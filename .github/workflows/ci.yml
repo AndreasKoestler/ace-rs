@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Core gate: builds, lints, and runs the suite on x86_64 Linux.
+  # This compiles the native `dpbssd_hw` path (x86_64), but only *executes* the
+  # scalar fallback unless the runner CPU happens to have AVX-VNNI-INT8 — native
+  # *execution* is proven by the `native-sde` job below.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  # Native-path verification: executes the real VPDPBSSD instruction under Intel
+  # SDE and asserts it matches the scalar oracle (see `hw_matches_scalar`). The
+  # `ACE_REQUIRE_NATIVE=1` guard (`native_runs_when_required`) makes the job fail
+  # if the native branch did NOT run, so this can never be a false green.
+  #
+  # SDE is x86-host-only and its download URL/version rotates per release and is
+  # license-gated, so it can't be hardcoded here. Enable this job by setting a
+  # repository variable `SDE_URL` (Settings → Secrets and variables → Actions →
+  # Variables) to the SDE Linux tarball URL, e.g.
+  #   https://downloadmirror.intel.com/<id>/sde-external-<ver>-lin.tar.xz
+  # Until that variable is set the job is skipped (the `test` gate still runs).
+  # Alternatives: a self-hosted x86_64 runner with an AVX-VNNI-INT8 CPU (Sierra
+  # Forest / Granite Rapids / Arrow Lake), or a community SDE-install action.
+  native-sde:
+    runs-on: ubuntu-latest
+    if: ${{ vars.SDE_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Intel SDE
+        env:
+          SDE_URL: ${{ vars.SDE_URL }}
+        run: |
+          set -euo pipefail
+          curl -fSL "$SDE_URL" -o sde.tar.xz
+          mkdir -p "$HOME/sde"
+          tar -xf sde.tar.xz -C "$HOME/sde" --strip-components=1
+          echo "$HOME/sde" >> "$GITHUB_PATH"
+      - name: Verify SDE is runnable
+        run: sde64 --version
+      - name: Run tests with the native path executed under SDE
+        env:
+          # Force the differential + guard tests to require the native branch.
+          ACE_REQUIRE_NATIVE: "1"
+          # Make cargo run each test binary under SDE emulating a CPU that has
+          # AVX-VNNI-INT8. `-future` selects the newest model; `-gnr` / `-srf`
+          # (Granite Rapids / Sierra Forest) also have the feature.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -future --"
+        run: cargo test --target x86_64-unknown-linux-gnu --verbose
