@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger. Use this to run the slow `native-sde` job against any branch
+  # (e.g. a PR branch) on demand: Actions tab → CI → "Run workflow" → pick the
+  # branch, or `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,8 +45,14 @@ jobs:
   # so a hosting problem fails only this job — the core gate stays green.
   # Alternative: a self-hosted x86_64 runner with an AVX-VNNI-INT8 CPU (Sierra
   # Forest / Granite Rapids / Arrow Lake).
+  #
+  # When it runs: on pushes to `main` (post-merge regression) and on manual
+  # `workflow_dispatch` (run it against a PR branch on demand). It is skipped on
+  # ordinary pull_request events so the fast `test` gate isn't held up by the
+  # 33 MB download + emulated run on every push to a PR.
   native-sde:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     env:
       SDE_VERSION: "10.8.0-2026-03-15"
       # Self-hosted, unmodified SDE tarball (see release sde-10.8.0). Served by
