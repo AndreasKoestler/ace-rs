@@ -133,6 +133,24 @@ Iteration 0 implements one primitive end to end: signed int8 dot-product-accumul
 
 **core:: reference:** `core::arch::x86_64::_mm256_dpbssd_epi32` (feature `avxvnniint8`), defined in `crates/core_arch/src/x86/avxvnniint8.rs`.
 
+### D10 (A1) — Operand signedness is encoded in the element type, on raw fixed-size arrays (no newtype)
+
+For the full group-1 family, each variant's `a`/`b` operands are typed *per signedness*: signed operands take `[i8; 32]`/`[i16; 16]`, unsigned operands take `[u8; 32]`/`[u16; 16]`, and `src`/result stay raw `[i32; 8]`. The arrays are exposed **directly**, not behind a newtype wrapper. (Captures requirement API.3 / API.3-1.)
+
+**Rationale:** the signedness is the single most error-prone axis of this family (`dpwsud != dpwusd`), and the mixed-signedness `SU`/`US` variants treat operand order as *significant*. Encoding signedness in the element type pushes that distinction into the type system: a wrong-signedness call, or a `b, a` swap on a mixed-signedness variant, is a **compile error** (rustc E0308) — never a silent wrong answer at runtime. This is why `prop_operands_commute` is asserted only for the genuinely commutative `SS`/`UU` variants and is *not even expressible* for `SU`/`US` (the swapped call does not type-check; the crate carries a `compile_fail` doctest as the executed witness). A newtype was rejected: it would add no safety over the distinct primitive element types (which already make swaps ill-typed) while obscuring the obvious "it's just an array of bytes/words" mental model and the eventual `core::arch` `__m256i` mapping. Raw arrays also keep the public surface a thin, mechanical wrapper over the future intrinsic signature (consistent with D3/D5).
+
+**core:: reference:** the eventual `core::arch::x86_64::_mm256_dp*_epi32` intrinsics take untyped `__m256i` for every operand, with signedness implied by the mnemonic alone — there is no compile-time signedness check at that layer (D1: the raw layer is the bare op). `ace-rs` adds the typed-operand safety at its dispatch layer (D2: ergonomics/safety are the crate's job), and the `[i8;32]`/`[u8;32]`/`[i16;16]`/`[u16;16]` arrays transmute losslessly to `__m256i` via the unaligned `_mm256_loadu_si256` marshalling each `_hw` path already uses.
+
+### D11 (B1) — One declarative `define_dp!` macro emits the dispatch + `_hw` + `_scalar` trio per variant
+
+The 11 new primitives are not hand-copied. A single `macro_rules!` macro, `define_dp!`, is parameterised over `(name, scalar, hw, feature, a_elem_ty, b_elem_ty, products_per_lane, intrinsic_path, accumulate=wrap|saturate)` and emits, for one variant, the public dispatch fn, the public scalar oracle, and the private `#[target_feature]`-gated native fn — reproducing the hand-written `dpbssd` shape (D1/D2/D5) exactly. The hand-written `dpbssd` is retained verbatim as the reference the macro's expansion is compared against. (Captures requirements PRIMITIVE_SHAPE.1/.2.)
+
+**Rationale:** the 12-cell grid is near-identical across cells; the *only* per-cell differences are the feature token, the two operand element types, the products-per-lane (4 byte / 2 word), the intrinsic path, and wrap-vs-saturate. Copy-pasting 11 ~40-line blocks would invite exactly the signedness/saturation/products-per-lane transcription bugs this family is most prone to, and would make a fix have to be applied 12 times. A *declarative* (`macro_rules!`) macro — rather than a procedural macro — keeps the factoring with **zero new dependencies** (SCOPE: a proc-macro would need `syn`/`quote`). Wrap-vs-saturate and the signed/unsigned element types are kept as **explicit named arguments** so each variant's invocation reads as a one-line spec and the per-variant differences stay reviewable at the call site rather than being buried in the macro body — satisfying the constraint that the shared factoring must not obscure the per-variant signedness/saturation differences (PRIMITIVE_SHAPE.2). The macro cannot concatenate identifiers without a proc-macro, so the `name`/`scalar`/`hw` trio is named explicitly per invocation; this is a small, deliberate verbosity in exchange for staying dependency-free on stable.
+
+The `...DS` saturation is implemented once, in the macro's `@fold saturate` arm, as a **single** `SIGNED_DWORD_SATURATE` of the full-precision `src + Σ products` (products folded in `i64`), matching the Intel SDM / Felix Cloutier pseudocode — see OQ-3 in §9. Doing it in one place means the (subtle, opposite-sign) saturation semantics are got right once and inherited by all six saturating variants.
+
+**core:: reference:** stdarch itself generates much of `core::arch` from declarative/codegen sources rather than hand-writing each intrinsic (e.g. the spec-driven generation under `crates/stdarch-gen-*`). `ace-rs`'s `define_dp!` is the same instinct at out-of-tree scale: one parameterised shape, expanded per primitive, with the bare per-variant intrinsic (`_mm256_dp*_epi32`) threaded in as a macro argument.
+
 ---
 
 ## 5. Testing strategy (before hardware)
@@ -148,13 +166,15 @@ Four layers; only one needs an emulator.
 
 Capability-detect SDE coverage and **skip-with-warning**, do not fail: a one-instruction smoke test that catches `SIGILL`/`#UD` tells you whether SDE emulates a given group; unsupported groups fall back to layers 1–2.
 
+For the group-1 family the differential property (`prop_hw_matches_scalar`) is the headline guarantee and is *non-vacuous*: when the variant's feature is absent it `TestResult::discard()`s rather than passing, and the `native_runs_when_required` guard (under `ACE_REQUIRE_NATIVE=1`) asserts **both** `avxvnniint8` and `avxvnniint16` were detected — so a green native CI run cannot mean "byte ops native, word ops silently scalar". Per-variant property selection: additivity + lane-independence + public-matches-oracle for all; `prop_operands_commute` for `SS`/`UU` only (never `SU`/`US` — see D10); a `prop_output_saturates` boundary check for every `...DS`.
+
 ---
 
 ## 6. Roadmap
 
 | Bullet | Primitive | New axis introduced |
 |--------|-----------|---------------------|
-| 0 | `dpbssd` (group 1) | dispatch + oracle + differential-test skeleton (D9) |
+| 0 ✅ | **group 1 complete** — `dpbssd` + the 11 remaining VEX integer multiply-accumulate ops (group 1: `avxvnniint8` byte `VPDPB*` + `avxvnniint16` word `VPDPW*`) | dispatch + oracle + differential-test skeleton (D9), generalised once via the declarative `define_dp!` macro (D11/B1) over typed-per-signedness operands (D10/A1); second CPUID feature family (`avxvnniint16`); dual-feature native-coverage guard |
 | 1 | AVX10.2 Subset / `AVX10_V1_AUX` (group 2): FP16↔FP8 converts + EVEX VNNI | `AVX10_V1_AUX` gating, FP8 format + RTNE/bias rounding oracle, first SDE-only tests; EVEX-generalizes the group-1 dot product. See `ticket.md`. |
 | 2 | `VCVTPS2HF8` FP32→FP8 (group 3) | FP32→FP8 convert + round-to-odd oracle (reuses the FP8 format oracle from bullet 1) |
 | 3 | `TOP2BF16PS` BF16 rank-2 outer product (group 4) | stateful RAII tile guard (D8), palette 2, the real engine — **`ACE`-gated; not in binutils 2.44 / likely not SDE 10.8 (§7): `.byte` encoding + layers 1–2 only until tooling lands** |
@@ -203,3 +223,14 @@ binutils 2.44 `gas/NEWS` ("Changes in 2.44") lists Diamond Rapids support under 
 **Related crates**: `multiversion`, `pulp` (dispatch); `wide`, `safe_arch` (safe wrappers); `cc` (native stub build, D7).
 
 **Tooling**: Intel SDE 10.8 (15 Mar 2026); GNU binutils 2.44 (gas: AVX10.2 + Diamond Rapids); LLVM (AVX10.2).
+
+---
+
+## 9. Open questions (group-1 family) — resolved / assumed
+
+These were carried from the design/structure stages for the group-1 extension; their resolution is recorded here (and surfaced for callers in `README.md`):
+
+- **OQ-1 — toolchain (resolved):** `is_x86_feature_detected!("avxvnniint16")` and the six `_mm256_dpw*_epi32` word intrinsics (plus the five new byte intrinsics) compile on **stable Rust 1.96** — no MSRV bump, no nightly feature flags. Re-confirmed at implementation time with `cargo check --target x86_64-unknown-linux-gnu` (TOOLCHAIN.1 / .1-1).
+- **OQ-2 — SDE arch flag (assumed; CI-verified):** the `native-sde` job uses `sde64 -future --` to enable runtime detection of *both* feature families. Whether `-future` makes `is_x86_feature_detected!("avxvnniint16")` return `true` inside the emulated process can only be confirmed by an actual SDE run; the dual-feature guard turns a wrong flag into a **loud red** (the `avxvnniint16` assert fails) rather than a silently-vacuous green. Documented fallbacks: `-gnr` (Granite Rapids) / `-srf` (Sierra Forest). Must be confirmed in CI before declaring INT16 coverage done.
+- **OQ-3 — saturation / accumulation width (resolved):** the `...DS` variants apply a **single** `SIGNED_DWORD_SATURATE` to the full-precision lane total `src[i] + Σ products`, with the products folded in `i64` (wide enough that a `u16×u16` product cannot overflow before the clamp). This matches the Intel SDM / Felix Cloutier pseudocode for `VPDPB*DS` / `VPDPW*DS` — it is **not** a two-stage "clamp the product sum, then saturating-add `src`" (which diverges from hardware when `src` and the product sum have opposite signs and the product sum exceeds the i32 range). The native intrinsic is the differential tiebreaker, and the per-variant `prop_output_saturates` + opposite-sign known-value lanes lock the model (SCALAR_ORACLE.1-4).
+- **OQ-4 — test summary wording (resolved):** the suite asserts on the stable substring `passed; 0 failed` plus exit code 0, and on the exact panic/assert message strings (`native path disagrees with oracle`, the guard messages), rather than a verbatim toolchain-formatted summary line or a hardcoded per-variant test count.

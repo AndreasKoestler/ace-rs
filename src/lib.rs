@@ -19,18 +19,45 @@
 //! primitive ships oracle-only: no stable EVEX intrinsic exists yet, so the native slot is
 //! dormant ([avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]).
 //!
+//! It also **completes the group-1 VEX family**: alongside iteration-0 [`dpbssd`] the crate
+//! root now exposes the 11 remaining `avxvnniint8` byte (`VPDPB*`) and `avxvnniint16` word
+//! (`VPDPW*`) multiply-accumulate ops, generated once through the declarative `define_dp!`
+//! macro. These have real stable `core::arch` intrinsics and run natively wherever the CPU
+//! advertises the feature.
+//!
 //! The EVEX byte/word VNNI primitives live in the [`vnni`] module and are reached
 //! module-qualified — e.g. the 512-bit EVEX `dpbssd` is [`vnni::dpbssd`]
 //! (`ace::vnni::dpbssd`), DISTINCT from this crate's iteration-0 256-bit VEX [`dpbssd`]
 //! (`ace::dpbssd`). The two are resolved by module path and neither shadows the other
 //! ([avx10-v1-aux-fp16-fp8-evex-vnni.BYTE_VNNI.1], OQ-1).
 //!
+//! ## Operand-order significance (mixed-signedness variants)
+//!
+//! Per LOCKED decision A1 the operand signedness is encoded in the element type — signed
+//! operands are `[i8;32]`/`[i16;16]`, unsigned operands are `[u8;32]`/`[u16;16]`. For the
+//! mixed-signedness `SU`/`US` variants (e.g. [`dpbsud`], [`dpbsuds`]) operand order is
+//! *significant*, so the two arguments have distinct types and a `b, a` swap does not even
+//! compile — commutativity is not expressible, which is why those variants carry no
+//! `prop_operands_commute` property ([vnni-int8-int16-family.CORRECTNESS.2]):
+//!
+//! ```compile_fail
+//! let src = [0i32; 8];
+//! let a = [0i8; 32]; // signed operand
+//! let b = [0u8; 32]; // unsigned operand
+//! // The correct order, `ace::dpbsud(src, a, b)`, type-checks; the swapped order does
+//! // NOT — `[u8;32]` is not `[i8;32]` and vice versa (rustc E0308):
+//! let _ = ace::dpbsud(src, b, a);
+//! ```
+//!
 //! # Native-coverage tripwire (`ACE_REQUIRE_NATIVE`) — scope in v1
 //!
-//! The `ACE_REQUIRE_NATIVE=1` coverage tripwire (CI's `native-sde` job) stays **meaningful
-//! only for the iteration-0 group-1 [`dpbssd`]**: that primitive has a real stable
-//! `core::arch` intrinsic, so the `native_runs_when_required` guard in this module's tests
-//! asserts the native `VPDPBSSD` branch actually ran rather than the scalar fallback
+//! The `ACE_REQUIRE_NATIVE=1` coverage tripwire (CI's `native-sde` job) stays meaningful for
+//! the **group-1 VEX family** — iteration-0 [`dpbssd`] plus the 11 remaining
+//! `avxvnniint8`/`avxvnniint16` multiply-accumulate ops — because those primitives have real
+//! stable `core::arch` intrinsics, so the `native_runs_when_required` guard in this module's
+//! tests asserts the native `VPDPB*`/`VPDPW*` branch actually ran rather than the scalar
+//! fallback, and that **both** `avxvnniint8` and `avxvnniint16` were detected — a green
+//! native run cannot mean "byte ops native, word ops silently scalar"
 //! ([avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.2],
 //! [avx10-v1-aux-fp16-fp8-evex-vnni.CI.2]). For the new `AVX10_V1_AUX` families (A–G) the
 //! tripwire is intentionally **dormant**: no stable EVEX intrinsic exists yet (OQ-3,
@@ -46,16 +73,17 @@
 //!
 //! # v1 non-goals — confirmed NOT implemented
 //!
-//! The public surface of this crate is exactly the iteration-0 [`dpbssd`] plus the 26
-//! `AVX10_V1_AUX` primitives (families A–G). The following are deliberately **out of scope**
-//! for v1 and are NOT present in any public item or native path
+//! The public surface of this crate is the completed group-1 VEX family (iteration-0
+//! [`dpbssd`] plus the 11 remaining `avxvnniint8`/`avxvnniint16` multiply-accumulate ops)
+//! plus the 26 `AVX10_V1_AUX` primitives (families A–G). The following are deliberately
+//! **out of scope** for v1 and are NOT present in any public item or native path
 //! (verified by [`tests::non_goals_absent`]):
 //!
 //! - **No `AVX10_V2_AUX` (group 3) instructions** — no FP32↔FP8, FP4/FP6, `VPMOVSSDB`, or
 //!   `VUNPACKB` converts (spec §6.2).
 //! - **No group-4 `ACE` instructions** — no `TOP*`, `BSR*`, or tile-move primitives.
-//! - **No VEX-encoded AVX-VNNI-INT8/16 forms beyond the existing 256-bit [`dpbssd`]** — the
-//!   family-F/G additions are the EVEX 512-bit generalization ([`vnni`]), not new VEX forms.
+//! - **No VEX-encoded AVX-VNNI-INT8/16 forms beyond the group-1 family** — the family-F/G
+//!   additions are the EVEX 512-bit generalization ([`vnni`]), not new VEX forms.
 //! - **No EVEX write-masking (`{k1}{z}`) or memory-broadcast (`m*bcst`) in the public API** —
 //!   every primitive takes plain fixed-size lane arrays by value and writes a full result; the
 //!   spec's `k1` / `zeroing` / `evex_b` operands are fixed to the no-writemask, no-broadcast
@@ -81,6 +109,12 @@ pub use cvt_ph_fp8::{
 pub use cvt_fp8_ph::{cvthf8_ph, cvthf8_ph_scalar};
 
 pub use cvt_ps_ph::{cvt2ps_phx, cvt2ps_phx_scalar};
+
+// T1 toolchain risk gate (OQ-1, re-confirmed): `is_x86_feature_detected!("avxvnniint16")`
+// and all six word intrinsics (`_mm256_dpw{sud,suds,usd,usds,uud,uuds}_epi32`) plus the
+// five remaining byte intrinsics (`_mm256_dpb{ssds,sud,suds,uud,uuds}_epi32`) resolve on
+// stable Rust 1.96 (`cargo check --target x86_64-unknown-linux-gnu`, exit 0, no E0432) —
+// no MSRV bump and no nightly feature flags needed; the word-op phases may depend on them.
 
 /// Signed int8 dot-product-accumulate. (ACE group 1: AVX-VNNI-INT8, `VPDPBSSD`.)
 ///
@@ -134,6 +168,343 @@ unsafe fn dpbssd_hw(src: [i32; 8], a: [i8; 32], b: [i8; 32]) -> [i32; 8] {
     out
 }
 
+/// Declarative factory for a group-1 dot-product-accumulate primitive (LOCKED B1).
+///
+/// One invocation emits the full three-layer shape — exactly the hand-written [`dpbssd`]
+/// shape (design D1/D2/D5), parameterised so each new ACE instruction is a single
+/// declaration rather than a hand-copied block:
+///
+/// * a public **dispatch** fn `$name` — runtime `is_x86_feature_detected!` probe on
+///   x86_64 calling the native path, falling through to the scalar oracle otherwise;
+/// * a public **scalar oracle** `$scalar` — the portable reference path and the source of
+///   truth the native path is differential-tested against;
+/// * a private `#[target_feature]`-gated **native** fn `$hw` calling the matching
+///   `_mm256_dp*_epi32` intrinsic via unaligned `loadu`/`storeu`.
+///
+/// Named arguments (wrap-vs-saturate and signedness are explicit, per B1):
+/// * `name` / `scalar` / `hw` — the public dispatch fn, the public oracle fn, and the
+///   private native fn identifiers (stable Rust cannot concatenate identifiers without a
+///   proc-macro dependency, which `SCOPE.4` forbids, so the trio is named explicitly).
+/// * `feature` — the CPUID feature token (`"avxvnniint8"` byte / `"avxvnniint16"` word).
+/// * `a` / `b` — the per-element operand types; their signedness threads into the oracle
+///   widening cast (`i8`/`i16` sign-extend, `u8`/`u16` zero-extend), encoding the mnemonic.
+/// * `products` — products-per-lane (4 byte / 2 word); the operand arrays are `[_; products*8]`.
+/// * `intrinsic` — the matching `_mm256_dp<variant>_epi32` path.
+/// * `accumulate` — `wrap` (the `...D` variants: `wrapping_add` of the products onto the
+///   lane) or `saturate` (the `...DS` variants: a SINGLE signed-dword saturation of the
+///   full-precision sum — `out[i] = SIGNED_DWORD_SATURATE(src[i] + Σ products)`, per the
+///   Intel SDM / Felix Cloutier pseudocode for VPDPB*DS / VPDPW*DS; there is NO intermediate
+///   clamp of the product-sum before adding src). Products are summed in `i64` — wide enough
+///   that `u16×u16` cannot overflow before the single clamp.
+///
+/// The native intrinsic is the differential tiebreaker for the saturation/accumulation-width
+/// question; the oracle is validated bit-for-bit against it under the SDE CI job.
+///
+/// [vnni-int8-int16-family.PRIMITIVE_SHAPE.1] [vnni-int8-int16-family.PRIMITIVE_SHAPE.2]
+/// [vnni-int8-int16-family.API.3] [vnni-int8-int16-family.API.4]
+/// [vnni-int8-int16-family.SCALAR_ORACLE.1] [vnni-int8-int16-family.SCALAR_ORACLE.1-1]
+/// [vnni-int8-int16-family.SCALAR_ORACLE.1-2] [vnni-int8-int16-family.SCALAR_ORACLE.1-3]
+/// [vnni-int8-int16-family.SCALAR_ORACLE.1-4] [vnni-int8-int16-family.NATIVE_PATH.1]
+/// [vnni-int8-int16-family.NATIVE_PATH.2] [vnni-int8-int16-family.NATIVE_PATH.3]
+macro_rules! define_dp {
+    // ---- accumulate helpers: fold one lane's products onto `src[i]`. ----------------
+    // `wrap`: wrapping i32 accumulation (the `...D` variants).
+    (@fold wrap, $src:expr, $acc:expr) => {
+        // `$acc` is the i64 product sum; the ISA wraps at i32, so wrapping-cast then
+        // wrapping-add — matching the native intrinsic's modular arithmetic.
+        $src.wrapping_add($acc as i32)
+    };
+    // `saturate`: a SINGLE signed-dword saturation of the FULL-PRECISION sum (the `...DS`
+    // variants). Per the Intel SDM / Felix Cloutier pseudocode for VPDPB*DS and VPDPW*DS:
+    //   DEST.dword[i] := SIGNED_DWORD_SATURATE( SRC.dword[i] + product1 + product2 [+ ...] )
+    // There is NO intermediate clamp of the product-sum before adding src. We add `src` to
+    // the i64 product sum and clamp the single total once into [i32::MIN, i32::MAX]. (A prior
+    // two-stage "clamp acc into i32, then saturating_add src" diverged from hardware when src
+    // and acc had opposite signs and |acc| exceeded the i32 range.)
+    (@fold saturate, $src:expr, $acc:expr) => {{
+        let total: i64 = ($src as i64) + $acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }};
+
+    // ---- main entry: emit dispatch + scalar oracle + native _hw for one variant. -----
+    (
+        name = $name:ident,
+        scalar = $scalar:ident,
+        hw = $hw:ident,
+        feature = $feat:literal,
+        a = $a:ty,
+        b = $b:ty,
+        products = $ppl:expr,
+        intrinsic = $intrin:path,
+        accumulate = $acc:tt
+    ) => {
+        /// Group-1 dot-product-accumulate dispatch fn (emitted by `define_dp!`).
+        ///
+        /// Dispatches to the native intrinsic when the running CPU supports the variant's
+        /// feature, otherwise uses the portable scalar oracle. Both produce identical results.
+        pub fn $name(src: [i32; 8], a: [$a; $ppl * 8], b: [$b; $ppl * 8]) -> [i32; 8] {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!($feat) {
+                    // SAFETY: the variant's feature was confirmed present immediately above.
+                    return unsafe { $hw(src, a, b) };
+                }
+            }
+            $scalar(src, a, b)
+        }
+
+        /// Portable reference path — the oracle the native path is differential-tested
+        /// against. Widens each operand with the signedness-correct cast (the operand
+        /// element types encode the mnemonic), multiplies and folds the per-lane products
+        /// in `i64` (cannot overflow before the clamp), then applies the variant's
+        /// wrap/saturate accumulation onto `src`.
+        pub fn $scalar(src: [i32; 8], a: [$a; $ppl * 8], b: [$b; $ppl * 8]) -> [i32; 8] {
+            let mut out = src;
+            for i in 0..8 {
+                let mut acc = 0i64;
+                for k in 0..$ppl {
+                    let av = a[$ppl * i + k] as i64;
+                    let bv = b[$ppl * i + k] as i64;
+                    acc += av * bv;
+                }
+                out[i] = define_dp!(@fold $acc, out[i], acc);
+            }
+            out
+        }
+
+        /// Native path via the matching `_mm256_dp*_epi32` intrinsic.
+        ///
+        /// # Safety
+        /// The CPU must support the variant's feature. Callers go through the dispatch fn,
+        /// which checks this at runtime.
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = $feat)]
+        unsafe fn $hw(src: [i32; 8], a: [$a; $ppl * 8], b: [$b; $ppl * 8]) -> [i32; 8] {
+            use std::arch::x86_64::*;
+            let vsrc = _mm256_loadu_si256(src.as_ptr().cast());
+            let va = _mm256_loadu_si256(a.as_ptr().cast());
+            let vb = _mm256_loadu_si256(b.as_ptr().cast());
+            let vout = $intrin(vsrc, va, vb);
+            let mut out = [0i32; 8];
+            _mm256_storeu_si256(out.as_mut_ptr().cast(), vout);
+            out
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::_mm256_dpbssds_epi32;
+
+// First macro-emitted variant: dpbssds — signed×signed bytes, saturating (ACE group 1:
+// AVX-VNNI-INT8, `VPDPBSSDS`). Proves the `define_dp!` macro reproduces the `dpbssd` shape
+// end-to-end (dispatch → native _hw → scalar oracle) with the saturating accumulate path.
+// [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2]
+define_dp! {
+    name = dpbssds,
+    scalar = dpbssds_scalar,
+    hw = dpbssds_hw,
+    feature = "avxvnniint8",
+    a = i8,
+    b = i8,
+    products = 4,
+    intrinsic = _mm256_dpbssds_epi32,
+    accumulate = saturate
+}
+
+// ===================== Phase 3: remaining avxvnniint8 byte variants =====================
+// Complete the byte half of the group-1 grid via `define_dp!`: mixed-signedness SU
+// (operand order significant — A1's distinct [i8;32]/[u8;32] types make a swap a compile
+// error, so no commutativity property) and unsigned UU (commutative), each in both the
+// wrapping (...D) and saturating (...DS) accumulate forms.
+// [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2]
+// [vnni-int8-int16-family.API.3] [vnni-int8-int16-family.NATIVE_PATH.1]
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{
+    _mm256_dpbsud_epi32, _mm256_dpbsuds_epi32, _mm256_dpbuud_epi32, _mm256_dpbuuds_epi32,
+};
+
+// dpbsud — signed×unsigned bytes, wrapping (ACE group 1: AVX-VNNI-INT8, `VPDPBSUD`).
+// `a: [i8;32]` sign-extends, `b: [u8;32]` zero-extends in the oracle widening cast.
+define_dp! {
+    name = dpbsud,
+    scalar = dpbsud_scalar,
+    hw = dpbsud_hw,
+    feature = "avxvnniint8",
+    a = i8,
+    b = u8,
+    products = 4,
+    intrinsic = _mm256_dpbsud_epi32,
+    accumulate = wrap
+}
+
+// dpbsuds — signed×unsigned bytes, saturating (ACE group 1: AVX-VNNI-INT8, `VPDPBSUDS`).
+define_dp! {
+    name = dpbsuds,
+    scalar = dpbsuds_scalar,
+    hw = dpbsuds_hw,
+    feature = "avxvnniint8",
+    a = i8,
+    b = u8,
+    products = 4,
+    intrinsic = _mm256_dpbsuds_epi32,
+    accumulate = saturate
+}
+
+// dpbuud — unsigned×unsigned bytes, wrapping (ACE group 1: AVX-VNNI-INT8, `VPDPBUUD`).
+// Both operands `[u8;32]` zero-extend; commutative (UU).
+define_dp! {
+    name = dpbuud,
+    scalar = dpbuud_scalar,
+    hw = dpbuud_hw,
+    feature = "avxvnniint8",
+    a = u8,
+    b = u8,
+    products = 4,
+    intrinsic = _mm256_dpbuud_epi32,
+    accumulate = wrap
+}
+
+// dpbuuds — unsigned×unsigned bytes, saturating (ACE group 1: AVX-VNNI-INT8, `VPDPBUUDS`).
+define_dp! {
+    name = dpbuuds,
+    scalar = dpbuuds_scalar,
+    hw = dpbuuds_hw,
+    feature = "avxvnniint8",
+    a = u8,
+    b = u8,
+    products = 4,
+    intrinsic = _mm256_dpbuuds_epi32,
+    accumulate = saturate
+}
+
+// ============== Phase 4: word variants part 1 — avxvnniint16, 2 products/lane ==============
+// Second CPUID feature family (avxvnniint16) and the word operand shapes: `[i16;16]` /
+// `[u16;16]` (256-bit, 16 elements → `products = 2` per lane × 8 lanes). The `define_dp!`
+// macro already generalises over products-per-lane (`$ppl`) and operand-array length
+// (`[_; $ppl*8]`), and its oracle folds the per-lane products in `i64` — wide enough that a
+// `u16 × u16` product (max 65535*65535 = 4_294_836_225, well above `i32::MAX`) cannot
+// overflow before the final wrap/saturate clamp (OQ-3; SCALAR_ORACLE.1-4). So the word ops
+// reuse the macro UNCHANGED; only `products = 2` and the 16-element operand types differ.
+// `as i64` is the signedness-correct widening: `i16` sign-extends, `u16` zero-extends.
+// These three are all mixed-signedness (SU / US) — operand order is significant and
+// `dpwsud != dpwusd`, so none carries a `prop_operands_commute` property, and A1's distinct
+// element types make a `b,a` swap a compile error.
+// [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2]
+// [vnni-int8-int16-family.API.3] [vnni-int8-int16-family.API.4]
+// [vnni-int8-int16-family.NATIVE_PATH.1] [vnni-int8-int16-family.SCALAR_ORACLE.1-2]
+// [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm256_dpwsud_epi32, _mm256_dpwsuds_epi32, _mm256_dpwusd_epi32};
+
+// dpwsud — signed×unsigned words, wrapping (ACE group 1: AVX-VNNI-INT16, `VPDPWSUD`).
+// `a: [i16;16]` sign-extends, `b: [u16;16]` zero-extends in the oracle widening cast.
+define_dp! {
+    name = dpwsud,
+    scalar = dpwsud_scalar,
+    hw = dpwsud_hw,
+    feature = "avxvnniint16",
+    a = i16,
+    b = u16,
+    products = 2,
+    intrinsic = _mm256_dpwsud_epi32,
+    accumulate = wrap
+}
+
+// dpwsuds — signed×unsigned words, saturating (ACE group 1: AVX-VNNI-INT16, `VPDPWSUDS`).
+define_dp! {
+    name = dpwsuds,
+    scalar = dpwsuds_scalar,
+    hw = dpwsuds_hw,
+    feature = "avxvnniint16",
+    a = i16,
+    b = u16,
+    products = 2,
+    intrinsic = _mm256_dpwsuds_epi32,
+    accumulate = saturate
+}
+
+// dpwusd — unsigned×signed words, wrapping (ACE group 1: AVX-VNNI-INT16, `VPDPWUSD`).
+// `a: [u16;16]` zero-extends, `b: [i16;16]` sign-extends — operand order is the inverse of
+// dpwsud, so `dpwusd != dpwsud` for the same numeric operands.
+define_dp! {
+    name = dpwusd,
+    scalar = dpwusd_scalar,
+    hw = dpwusd_hw,
+    feature = "avxvnniint16",
+    a = u16,
+    b = i16,
+    products = 2,
+    intrinsic = _mm256_dpwusd_epi32,
+    accumulate = wrap
+}
+
+// ============== Phase 5: word variants part 2 — avxvnniint16, complete group-1 ==============
+// The final three word variants close the 12-cell grid: the last US-saturate (dpwusds), and
+// the unsigned×unsigned pair in both accumulate forms (dpwuud wrap, dpwuuds saturate). These
+// reuse the `define_dp!` macro UNCHANGED — `products = 2`, 16-element operand types, and the
+// macro's `@fold saturate` arm (a SINGLE signed-dword saturation of the FULL-PRECISION i64 sum
+// `src + Σ products`, per Intel SDM / Felix Cloutier VPDPW*DS — no intermediate product-sum
+// clamp). The UU variants carry the LARGEST product sums of the whole family (u16×u16 ≈ 4.29e9
+// per product, 2/lane ≈ 8.59e9), well beyond i32::MAX, so the i64 fold is load-bearing and the
+// single-saturate model is the only one matching hardware when src and the product sum have
+// opposite signs (e.g. src = i32::MIN + a large positive product sum clamps toward i32::MAX,
+// it does NOT collapse to ~0 as a two-stage clamp would).
+//   * dpwusds is US (mixed signedness) — operand order significant (`dpwusds != dpwsuds`);
+//     A1's distinct [u16;16]/[i16;16] types make a `b,a` swap a compile error → NO commutativity.
+//   * dpwuud / dpwuuds are UU — both operands `[u16;16]` zero-extend, commutative.
+// [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2] [vnni-int8-int16-family.API.3]
+// [vnni-int8-int16-family.API.4] [vnni-int8-int16-family.NATIVE_PATH.1]
+// [vnni-int8-int16-family.SCALAR_ORACLE.1-2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm256_dpwusds_epi32, _mm256_dpwuud_epi32, _mm256_dpwuuds_epi32};
+
+// dpwusds — unsigned×signed words, saturating (ACE group 1: AVX-VNNI-INT16, `VPDPWUSDS`).
+// `a: [u16;16]` zero-extends, `b: [i16;16]` sign-extends — inverse operand order of dpwsuds.
+define_dp! {
+    name = dpwusds,
+    scalar = dpwusds_scalar,
+    hw = dpwusds_hw,
+    feature = "avxvnniint16",
+    a = u16,
+    b = i16,
+    products = 2,
+    intrinsic = _mm256_dpwusds_epi32,
+    accumulate = saturate
+}
+
+// dpwuud — unsigned×unsigned words, wrapping (ACE group 1: AVX-VNNI-INT16, `VPDPWUUD`).
+// Both operands `[u16;16]` zero-extend; commutative (UU). The i64 fold cannot overflow before
+// the wrapping-cast even though a u16×u16 product (≈4.29e9) exceeds i32::MAX.
+define_dp! {
+    name = dpwuud,
+    scalar = dpwuud_scalar,
+    hw = dpwuud_hw,
+    feature = "avxvnniint16",
+    a = u16,
+    b = u16,
+    products = 2,
+    intrinsic = _mm256_dpwuud_epi32,
+    accumulate = wrap
+}
+
+// dpwuuds — unsigned×unsigned words, saturating (ACE group 1: AVX-VNNI-INT16, `VPDPWUUDS`).
+// Commutative (UU); the largest-magnitude positive product sums of the family exercise the
+// single signed-dword saturation of `src + Σ products`.
+define_dp! {
+    name = dpwuuds,
+    scalar = dpwuuds_scalar,
+    hw = dpwuuds_hw,
+    feature = "avxvnniint16",
+    a = u16,
+    b = u16,
+    products = 2,
+    intrinsic = _mm256_dpwuuds_epi32,
+    accumulate = saturate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,19 +533,244 @@ mod tests {
         assert_eq!(dpbssd(src, a, b), want);
     }
 
-    /// Coverage guard. When `ACE_REQUIRE_NATIVE=1` is set (CI's SDE job), the native
-    /// path *must* be the one that runs — otherwise a green suite would only prove the
-    /// scalar fallback. Off by default, so local/non-x86 runs are unaffected.
+    /// Differential test for `dpbssds` (SS, saturate): the native `VPDPBSSDS` path must
+    /// match the saturating scalar oracle bit-for-bit. Runs only where `avxvnniint8` is
+    /// actually available; fails with `native path disagrees with oracle`
+    /// (`NativeDivergesFromOracle`) on divergence.
+    /// [vnni-int8-int16-family.TESTS.1] [vnni-int8-int16-family.CORRECTNESS.1]
+    #[test]
+    fn dpbssds_hw_matches_scalar() {
+        // Include lanes whose product sum is large enough to exercise the saturating clamp.
+        let a: [i8; 32] = core::array::from_fn(|i| (i as i8).wrapping_mul(7).wrapping_sub(64));
+        let b: [i8; 32] = core::array::from_fn(|i| (i as i8).wrapping_mul(5).wrapping_add(33));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 1_000_000);
+
+        let want = dpbssds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint8") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpbssds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+
+        // Public API always works (falls back when the feature is absent).
+        assert_eq!(dpbssds(src, a, b), want);
+    }
+
+    // ============== Phase 3: deterministic differential tests (byte variants) ==============
+    // One per variant; runs the native==oracle comparison only where `avxvnniint8` is
+    // actually detected (skipped on this arm64 host — SDE CI exercises the native path),
+    // failing with `native path disagrees with oracle` (`NativeDivergesFromOracle`) on
+    // divergence. The public dispatcher is always checked against the oracle.
+    // [vnni-int8-int16-family.TESTS.1] [vnni-int8-int16-family.CORRECTNESS.1]
+
+    /// Differential test for `dpbsud` (SU, wrap): native `VPDPBSUD` vs the wrapping oracle.
+    #[test]
+    fn dpbsud_hw_matches_scalar() {
+        let a: [i8; 32] = core::array::from_fn(|i| (i as i8).wrapping_mul(11).wrapping_sub(70));
+        let b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(9).wrapping_add(3));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 7_000);
+
+        let want = dpbsud_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint8") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpbsud_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpbsud(src, a, b), want);
+    }
+
+    /// Differential test for `dpbsuds` (SU, saturate): native `VPDPBSUDS` vs the saturating
+    /// oracle, with inputs that exercise the clamp.
+    #[test]
+    fn dpbsuds_hw_matches_scalar() {
+        let a: [i8; 32] = core::array::from_fn(|i| (i as i8).wrapping_mul(13).wrapping_sub(50));
+        let b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(7));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 500_000_000);
+
+        let want = dpbsuds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint8") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpbsuds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpbsuds(src, a, b), want);
+    }
+
+    /// Differential test for `dpbuud` (UU, wrap): native `VPDPBUUD` vs the wrapping oracle.
+    #[test]
+    fn dpbuud_hw_matches_scalar() {
+        let a: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(1));
+        let b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(19).wrapping_add(5));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 11_000);
+
+        let want = dpbuud_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint8") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpbuud_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpbuud(src, a, b), want);
+    }
+
+    /// Differential test for `dpbuuds` (UU, saturate): native `VPDPBUUDS` vs the saturating
+    /// oracle, with inputs that exercise the clamp.
+    #[test]
+    fn dpbuuds_hw_matches_scalar() {
+        let a: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(200));
+        let b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(180));
+        // Lanes 5-7 sit within one max product-sum (4*255*255 = 260100) of i32::MAX so
+        // the large positive products push them into the saturating clamp; all lanes stay
+        // within i32 range (no debug-overflow when building the inputs).
+        let src: [i32; 8] = core::array::from_fn(|i| i32::MAX - (7 - i as i32) * 100_000);
+
+        let want = dpbuuds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint8") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpbuuds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpbuuds(src, a, b), want);
+    }
+
+    // ============== Phase 4: deterministic differential tests (word variants) ==============
+    // dpwsud / dpwsuds / dpwusd — gated on `avxvnniint16` (not detected on this arm64 host,
+    // so the native block is skipped here; SDE CI exercises it). Each fails with
+    // `native path disagrees with oracle` (`NativeDivergesFromOracle`) on divergence; the
+    // public dispatcher is always checked against the oracle.
+    // [vnni-int8-int16-family.TESTS.1] [vnni-int8-int16-family.CORRECTNESS.1]
+
+    /// Differential test for `dpwsud` (SU, wrap; words): native `VPDPWSUD` vs the wrapping
+    /// oracle. `a` is signed (`[i16;16]`), `b` unsigned (`[u16;16]`), 2 products/lane.
+    #[test]
+    fn dpwsud_hw_matches_scalar() {
+        let a: [i16; 16] =
+            core::array::from_fn(|i| (i as i16).wrapping_mul(4001).wrapping_sub(20000));
+        let b: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(4099).wrapping_add(257));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 13_000);
+
+        let want = dpwsud_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwsud_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwsud(src, a, b), want);
+    }
+
+    /// Differential test for `dpwsuds` (SU, saturate; words): native `VPDPWSUDS` vs the
+    /// saturating oracle, with inputs that exercise the clamp.
+    #[test]
+    fn dpwsuds_hw_matches_scalar() {
+        let a: [i16; 16] =
+            core::array::from_fn(|i| (i as i16).wrapping_mul(8009).wrapping_sub(16000));
+        let b: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(8191).wrapping_add(40000));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 500_000_000);
+
+        let want = dpwsuds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwsuds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwsuds(src, a, b), want);
+    }
+
+    /// Differential test for `dpwusd` (US, wrap; words): native `VPDPWUSD` vs the wrapping
+    /// oracle. `a` is unsigned (`[u16;16]`), `b` signed (`[i16;16]`) — inverse operand order
+    /// of `dpwsud`.
+    #[test]
+    fn dpwusd_hw_matches_scalar() {
+        let a: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(4099).wrapping_add(257));
+        let b: [i16; 16] =
+            core::array::from_fn(|i| (i as i16).wrapping_mul(4001).wrapping_sub(20000));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 13_000);
+
+        let want = dpwusd_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwusd_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwusd(src, a, b), want);
+    }
+
+    /// Dual-feature coverage guard. When `ACE_REQUIRE_NATIVE` is present (CI's SDE job;
+    /// presence-checked, value ignored), EVERY feature the suite exercises — both
+    /// `avxvnniint8` (byte ops) AND `avxvnniint16` (word ops) — *must* have been detected,
+    /// otherwise a green suite would only prove the native byte path while the word ops
+    /// silently fell back to the scalar oracle. Off by default, so local/non-x86 runs are
+    /// unaffected: with the var unset the guard returns early (non-vacuous fallback) and the
+    /// host `cargo test` stays green without requiring any native path.
+    ///
+    /// Realises NATIVE_GUARD.1 / NATIVE_GUARD.1-1 (dual-feature invariant) and the
+    /// NativeFeaturePrecondition validation rule; renders NativeGuardNotDetected (missing
+    /// feature, exit 1) and NativeGuardNonX86 (wrong arch, exit 1).
     #[test]
     fn native_runs_when_required() {
+        // ACE_REQUIRE_NATIVE absent → guard returns early, suite stays green without native.
+        // On this host the var is unset, so this test exercises exactly this branch and passes.
         if std::env::var_os("ACE_REQUIRE_NATIVE").is_none() {
             return;
         }
         #[cfg(target_arch = "x86_64")]
-        assert!(
-            std::is_x86_feature_detected!("avxvnniint8"),
-            "ACE_REQUIRE_NATIVE=1 but avxvnniint8 is not detected — the native path was NOT exercised"
-        );
+        {
+            // Assert EVERY exercised feature family was detected. A miss panics with the
+            // message parameterised by the *missing* feature token (NativeGuardNotDetected).
+            for feature in ["avxvnniint8", "avxvnniint16"] {
+                let detected = match feature {
+                    "avxvnniint8" => std::is_x86_feature_detected!("avxvnniint8"),
+                    "avxvnniint16" => std::is_x86_feature_detected!("avxvnniint16"),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    detected,
+                    "ACE_REQUIRE_NATIVE=1 but {feature} is not detected — the native path was NOT exercised"
+                );
+            }
+        }
         #[cfg(not(target_arch = "x86_64"))]
         panic!("ACE_REQUIRE_NATIVE=1 on a non-x86_64 target — the native path cannot run here");
     }
@@ -191,6 +787,528 @@ mod tests {
         }
         assert_eq!(dpbssd([0; 8], a, b), [30, 0, 0, 0, 0, 0, 0, 0]);
     }
+
+    /// Hand-computed value for `dpbssds`, independent of the implementation, covering the
+    /// saturating clamp on at least one lane.
+    ///
+    /// * lane 0: `src=0`, all four products `127*127=16129` → `0 + 4*16129 = 64516`
+    ///   (no clamp — well within i32).
+    /// * lane 1: `src=i32::MAX`, products `127*127=16129` each → `i32::MAX + 64516`
+    ///   saturates to `i32::MAX`.
+    /// * lane 2: `src=i32::MIN`, products `127*-128=-16256` each → `i32::MIN + 4*-16256`
+    ///   saturates to `i32::MIN`.
+    ///
+    /// [vnni-int8-int16-family.TESTS.2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+    #[test]
+    fn dpbssds_known_value() {
+        let mut a = [0i8; 32];
+        let mut b = [0i8; 32];
+        // lane 0 (a[0..4], b[0..4]): 127 * 127, no saturation.
+        for slot in 0..4 {
+            a[slot] = 127;
+            b[slot] = 127;
+        }
+        // lane 1 (a[4..8], b[4..8]): 127 * 127 with src = i32::MAX → clamp to MAX.
+        for slot in 4..8 {
+            a[slot] = 127;
+            b[slot] = 127;
+        }
+        // lane 2 (a[8..12], b[8..12]): 127 * -128 with src = i32::MIN → clamp to MIN.
+        for slot in 8..12 {
+            a[slot] = 127;
+            b[slot] = -128;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MAX;
+        src[2] = i32::MIN;
+
+        let out = dpbssds(src, a, b);
+        assert_eq!(out[0], 64_516, "lane 0: 4 * 127*127 = 64516, no clamp");
+        assert_eq!(
+            out[1],
+            i32::MAX,
+            "lane 1: i32::MAX + 64516 clamps to i32::MAX"
+        );
+        assert_eq!(
+            out[2],
+            i32::MIN,
+            "lane 2: i32::MIN + 4*(127*-128) clamps to i32::MIN"
+        );
+    }
+
+    // ================== Phase 3: hand-computed known-value tests (byte variants) ==================
+    // Each is independent of the implementation: products spelled out by hand.
+    // [vnni-int8-int16-family.TESTS.2]
+
+    /// Hand-computed value for `dpbsud` (SU, wrap). `a` is signed, `b` unsigned.
+    ///
+    /// * lane 0: `src=0`, products `(-1)*2 = -2` ×4 → `0 + 4*(-2) = -8` (the manualExecution
+    ///   case from the plan).
+    /// * lane 1: `src=1000`, products `5 * 255 = 1275` ×4 → `1000 + 5100 = 6100`.
+    #[test]
+    fn dpbsud_known_value() {
+        let mut a = [0i8; 32];
+        let mut b = [0u8; 32];
+        for slot in 0..4 {
+            a[slot] = -1;
+            b[slot] = 2;
+        }
+        for slot in 4..8 {
+            a[slot] = 5;
+            b[slot] = 255;
+        }
+        let mut src = [0i32; 8];
+        src[1] = 1000;
+
+        let out = dpbsud(src, a, b);
+        assert_eq!(out[0], -8, "lane 0: 0 + 4*(-1*2) = -8");
+        assert_eq!(out[1], 6100, "lane 1: 1000 + 4*(5*255) = 6100");
+    }
+
+    /// Hand-computed value for `dpbsuds` (SU, saturate), covering the clamp.
+    ///
+    /// * lane 0: `src=0`, products `127*255 = 32385` ×4 → `0 + 129540 = 129540` (no clamp).
+    /// * lane 1: `src=i32::MAX`, products `127*255` ×4 (positive) → clamps to `i32::MAX`.
+    /// * lane 2: `src=i32::MIN`, products `(-128)*255 = -32640` ×4 → clamps to `i32::MIN`.
+    #[test]
+    fn dpbsuds_known_value() {
+        let mut a = [0i8; 32];
+        let mut b = [0u8; 32];
+        for slot in 0..4 {
+            a[slot] = 127;
+            b[slot] = 255;
+        }
+        for slot in 4..8 {
+            a[slot] = 127;
+            b[slot] = 255;
+        }
+        for slot in 8..12 {
+            a[slot] = -128;
+            b[slot] = 255;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MAX;
+        src[2] = i32::MIN;
+
+        let out = dpbsuds(src, a, b);
+        assert_eq!(out[0], 129_540, "lane 0: 4 * 127*255 = 129540, no clamp");
+        assert_eq!(out[1], i32::MAX, "lane 1: i32::MAX + 129540 clamps to MAX");
+        assert_eq!(
+            out[2],
+            i32::MIN,
+            "lane 2: i32::MIN + 4*(-128*255) clamps to MIN"
+        );
+    }
+
+    /// Hand-computed value for `dpbuud` (UU, wrap). Both operands unsigned.
+    ///
+    /// * lane 0: `src=0`, products `255*255 = 65025` ×4 → `0 + 260100 = 260100`.
+    /// * lane 1: `src=-100`, products `10*20 = 200` ×4 → `-100 + 800 = 700`.
+    #[test]
+    fn dpbuud_known_value() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        for slot in 0..4 {
+            a[slot] = 255;
+            b[slot] = 255;
+        }
+        for slot in 4..8 {
+            a[slot] = 10;
+            b[slot] = 20;
+        }
+        let mut src = [0i32; 8];
+        src[1] = -100;
+
+        let out = dpbuud(src, a, b);
+        assert_eq!(out[0], 260_100, "lane 0: 4 * 255*255 = 260100");
+        assert_eq!(out[1], 700, "lane 1: -100 + 4*(10*20) = 700");
+    }
+
+    /// Hand-computed value for `dpbuuds` (UU, saturate), covering the clamp.
+    ///
+    /// * lane 0: `src=0`, products `255*255 = 65025` ×4 → `260100` (no clamp).
+    /// * lane 1: `src=i32::MAX`, products `255*255` ×4 → clamps to `i32::MAX`.
+    /// * lane 2: `src=i32::MIN`, all products zero → stays `i32::MIN` (no underflow).
+    #[test]
+    fn dpbuuds_known_value() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        for slot in 0..4 {
+            a[slot] = 255;
+            b[slot] = 255;
+        }
+        for slot in 4..8 {
+            a[slot] = 255;
+            b[slot] = 255;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MAX;
+        src[2] = i32::MIN;
+
+        let out = dpbuuds(src, a, b);
+        assert_eq!(out[0], 260_100, "lane 0: 4 * 255*255 = 260100, no clamp");
+        assert_eq!(out[1], i32::MAX, "lane 1: i32::MAX + 260100 clamps to MAX");
+        assert_eq!(out[2], i32::MIN, "lane 2: i32::MIN + 0 stays MIN");
+    }
+
+    // ================== Phase 4: hand-computed known-value tests (word variants) ==================
+    // Each independent of the implementation; 2 products/lane. The critical case includes a
+    // `u16 × u16` product that exceeds `i32::MAX`, proving the i64-wide accumulation in the
+    // oracle (an i32-truncating oracle would mis-model it).
+    // [vnni-int8-int16-family.TESTS.2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+    /// Hand-computed value for `dpwsud` (SU, wrap; words). `a` signed, `b` unsigned, 2
+    /// products/lane.
+    ///
+    /// * lane 0: `src=0`, products `(-3)*4 = -12` and `(-3)*4 = -12` → `0 + (-24) = -24`.
+    /// * lane 1: `src=1000`, products `7*65535 = 458745` ×2 → `1000 + 917490 = 918490`.
+    ///   `7 * 65535 = 458_745` fits in i32; the *sum* `918_490` also fits — but each operand
+    ///   is a full-range u16, exercising zero-extension of `b`.
+    #[test]
+    fn dpwsud_known_value() {
+        let mut a = [0i16; 16];
+        let mut b = [0u16; 16];
+        // lane 0 (a[0..2], b[0..2]).
+        for slot in 0..2 {
+            a[slot] = -3;
+            b[slot] = 4;
+        }
+        // lane 1 (a[2..4], b[2..4]).
+        for slot in 2..4 {
+            a[slot] = 7;
+            b[slot] = 65535;
+        }
+        let mut src = [0i32; 8];
+        src[1] = 1000;
+
+        let out = dpwsud(src, a, b);
+        assert_eq!(out[0], -24, "lane 0: 0 + 2*(-3*4) = -24");
+        assert_eq!(out[1], 918_490, "lane 1: 1000 + 2*(7*65535) = 918490");
+    }
+
+    /// Hand-computed value for `dpwsuds` (SU, saturate; words), covering the clamp.
+    ///
+    /// * lane 0: `src=0`, products `32767*65535 = 2_147_385_345` ×2 = `4_294_770_690`
+    ///   (exceeds i32::MAX) → clamps to `i32::MAX`. This is the `> i32::MAX` product/sum case.
+    /// * lane 1: `src=i32::MIN`, products `(-32768)*65535 = -2_147_450_880` ×2 → clamps to
+    ///   `i32::MIN`.
+    /// * lane 2: `src=5`, products `1*2 = 2` ×2 → `5 + 4 = 9` (no clamp).
+    #[test]
+    fn dpwsuds_known_value() {
+        let mut a = [0i16; 16];
+        let mut b = [0u16; 16];
+        for slot in 0..2 {
+            a[slot] = 32767;
+            b[slot] = 65535;
+        }
+        for slot in 2..4 {
+            a[slot] = -32768;
+            b[slot] = 65535;
+        }
+        for slot in 4..6 {
+            a[slot] = 1;
+            b[slot] = 2;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MIN;
+        src[2] = 5;
+
+        let out = dpwsuds(src, a, b);
+        assert_eq!(
+            out[0],
+            i32::MAX,
+            "lane 0: 2*(32767*65535) = 4294770690 > i32::MAX → clamp"
+        );
+        assert_eq!(
+            out[1],
+            i32::MIN,
+            "lane 1: i32::MIN + 2*(-32768*65535) clamps to MIN"
+        );
+        assert_eq!(out[2], 9, "lane 2: 5 + 2*(1*2) = 9, no clamp");
+    }
+
+    /// Hand-computed value for `dpwusd` (US, wrap; words). `a` unsigned, `b` signed; this is
+    /// the plan's manualExecution case plus a `u16 × i16` product exceeding `i32::MAX`.
+    ///
+    /// * lane 0: `src=0`, `a=65535`, `b=1`, products `65535*1 = 65535` ×2 → `131070`
+    ///   (the plan's `dpwusd([0;8],[65535;16],[1;16])` lane value).
+    /// * lane 1: `src=0`, `a=65535`, `b=32767`, products `65535*32767 = 2_147_385_345` ×2 =
+    ///   `4_294_770_690` (exceeds i32::MAX) → wraps (mod 2^32) to a defined i32. The oracle
+    ///   folds in i64 then wrapping-casts; an i32-truncating oracle would mis-model this.
+    #[test]
+    fn dpwusd_known_value() {
+        let mut a = [0u16; 16];
+        let mut b = [0i16; 16];
+        for slot in 0..2 {
+            a[slot] = 65535;
+            b[slot] = 1;
+        }
+        for slot in 2..4 {
+            a[slot] = 65535;
+            b[slot] = 32767;
+        }
+        let src = [0i32; 8];
+
+        let out = dpwusd(src, a, b);
+        assert_eq!(out[0], 131_070, "lane 0: 0 + 2*(65535*1) = 131070");
+        // lane 1: i64 sum = 2 * 65535 * 32767 = 4_294_770_690; wrapping into i32:
+        // 4_294_770_690 - 2^32 = 4_294_770_690 - 4_294_967_296 = -196_606.
+        let expected_lane1 = (2i64 * 65535 * 32767) as i32; // i64 → i32 wraps (`as`).
+        assert_eq!(
+            out[1], expected_lane1,
+            "lane 1: 2*(65535*32767) = 4294770690 wraps to {expected_lane1}"
+        );
+        assert_eq!(expected_lane1, -196_606, "wrap arithmetic sanity check");
+    }
+
+    // ============== Phase 5: deterministic differential tests (word variants pt 2) ==============
+    // dpwusds / dpwuud / dpwuuds — gated on `avxvnniint16` (not detected on this arm64 host, so
+    // the native block is skipped here; SDE CI exercises it). Each fails with
+    // `native path disagrees with oracle` (`NativeDivergesFromOracle`) on divergence; the public
+    // dispatcher is always checked against the oracle.
+    // [vnni-int8-int16-family.TESTS.1] [vnni-int8-int16-family.CORRECTNESS.1]
+
+    /// Differential test for `dpwusds` (US, saturate; words): native `VPDPWUSDS` vs the
+    /// saturating oracle, with inputs that exercise the clamp. `a` unsigned, `b` signed.
+    #[test]
+    fn dpwusds_hw_matches_scalar() {
+        let a: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(8191).wrapping_add(40000));
+        let b: [i16; 16] =
+            core::array::from_fn(|i| (i as i16).wrapping_mul(8009).wrapping_sub(16000));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 500_000_000);
+
+        let want = dpwusds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwusds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwusds(src, a, b), want);
+    }
+
+    /// Differential test for `dpwuud` (UU, wrap; words): native `VPDPWUUD` vs the wrapping
+    /// oracle. Both operands unsigned; the u16×u16 products (≈4.29e9) exercise the i64 fold.
+    #[test]
+    fn dpwuud_hw_matches_scalar() {
+        let a: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(4099).wrapping_add(50021));
+        let b: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(4093).wrapping_add(60013));
+        let src: [i32; 8] = core::array::from_fn(|i| (i as i32 - 4) * 17_000);
+
+        let want = dpwuud_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwuud_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwuud(src, a, b), want);
+    }
+
+    /// Differential test for `dpwuuds` (UU, saturate; words): native `VPDPWUUDS` vs the
+    /// saturating oracle. The largest product sums of the family drive the clamp.
+    #[test]
+    fn dpwuuds_hw_matches_scalar() {
+        let a: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(8191).wrapping_add(58000));
+        let b: [u16; 16] =
+            core::array::from_fn(|i| (i as u16).wrapping_mul(8101).wrapping_add(57000));
+        // Mix of large positive `src` (clamps toward MAX with the big positive products) and
+        // i32::MIN `src` lanes; all within i32 range when constructed.
+        let src: [i32; 8] = core::array::from_fn(|i| {
+            if i % 2 == 0 {
+                i32::MAX - (i as i32) * 1_000_000
+            } else {
+                i32::MIN + (i as i32) * 1_000_000
+            }
+        });
+
+        let want = dpwuuds_scalar(src, a, b);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avxvnniint16") {
+            // SAFETY: feature checked above.
+            assert_eq!(
+                unsafe { dpwuuds_hw(src, a, b) },
+                want,
+                "native path disagrees with oracle"
+            );
+        }
+        assert_eq!(dpwuuds(src, a, b), want);
+    }
+
+    // ============== Phase 5: hand-computed known-value tests (word variants pt 2) ==============
+    // Each independent of the implementation; 2 products/lane. The UU cases include products
+    // and sums exceeding i32::MAX (the u16 trap) AND the load-bearing opposite-sign case:
+    // src = i32::MIN with a large POSITIVE product sum, which under the single-saturate model
+    // clamps toward i32::MAX (NOT a collapse to ~0 that a two-stage clamp would produce).
+    // [vnni-int8-int16-family.TESTS.2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+    /// Hand-computed value for `dpwusds` (US, saturate; words). `a` unsigned, `b` signed.
+    ///
+    /// * lane 0: `src=0`, products `65535 * 1 = 65535` ×2 → `0 + 131070 = 131070` (no clamp).
+    /// * lane 1: `src=i32::MAX`, products `65535 * 32767 = 2_147_385_345` ×2 (positive) → clamp
+    ///   to `i32::MAX`.
+    /// * lane 2: `src=i32::MIN`, products `65535 * -32768 = -2_147_450_880` ×2 → clamp to
+    ///   `i32::MIN`.
+    /// * lane 3: `src=i32::MIN`, products `65535 * 32767 = 2_147_385_345` ×2 = `4_294_770_690`
+    ///   (a large POSITIVE sum). Single-saturate: `i32::MIN + 4_294_770_690 = 2_147_287_042`
+    ///   which is within i32 range → NO clamp, exact `2_147_287_042`. (A two-stage clamp would
+    ///   first clamp the product sum to i32::MAX then `i32::MIN.saturating_add(i32::MAX) = -1`,
+    ///   diverging from hardware — this lane locks the single-saturate model.)
+    #[test]
+    fn dpwusds_known_value() {
+        let mut a = [0u16; 16];
+        let mut b = [0i16; 16];
+        for slot in 0..2 {
+            a[slot] = 65535;
+            b[slot] = 1;
+        }
+        for slot in 2..4 {
+            a[slot] = 65535;
+            b[slot] = 32767;
+        }
+        for slot in 4..6 {
+            a[slot] = 65535;
+            b[slot] = -32768;
+        }
+        for slot in 6..8 {
+            a[slot] = 65535;
+            b[slot] = 32767;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MAX;
+        src[2] = i32::MIN;
+        src[3] = i32::MIN;
+
+        let out = dpwusds(src, a, b);
+        assert_eq!(
+            out[0], 131_070,
+            "lane 0: 0 + 2*(65535*1) = 131070, no clamp"
+        );
+        assert_eq!(
+            out[1],
+            i32::MAX,
+            "lane 1: i32::MAX + positive clamps to MAX"
+        );
+        assert_eq!(
+            out[2],
+            i32::MIN,
+            "lane 2: i32::MIN + 2*(65535*-32768) clamps to MIN"
+        );
+        // lane 3: i32::MIN + 2*(65535*32767) = -2147483648 + 4294770690 = 2147287042 (in range).
+        let lane3 = i32::MIN as i64 + 2 * 65535 * 32767;
+        assert_eq!(
+            lane3, 2_147_287_042,
+            "single-saturate full sum, in i32 range"
+        );
+        assert_eq!(
+            out[3], 2_147_287_042,
+            "lane 3: i32::MIN + large positive product sum stays in range (single-saturate)"
+        );
+    }
+
+    /// Hand-computed value for `dpwuud` (UU, wrap; words). Both operands unsigned.
+    ///
+    /// * lane 0: `src=0`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450`. Folded
+    ///   in i64 then wrapping-cast to i32: `8_589_672_450 mod 2^32` reinterpreted signed.
+    /// * lane 1: `src=100`, products `3*4 = 12` ×2 → `100 + 24 = 124` (small, no wrap concern).
+    #[test]
+    fn dpwuud_known_value() {
+        let mut a = [0u16; 16];
+        let mut b = [0u16; 16];
+        for slot in 0..2 {
+            a[slot] = 65535;
+            b[slot] = 65535;
+        }
+        for slot in 2..4 {
+            a[slot] = 3;
+            b[slot] = 4;
+        }
+        let mut src = [0i32; 8];
+        src[1] = 100;
+
+        let out = dpwuud(src, a, b);
+        // lane 0: i64 total = 0 + 2*(65535*65535) = 8_589_672_450; wrapping into i32:
+        // 8_589_672_450 - 2*2^32 = 8_589_672_450 - 8_589_934_592 = -262_142.
+        let lane0 = 8_589_672_450i64 as i32; // i64 → i32 wraps (`as`).
+        assert_eq!(lane0, -262_142, "wrap arithmetic sanity check");
+        assert_eq!(out[0], -262_142, "lane 0: 2*(65535*65535) wraps to -262142");
+        assert_eq!(out[1], 124, "lane 1: 100 + 2*(3*4) = 124");
+    }
+
+    /// Hand-computed value for `dpwuuds` (UU, saturate; words), covering the clamp AND the
+    /// opposite-sign single-saturate case.
+    ///
+    /// * lane 0: `src=0`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450`
+    ///   (far above i32::MAX) → clamp to `i32::MAX`.
+    /// * lane 1: `src=i32::MAX`, products `65535*65535` ×2 (positive) → clamp to `i32::MAX`.
+    /// * lane 2: `src=i32::MIN`, all products zero → stays `i32::MIN` (no underflow).
+    /// * lane 3: `src=i32::MIN`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450`
+    ///   (a huge POSITIVE sum). Single-saturate: `i32::MIN + 8_589_672_450 = 6_442_188_802`,
+    ///   which exceeds i32::MAX → clamp to `i32::MAX`. This is the load-bearing opposite-sign
+    ///   case: a two-stage clamp would give `i32::MIN.saturating_add(i32::MAX) = -1`, NOT
+    ///   i32::MAX — so this lane proves the single-saturate model.
+    #[test]
+    fn dpwuuds_known_value() {
+        let mut a = [0u16; 16];
+        let mut b = [0u16; 16];
+        // lane 0 (slots 0,1): big products, src=0 → clamp MAX.
+        for slot in 0..2 {
+            a[slot] = 65535;
+            b[slot] = 65535;
+        }
+        // lane 1 (slots 2,3): big positive products, src=i32::MAX → clamp MAX.
+        for slot in 2..4 {
+            a[slot] = 65535;
+            b[slot] = 65535;
+        }
+        // lane 2 (slots 4,5): left ZERO → src=i32::MIN stays MIN.
+        // lane 3 (slots 6,7): big positive products, src=i32::MIN → single-saturate clamps MAX.
+        for slot in 6..8 {
+            a[slot] = 65535;
+            b[slot] = 65535;
+        }
+        let mut src = [0i32; 8];
+        src[1] = i32::MAX;
+        src[2] = i32::MIN;
+        src[3] = i32::MIN;
+
+        let out = dpwuuds(src, a, b);
+        assert_eq!(
+            out[0],
+            i32::MAX,
+            "lane 0: 2*(65535*65535) = 8589672450 > i32::MAX → clamp"
+        );
+        assert_eq!(
+            out[1],
+            i32::MAX,
+            "lane 1: i32::MAX + positive clamps to MAX"
+        );
+        assert_eq!(out[2], i32::MIN, "lane 2: i32::MIN + 0 stays MIN");
+        // lane 3: i32::MIN + 8_589_672_450 = 6_442_188_802 > i32::MAX → clamp to i32::MAX.
+        let lane3 = i32::MIN as i64 + 2 * 65535 * 65535;
+        assert_eq!(
+            lane3, 6_442_188_802,
+            "single-saturate full sum exceeds i32::MAX"
+        );
+        assert_eq!(
+            out[3],
+            i32::MAX,
+            "lane 3: i32::MIN + huge positive sum clamps toward i32::MAX (single-saturate)"
+        );
+    }
 }
 
 /// Property-based tests. The hand-rolled tests above pin specific values; these
@@ -201,16 +1319,27 @@ mod proptests {
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 
-    /// A full, independently-random argument triple for [`dpbssd`].
+    /// A full, independently-random argument triple for the byte and word variants.
     ///
-    /// We wrap the three fixed-size arrays in a newtype because `quickcheck` does
-    /// not derive `Arbitrary` for arrays of this length; `from_fn` fills each lane
-    /// from the generator so every byte is sampled independently.
+    /// We wrap the fixed-size arrays in a newtype because `quickcheck` does not derive
+    /// `Arbitrary` for arrays of this length; `from_fn` fills each lane from the generator
+    /// (index ignored) so every element is sampled independently with no correlated bias.
+    /// The signed (`a`/`b`) and unsigned (`a_u`/`b_u`) byte operand fields let SS, SU and UU
+    /// byte variants each draw operands of the element types their signature requires; the
+    /// word fields (`a_w`/`b_w` = `[i16;16]`, `a_wu`/`b_wu` = `[u16;16]`) do the same for the
+    /// word variants.
+    /// [vnni-int8-int16-family.TESTS.4]
     #[derive(Clone, Debug)]
     struct Inputs {
         src: [i32; 8],
         a: [i8; 32],
         b: [i8; 32],
+        a_u: [u8; 32],
+        b_u: [u8; 32],
+        a_w: [i16; 16],
+        b_w: [i16; 16],
+        a_wu: [u16; 16],
+        b_wu: [u16; 16],
     }
 
     impl Arbitrary for Inputs {
@@ -219,6 +1348,12 @@ mod proptests {
                 src: core::array::from_fn(|_| i32::arbitrary(g)),
                 a: core::array::from_fn(|_| i8::arbitrary(g)),
                 b: core::array::from_fn(|_| i8::arbitrary(g)),
+                a_u: core::array::from_fn(|_| u8::arbitrary(g)),
+                b_u: core::array::from_fn(|_| u8::arbitrary(g)),
+                a_w: core::array::from_fn(|_| i16::arbitrary(g)),
+                b_w: core::array::from_fn(|_| i16::arbitrary(g)),
+                a_wu: core::array::from_fn(|_| u16::arbitrary(g)),
+                b_wu: core::array::from_fn(|_| u16::arbitrary(g)),
             }
         }
     }
@@ -281,6 +1416,807 @@ mod proptests {
             }
             dpbssd_scalar(input.src, a, b)[i]
                 == dpbssd_scalar(input.src, input.a, input.b)[i]
+        }
+    }
+
+    // ===================== dpbssds (SS, saturate; avxvnniint8) =====================
+
+    /// The independently-saturating reference accumulation a property checks `dpbssds`
+    /// against: widen each i8 operand to i64, fold the lane's products, then apply a single
+    /// signed-dword saturation of the full sum `src[i] + Σ products` (Intel SDM VPDPB*DS).
+    fn dpbssds_lane_expected(src: i32, a: &[i8; 32], b: &[i8; 32], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..4 {
+            acc += a[4 * i + k] as i64 * b[4 * i + k] as i64;
+        }
+        // Single signed-dword saturation of the full-precision sum (Intel SDM / Felix
+        // Cloutier VPDPB*DS): clamp `src + Σ products` once. (For bytes the product sum
+        // always fits i32, so this coincides with a two-stage clamp; the word ops are where
+        // the two models diverge.)
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    quickcheck! {
+        /// Differential property for `dpbssds`: native `VPDPBSSDS` must agree with the
+        /// saturating scalar oracle bit-for-bit. Discarded (never passed) when the feature
+        /// is absent, so a feature-less host cannot go vacuously green.
+        /// [vnni-int8-int16-family.TESTS.1]
+        fn dpbssds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbssds_scalar(input.src, input.a, input.b);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbssds_hw(input.src, input.a, input.b) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        /// The public `dpbssds` dispatcher always equals its scalar oracle.
+        fn dpbssds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbssds(input.src, input.a, input.b)
+                == dpbssds_scalar(input.src, input.a, input.b)
+        }
+
+        /// A zeroed multiplicand contributes nothing: the output is exactly `src`
+        /// (`src.saturating_add(0) == src`).
+        fn dpbssds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbssds_scalar(input.src, [0; 32], input.b) == input.src
+        }
+
+        /// Lane independence: output lane `i` depends only on `a[4i..4i+4]` and
+        /// `b[4i..4i+4]`.
+        fn dpbssds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i8; 32];
+            let mut b = [0i8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a[4 * i + k];
+                b[4 * i + k] = input.b[4 * i + k];
+            }
+            dpbssds_scalar(input.src, a, b)[i]
+                == dpbssds_scalar(input.src, input.a, input.b)[i]
+        }
+
+        /// Operand commutativity holds for `dpbssds` because it is signed×signed (SS):
+        /// each lane is a dot product `a·b`, so swapping the multiplicands is identical.
+        /// (NOT asserted for the mixed-signedness SU/US variants in later phases.)
+        /// [vnni-int8-int16-family.TESTS.3-2]
+        fn dpbssds_prop_operands_commute(input: Inputs) -> bool {
+            dpbssds_scalar(input.src, input.a, input.b)
+                == dpbssds_scalar(input.src, input.b, input.a)
+        }
+
+        /// Saturation property (...DS), replacing the wrapping `prop_src_is_additive`:
+        /// each lane equals `SIGNED_DWORD_SATURATE(src[i] + Σ products)` — i.e. the final
+        /// accumulation *saturates* (never wraps). Whenever the unbounded i64 lane total
+        /// would overflow i32, the lane sits exactly at the i32 boundary, which is the
+        /// observable difference from a wrapping variant.
+        /// [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.SCALAR_ORACLE.1-3]
+        fn dpbssds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpbssds_scalar(input.src, input.a, input.b);
+            (0..8).all(|i| {
+                // The lane matches the saturating reference exactly.
+                if out[i] != dpbssds_lane_expected(input.src[i], &input.a, &input.b, i) {
+                    return false;
+                }
+                // And when the unbounded total exceeds i32 range, the lane is clamped
+                // to the boundary — a wrapping variant would not be.
+                let total: i64 = input.src[i] as i64
+                    + (0..4)
+                        .map(|k| input.a[4 * i + k] as i64 * input.b[4 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
+        }
+    }
+
+    // ============== Phase 3: per-variant references + property selection ==============
+    // Per-variant property selection follows design §11 / research q6 exactly:
+    //   * ALL four: prop_hw_matches_scalar (discard on feature-absence), public_matches_scalar,
+    //     zero_operand_is_passthrough, lanes_are_independent.
+    //   * wrapping (...D) dpbsud, dpbuud: prop_src_is_additive (wrapping decomposition).
+    //   * saturating (...DS) dpbsuds, dpbuuds: saturating-add assertion + prop_output_saturates.
+    //   * UU dpbuud, dpbuuds: prop_operands_commute. NOT for SU dpbsud/dpbsuds — A1's distinct
+    //     [i8;32]/[u8;32] types make a b,a swap a *compile* error, so commutativity is not even
+    //     expressible (the crate-level `compile_fail` doctest is the executed witness of this).
+    // [vnni-int8-int16-family.TESTS.3] [vnni-int8-int16-family.TESTS.3-1]
+    // [vnni-int8-int16-family.TESTS.3-2] [vnni-int8-int16-family.TESTS.3-3]
+    // [vnni-int8-int16-family.CORRECTNESS.2]
+
+    /// Saturating reference for the SU `dpbsuds`: `a` sign-extends (i8), `b` zero-extends
+    /// (u8), products folded in i64, then a single signed-dword saturation of the full sum
+    /// `src + Σ products` (Intel SDM VPDPB*DS — no intermediate product-sum clamp).
+    fn dpbsuds_lane_expected(src: i32, a: &[i8; 32], b: &[u8; 32], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..4 {
+            acc += a[4 * i + k] as i64 * b[4 * i + k] as i64;
+        }
+        // Single signed-dword saturation of the full-precision sum (Intel SDM / Felix
+        // Cloutier VPDPB*DS): clamp `src + Σ products` once. (For bytes the product sum
+        // always fits i32, so this coincides with a two-stage clamp; the word ops are where
+        // the two models diverge.)
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    /// Saturating reference for the UU `dpbuuds`: both operands zero-extend (u8).
+    fn dpbuuds_lane_expected(src: i32, a: &[u8; 32], b: &[u8; 32], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..4 {
+            acc += a[4 * i + k] as i64 * b[4 * i + k] as i64;
+        }
+        // Single signed-dword saturation of the full-precision sum (Intel SDM / Felix
+        // Cloutier VPDPB*DS): clamp `src + Σ products` once. (For bytes the product sum
+        // always fits i32, so this coincides with a two-stage clamp; the word ops are where
+        // the two models diverge.)
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    quickcheck! {
+        // -------------------- dpbsud (SU, wrap; avxvnniint8) --------------------
+
+        /// Differential property for `dpbsud`: native `VPDPBSUD` vs the wrapping oracle.
+        /// Discarded (never passed) when `avxvnniint8` is absent.
+        fn dpbsud_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbsud_scalar(input.src, input.a, input.b_u);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbsud_hw(input.src, input.a, input.b_u) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpbsud_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbsud(input.src, input.a, input.b_u)
+                == dpbsud_scalar(input.src, input.a, input.b_u)
+        }
+
+        /// Wrapping additivity (...D): `src` is a pure wrapping-additive bias.
+        /// [vnni-int8-int16-family.TESTS.3-1]
+        fn dpbsud_prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpbsud_scalar(input.src, input.a, input.b_u);
+            let no_src = dpbsud_scalar([0; 8], input.a, input.b_u);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        fn dpbsud_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbsud_scalar(input.src, [0; 32], input.b_u) == input.src
+        }
+
+        fn dpbsud_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i8; 32];
+            let mut b = [0u8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a[4 * i + k];
+                b[4 * i + k] = input.b_u[4 * i + k];
+            }
+            dpbsud_scalar(input.src, a, b)[i]
+                == dpbsud_scalar(input.src, input.a, input.b_u)[i]
+        }
+        // NOTE: no `dpbsud_prop_operands_commute` — SU operand order is significant and
+        // A1's distinct [i8;32]/[u8;32] types make a swap a compile error (CORRECTNESS.2).
+
+        // -------------------- dpbsuds (SU, saturate; avxvnniint8) --------------------
+
+        /// Differential property for `dpbsuds`: native `VPDPBSUDS` vs the saturating oracle.
+        fn dpbsuds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbsuds_scalar(input.src, input.a, input.b_u);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbsuds_hw(input.src, input.a, input.b_u) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpbsuds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbsuds(input.src, input.a, input.b_u)
+                == dpbsuds_scalar(input.src, input.a, input.b_u)
+        }
+
+        fn dpbsuds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbsuds_scalar(input.src, [0; 32], input.b_u) == input.src
+        }
+
+        fn dpbsuds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i8; 32];
+            let mut b = [0u8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a[4 * i + k];
+                b[4 * i + k] = input.b_u[4 * i + k];
+            }
+            dpbsuds_scalar(input.src, a, b)[i]
+                == dpbsuds_scalar(input.src, input.a, input.b_u)[i]
+        }
+
+        /// Saturation property (...DS): every lane equals the saturating reference and
+        /// sits at the i32 boundary whenever the unbounded total would overflow.
+        /// [vnni-int8-int16-family.TESTS.3-3]
+        fn dpbsuds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpbsuds_scalar(input.src, input.a, input.b_u);
+            (0..8).all(|i| {
+                if out[i] != dpbsuds_lane_expected(input.src[i], &input.a, &input.b_u, i) {
+                    return false;
+                }
+                let total: i64 = input.src[i] as i64
+                    + (0..4)
+                        .map(|k| input.a[4 * i + k] as i64 * input.b_u[4 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
+        }
+        // NOTE: no `dpbsuds_prop_operands_commute` — SU, see dpbsud note above.
+
+        // -------------------- dpbuud (UU, wrap; avxvnniint8) --------------------
+
+        /// Differential property for `dpbuud`: native `VPDPBUUD` vs the wrapping oracle.
+        fn dpbuud_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbuud_scalar(input.src, input.a_u, input.b_u);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbuud_hw(input.src, input.a_u, input.b_u) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpbuud_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbuud(input.src, input.a_u, input.b_u)
+                == dpbuud_scalar(input.src, input.a_u, input.b_u)
+        }
+
+        /// Wrapping additivity (...D).
+        /// [vnni-int8-int16-family.TESTS.3-1]
+        fn dpbuud_prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpbuud_scalar(input.src, input.a_u, input.b_u);
+            let no_src = dpbuud_scalar([0; 8], input.a_u, input.b_u);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        fn dpbuud_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbuud_scalar(input.src, [0; 32], input.b_u) == input.src
+        }
+
+        fn dpbuud_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a_u[4 * i + k];
+                b[4 * i + k] = input.b_u[4 * i + k];
+            }
+            dpbuud_scalar(input.src, a, b)[i]
+                == dpbuud_scalar(input.src, input.a_u, input.b_u)[i]
+        }
+
+        /// Operand commutativity holds for `dpbuud` (UU): swapping the two u8 multiplicand
+        /// vectors leaves the dot product unchanged. (Asserted for UU only.)
+        /// [vnni-int8-int16-family.TESTS.3-2]
+        fn dpbuud_prop_operands_commute(input: Inputs) -> bool {
+            dpbuud_scalar(input.src, input.a_u, input.b_u)
+                == dpbuud_scalar(input.src, input.b_u, input.a_u)
+        }
+
+        // -------------------- dpbuuds (UU, saturate; avxvnniint8) --------------------
+
+        /// Differential property for `dpbuuds`: native `VPDPBUUDS` vs the saturating oracle.
+        fn dpbuuds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbuuds_scalar(input.src, input.a_u, input.b_u);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbuuds_hw(input.src, input.a_u, input.b_u) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpbuuds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbuuds(input.src, input.a_u, input.b_u)
+                == dpbuuds_scalar(input.src, input.a_u, input.b_u)
+        }
+
+        fn dpbuuds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbuuds_scalar(input.src, [0; 32], input.b_u) == input.src
+        }
+
+        fn dpbuuds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a_u[4 * i + k];
+                b[4 * i + k] = input.b_u[4 * i + k];
+            }
+            dpbuuds_scalar(input.src, a, b)[i]
+                == dpbuuds_scalar(input.src, input.a_u, input.b_u)[i]
+        }
+
+        /// Operand commutativity holds for `dpbuuds` (UU).
+        /// [vnni-int8-int16-family.TESTS.3-2]
+        fn dpbuuds_prop_operands_commute(input: Inputs) -> bool {
+            dpbuuds_scalar(input.src, input.a_u, input.b_u)
+                == dpbuuds_scalar(input.src, input.b_u, input.a_u)
+        }
+
+        /// Saturation property (...DS) for `dpbuuds`.
+        /// [vnni-int8-int16-family.TESTS.3-3]
+        fn dpbuuds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpbuuds_scalar(input.src, input.a_u, input.b_u);
+            (0..8).all(|i| {
+                if out[i] != dpbuuds_lane_expected(input.src[i], &input.a_u, &input.b_u, i) {
+                    return false;
+                }
+                let total: i64 = input.src[i] as i64
+                    + (0..4)
+                        .map(|k| input.a_u[4 * i + k] as i64 * input.b_u[4 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
+        }
+    }
+
+    // ============== Phase 4: word-variant references + property selection ==============
+    // dpwsud / dpwsuds / dpwusd (avxvnniint16, 2 products/lane). Per-variant selection:
+    //   * ALL three: prop_hw_matches_scalar (discard on avxvnniint16 absence),
+    //     public_matches_scalar, zero_operand_is_passthrough, lanes_are_independent.
+    //   * wrapping (...D) dpwsud, dpwusd: prop_src_is_additive (wrapping decomposition).
+    //   * saturating (...DS) dpwsuds: saturating-add assertion + prop_output_saturates.
+    //   * NO prop_operands_commute for ANY of the three — all are SU/US, operand order is
+    //     significant (`dpwsud != dpwusd`), and A1's distinct [i16;16]/[u16;16] types make a
+    //     `b,a` swap a compile error so commutativity is not even expressible.
+    // The lane references fold products in i64 — wide enough for the u16×u16 product trap.
+    // [vnni-int8-int16-family.TESTS.3] [vnni-int8-int16-family.TESTS.3-1]
+    // [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.CORRECTNESS.2]
+    // [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+    /// Saturating reference for the SU `dpwsuds`: `a` sign-extends (i16), `b` zero-extends
+    /// (u16). Products folded in i64 (cannot overflow before the clamp — `u16×u16` exceeds
+    /// i32::MAX), then a SINGLE signed-dword saturation of the full sum `src + Σ products`
+    /// (Intel SDM / Felix Cloutier VPDPW*DS — no intermediate clamp of the product-sum).
+    fn dpwsuds_lane_expected(src: i32, a: &[i16; 16], b: &[u16; 16], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..2 {
+            acc += a[2 * i + k] as i64 * b[2 * i + k] as i64;
+        }
+        // Single signed-dword saturation of the full-precision sum (Intel SDM / Felix
+        // Cloutier VPDPW*DS): clamp `src + Σ products` once; NO intermediate product-sum clamp.
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    quickcheck! {
+        // -------------------- dpwsud (SU, wrap; avxvnniint16) --------------------
+
+        /// Differential property for `dpwsud`: native `VPDPWSUD` vs the wrapping oracle.
+        /// Discarded (never passed) when `avxvnniint16` is absent, so a feature-less host
+        /// cannot go vacuously green.
+        fn dpwsud_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwsud_scalar(input.src, input.a_w, input.b_wu);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwsud_hw(input.src, input.a_w, input.b_wu) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwsud_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwsud(input.src, input.a_w, input.b_wu)
+                == dpwsud_scalar(input.src, input.a_w, input.b_wu)
+        }
+
+        /// Wrapping additivity (...D): `src` is a pure wrapping-additive bias.
+        /// [vnni-int8-int16-family.TESTS.3-1]
+        fn dpwsud_prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpwsud_scalar(input.src, input.a_w, input.b_wu);
+            let no_src = dpwsud_scalar([0; 8], input.a_w, input.b_wu);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        fn dpwsud_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwsud_scalar(input.src, [0; 16], input.b_wu) == input.src
+        }
+
+        fn dpwsud_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i16; 16];
+            let mut b = [0u16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_w[2 * i + k];
+                b[2 * i + k] = input.b_wu[2 * i + k];
+            }
+            dpwsud_scalar(input.src, a, b)[i]
+                == dpwsud_scalar(input.src, input.a_w, input.b_wu)[i]
+        }
+        // NOTE: no `dpwsud_prop_operands_commute` — SU operand order is significant
+        // (`dpwsud != dpwusd`); A1's distinct [i16;16]/[u16;16] types make a swap a compile
+        // error (CORRECTNESS.2).
+
+        // -------------------- dpwsuds (SU, saturate; avxvnniint16) --------------------
+
+        /// Differential property for `dpwsuds`: native `VPDPWSUDS` vs the saturating oracle.
+        fn dpwsuds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwsuds_scalar(input.src, input.a_w, input.b_wu);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwsuds_hw(input.src, input.a_w, input.b_wu) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwsuds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwsuds(input.src, input.a_w, input.b_wu)
+                == dpwsuds_scalar(input.src, input.a_w, input.b_wu)
+        }
+
+        fn dpwsuds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwsuds_scalar(input.src, [0; 16], input.b_wu) == input.src
+        }
+
+        fn dpwsuds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i16; 16];
+            let mut b = [0u16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_w[2 * i + k];
+                b[2 * i + k] = input.b_wu[2 * i + k];
+            }
+            dpwsuds_scalar(input.src, a, b)[i]
+                == dpwsuds_scalar(input.src, input.a_w, input.b_wu)[i]
+        }
+
+        /// Saturation property (...DS): every lane equals the saturating reference and sits
+        /// at the i32 boundary whenever the unbounded i64 total would overflow. The u16×u16
+        /// product reaching ~4.29e9 makes this the load-bearing word-saturation check.
+        /// [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+        fn dpwsuds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpwsuds_scalar(input.src, input.a_w, input.b_wu);
+            (0..8).all(|i| {
+                if out[i] != dpwsuds_lane_expected(input.src[i], &input.a_w, &input.b_wu, i) {
+                    return false;
+                }
+                // ISA single saturation (Intel SDM / Felix Cloutier VPDPW*DS): the full
+                // i64 total `src + Σ products` is clamped once into [i32::MIN, i32::MAX].
+                // There is NO intermediate clamp of the product-sum before adding src — for
+                // word ops the product sum can itself exceed i32 (the u16 trap), and a
+                // two-stage clamp would diverge from hardware when src and the product sum
+                // have opposite signs and the product sum's magnitude exceeds the i32 range.
+                let total: i64 = input.src[i] as i64
+                    + (0..2)
+                        .map(|k| input.a_w[2 * i + k] as i64 * input.b_wu[2 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
+        }
+        // NOTE: no `dpwsuds_prop_operands_commute` — SU, see dpwsud note above.
+
+        // -------------------- dpwusd (US, wrap; avxvnniint16) --------------------
+
+        /// Differential property for `dpwusd`: native `VPDPWUSD` vs the wrapping oracle.
+        /// `a` is unsigned (`[u16;16]`), `b` signed (`[i16;16]`) — inverse of `dpwsud`.
+        fn dpwusd_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwusd_scalar(input.src, input.a_wu, input.b_w);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwusd_hw(input.src, input.a_wu, input.b_w) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwusd_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwusd(input.src, input.a_wu, input.b_w)
+                == dpwusd_scalar(input.src, input.a_wu, input.b_w)
+        }
+
+        /// Wrapping additivity (...D): `src` is a pure wrapping-additive bias.
+        /// [vnni-int8-int16-family.TESTS.3-1]
+        fn dpwusd_prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpwusd_scalar(input.src, input.a_wu, input.b_w);
+            let no_src = dpwusd_scalar([0; 8], input.a_wu, input.b_w);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        fn dpwusd_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwusd_scalar(input.src, [0; 16], input.b_w) == input.src
+        }
+
+        fn dpwusd_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u16; 16];
+            let mut b = [0i16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_wu[2 * i + k];
+                b[2 * i + k] = input.b_w[2 * i + k];
+            }
+            dpwusd_scalar(input.src, a, b)[i]
+                == dpwusd_scalar(input.src, input.a_wu, input.b_w)[i]
+        }
+        // NOTE: no `dpwusd_prop_operands_commute` — US operand order is significant
+        // (`dpwusd != dpwsud`); distinct [u16;16]/[i16;16] types make a swap a compile error.
+    }
+
+    // ============== Phase 5: word-variant pt 2 references + property selection ==============
+    // dpwusds / dpwuud / dpwuuds (avxvnniint16, 2 products/lane). Per-variant selection:
+    //   * ALL three: prop_hw_matches_scalar (discard on avxvnniint16 absence),
+    //     public_matches_scalar, zero_operand_is_passthrough, lanes_are_independent.
+    //   * wrapping (...D) dpwuud ONLY: prop_src_is_additive (wrapping decomposition).
+    //   * saturating (...DS) dpwusds, dpwuuds: saturating-add assertion + prop_output_saturates.
+    //   * prop_operands_commute for dpwuud, dpwuuds (UU) ONLY — explicitly NOT for dpwusds (US),
+    //     whose operand order is significant (`dpwusds != dpwsuds`) and whose A1 distinct
+    //     [u16;16]/[i16;16] types make a `b,a` swap a compile error (commutativity not expressible).
+    // The saturating references fold products in i64 — wide enough for the u16×u16 trap — then
+    // apply the SINGLE signed-dword saturation of the full sum `src + Σ products` (NO intermediate
+    // product-sum clamp), the model that matches hardware when src and the product sum have
+    // opposite signs.
+    // [vnni-int8-int16-family.TESTS.3] [vnni-int8-int16-family.TESTS.3-1]
+    // [vnni-int8-int16-family.TESTS.3-2] [vnni-int8-int16-family.TESTS.3-3]
+    // [vnni-int8-int16-family.CORRECTNESS.2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+
+    /// Saturating reference for the US `dpwusds`: `a` zero-extends (u16), `b` sign-extends
+    /// (i16). Products folded in i64, then a SINGLE signed-dword saturation of the full sum
+    /// `src + Σ products` (Intel SDM / Felix Cloutier VPDPW*DS — no intermediate clamp).
+    fn dpwusds_lane_expected(src: i32, a: &[u16; 16], b: &[i16; 16], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..2 {
+            acc += a[2 * i + k] as i64 * b[2 * i + k] as i64;
+        }
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    /// Saturating reference for the UU `dpwuuds`: both operands zero-extend (u16). The u16×u16
+    /// products reach ≈4.29e9 and the lane sum ≈8.59e9, so the i64 fold and the single
+    /// full-sum saturation are both load-bearing.
+    fn dpwuuds_lane_expected(src: i32, a: &[u16; 16], b: &[u16; 16], i: usize) -> i32 {
+        let mut acc = 0i64;
+        for k in 0..2 {
+            acc += a[2 * i + k] as i64 * b[2 * i + k] as i64;
+        }
+        let total: i64 = src as i64 + acc;
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    quickcheck! {
+        // -------------------- dpwusds (US, saturate; avxvnniint16) --------------------
+
+        /// Differential property for `dpwusds`: native `VPDPWUSDS` vs the saturating oracle.
+        /// Discarded (never passed) when `avxvnniint16` is absent.
+        fn dpwusds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwusds_scalar(input.src, input.a_wu, input.b_w);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwusds_hw(input.src, input.a_wu, input.b_w) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwusds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwusds(input.src, input.a_wu, input.b_w)
+                == dpwusds_scalar(input.src, input.a_wu, input.b_w)
+        }
+
+        fn dpwusds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwusds_scalar(input.src, [0; 16], input.b_w) == input.src
+        }
+
+        fn dpwusds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u16; 16];
+            let mut b = [0i16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_wu[2 * i + k];
+                b[2 * i + k] = input.b_w[2 * i + k];
+            }
+            dpwusds_scalar(input.src, a, b)[i]
+                == dpwusds_scalar(input.src, input.a_wu, input.b_w)[i]
+        }
+
+        /// Saturation property (...DS): every lane equals the single-full-sum-saturating
+        /// reference and sits at the i32 boundary whenever the unbounded i64 total overflows.
+        /// [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+        fn dpwusds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpwusds_scalar(input.src, input.a_wu, input.b_w);
+            (0..8).all(|i| {
+                if out[i] != dpwusds_lane_expected(input.src[i], &input.a_wu, &input.b_w, i) {
+                    return false;
+                }
+                let total: i64 = input.src[i] as i64
+                    + (0..2)
+                        .map(|k| input.a_wu[2 * i + k] as i64 * input.b_w[2 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
+        }
+        // NOTE: no `dpwusds_prop_operands_commute` — US operand order is significant
+        // (`dpwusds != dpwsuds`); A1's distinct [u16;16]/[i16;16] types make a swap a compile
+        // error (CORRECTNESS.2).
+
+        // -------------------- dpwuud (UU, wrap; avxvnniint16) --------------------
+
+        /// Differential property for `dpwuud`: native `VPDPWUUD` vs the wrapping oracle.
+        fn dpwuud_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwuud_scalar(input.src, input.a_wu, input.b_wu);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwuud_hw(input.src, input.a_wu, input.b_wu) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwuud_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwuud(input.src, input.a_wu, input.b_wu)
+                == dpwuud_scalar(input.src, input.a_wu, input.b_wu)
+        }
+
+        /// Wrapping additivity (...D): `src` is a pure wrapping-additive bias.
+        /// [vnni-int8-int16-family.TESTS.3-1]
+        fn dpwuud_prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpwuud_scalar(input.src, input.a_wu, input.b_wu);
+            let no_src = dpwuud_scalar([0; 8], input.a_wu, input.b_wu);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        fn dpwuud_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwuud_scalar(input.src, [0; 16], input.b_wu) == input.src
+        }
+
+        fn dpwuud_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u16; 16];
+            let mut b = [0u16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_wu[2 * i + k];
+                b[2 * i + k] = input.b_wu[2 * i + k];
+            }
+            dpwuud_scalar(input.src, a, b)[i]
+                == dpwuud_scalar(input.src, input.a_wu, input.b_wu)[i]
+        }
+
+        /// Operand commutativity holds for `dpwuud` (UU): swapping the two u16 multiplicand
+        /// vectors leaves the dot product unchanged. (Asserted for UU only, NOT for US dpwusds.)
+        /// [vnni-int8-int16-family.TESTS.3-2]
+        fn dpwuud_prop_operands_commute(input: Inputs) -> bool {
+            dpwuud_scalar(input.src, input.a_wu, input.b_wu)
+                == dpwuud_scalar(input.src, input.b_wu, input.a_wu)
+        }
+
+        // -------------------- dpwuuds (UU, saturate; avxvnniint16) --------------------
+
+        /// Differential property for `dpwuuds`: native `VPDPWUUDS` vs the saturating oracle.
+        fn dpwuuds_prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint16") {
+                    let want = dpwuuds_scalar(input.src, input.a_wu, input.b_wu);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpwuuds_hw(input.src, input.a_wu, input.b_wu) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        fn dpwuuds_prop_public_matches_scalar(input: Inputs) -> bool {
+            dpwuuds(input.src, input.a_wu, input.b_wu)
+                == dpwuuds_scalar(input.src, input.a_wu, input.b_wu)
+        }
+
+        fn dpwuuds_prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpwuuds_scalar(input.src, [0; 16], input.b_wu) == input.src
+        }
+
+        fn dpwuuds_prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0u16; 16];
+            let mut b = [0u16; 16];
+            for k in 0..2 {
+                a[2 * i + k] = input.a_wu[2 * i + k];
+                b[2 * i + k] = input.b_wu[2 * i + k];
+            }
+            dpwuuds_scalar(input.src, a, b)[i]
+                == dpwuuds_scalar(input.src, input.a_wu, input.b_wu)[i]
+        }
+
+        /// Operand commutativity holds for `dpwuuds` (UU).
+        /// [vnni-int8-int16-family.TESTS.3-2]
+        fn dpwuuds_prop_operands_commute(input: Inputs) -> bool {
+            dpwuuds_scalar(input.src, input.a_wu, input.b_wu)
+                == dpwuuds_scalar(input.src, input.b_wu, input.a_wu)
+        }
+
+        /// Saturation property (...DS) for `dpwuuds`: the largest product sums of the family.
+        /// Every lane equals the single-full-sum-saturating reference and sits at the i32
+        /// boundary whenever the unbounded i64 total overflows — including the load-bearing
+        /// opposite-sign case (src negative, products large positive) which clamps toward
+        /// i32::MAX under the single-saturate model.
+        /// [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
+        fn dpwuuds_prop_output_saturates(input: Inputs) -> bool {
+            let out = dpwuuds_scalar(input.src, input.a_wu, input.b_wu);
+            (0..8).all(|i| {
+                if out[i] != dpwuuds_lane_expected(input.src[i], &input.a_wu, &input.b_wu, i) {
+                    return false;
+                }
+                let total: i64 = input.src[i] as i64
+                    + (0..2)
+                        .map(|k| input.a_wu[2 * i + k] as i64 * input.b_wu[2 * i + k] as i64)
+                        .sum::<i64>();
+                if total > i32::MAX as i64 {
+                    out[i] == i32::MAX
+                } else if total < i32::MIN as i64 {
+                    out[i] == i32::MIN
+                } else {
+                    true
+                }
+            })
         }
     }
 }

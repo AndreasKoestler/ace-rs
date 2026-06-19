@@ -14,9 +14,10 @@ env:
 
 jobs:
   # Core gate: builds, lints, and runs the suite on x86_64 Linux.
-  # This compiles the native `dpbssd_hw` path (x86_64), but only *executes* the
-  # scalar fallback unless the runner CPU happens to have AVX-VNNI-INT8 — native
-  # *execution* is proven by the `native-sde` job below.
+  # This compiles the native `*_hw` paths (x86_64), but only *executes* the
+  # scalar fallback unless the runner CPU happens to have AVX-VNNI-INT8 /
+  # AVX-VNNI-INT16 — native *execution* is proven by the `native-sde` job below.
+  # Runs on every push and pull_request as the fast scalar-only gate.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -29,10 +30,34 @@ jobs:
       - run: cargo build --verbose
       - run: cargo test --verbose
 
-  # Native-path verification: executes the real VPDPBSSD instruction under Intel
-  # SDE and asserts it matches the scalar oracle (see `hw_matches_scalar`). The
-  # `ACE_REQUIRE_NATIVE=1` guard (`native_runs_when_required`) makes the job fail
-  # if the native branch did NOT run, so this can never be a false green.
+  # Native-path verification: executes the real group-1 multiply-accumulate
+  # instructions (the avxvnniint8 byte ops AND the avxvnniint16 word ops) under
+  # Intel SDE and asserts each matches its scalar oracle (see `hw_matches_scalar`).
+  # The `ACE_REQUIRE_NATIVE=1` guard (`native_runs_when_required`) makes the job
+  # fail if a native branch did NOT run, so this can never be a false green.
+  #
+  # OQ-2 — the SDE arch flag must enable BOTH feature families.
+  # The runner emulates a CPU whose CPUID reports both `avxvnniint8` and
+  # `avxvnniint16`, because the suite exercises both families and the guard
+  # (extended in phase 6 to a *dual*-feature assert) requires both to have been
+  # detected at runtime. We use `-future` (the newest/broadest model) as the
+  # default flag: it is the most likely single flag to enable both features.
+  #   ⚠ UNVERIFIED LOCALLY: whether `sde64 -future` actually makes
+  #   `is_x86_feature_detected!("avxvnniint16")` return true inside the emulated
+  #   process can only be confirmed by an actual SDE run, which happens when this
+  #   job runs on push-to-main / workflow_dispatch. It cannot be checked on the
+  #   arm64 dev host or by `cargo` alone.
+  #   If a CI run shows `avxvnniint16` undetected, the job fails LOUDLY (see
+  #   below) — it does NOT go silently green. In that case switch the flag to
+  #   `-gnr` (Granite Rapids) or `-srf` (Sierra Forest), whichever an empirical
+  #   run confirms emulates both features, and update the RUNNER line below.
+  # Why a wrong flag fails loudly instead of green: the dual-feature guard
+  # asserts both tokens under ACE_REQUIRE_NATIVE=1. If the chosen flag enables
+  # only avxvnniint8 (the `Int8Only` outcome), the word-op differential
+  # properties discard and the guard panics with
+  #   `ACE_REQUIRE_NATIVE=1 but avxvnniint16 is not detected — the native path
+  #    was NOT exercised`
+  # turning the job RED — a byte-only run can never masquerade as full coverage.
   #
   # SDE is x86-host-only. Intel distributes it free under the Intel Simplified
   # Software License, which permits redistribution of the *unmodified* Software
@@ -43,8 +68,8 @@ jobs:
   # new tarball from Intel, attach it (plus its LICENSE) to a new release, and
   # point SDE_URL at the new asset. This job is isolated from the `test` gate,
   # so a hosting problem fails only this job — the core gate stays green.
-  # Alternative: a self-hosted x86_64 runner with an AVX-VNNI-INT8 CPU (Sierra
-  # Forest / Granite Rapids / Arrow Lake).
+  # Alternative: a self-hosted x86_64 runner with an AVX-VNNI-INT8 /
+  # AVX-VNNI-INT16 CPU (Sierra Forest / Granite Rapids / Arrow Lake).
   #
   # When it runs: on pushes to `main` (post-merge regression) and on manual
   # `workflow_dispatch` (run it against a PR branch on demand). It is skipped on
@@ -92,10 +117,13 @@ jobs:
           # Force the differential + guard tests to require the native branch.
           ACE_REQUIRE_NATIVE: "1"
           # Make cargo run each test binary under SDE emulating a CPU that has
-          # both AVX-VNNI-INT8 (group 1, iteration-0 `dpbssd`) and AVX10_V1_AUX
-          # (group 2, families A-G). `-future` selects the newest model, which
-          # exposes both; `-gnr` / `-srf` (Granite Rapids / Sierra Forest) have
-          # AVX-VNNI-INT8 but not necessarily AVX10.2.
+          # the full group-1 VNNI surface (AVX-VNNI-INT8 *and* AVX-VNNI-INT16)
+          # plus AVX10_V1_AUX (group 2, families A-G). `-future` selects the
+          # newest model and is our default (OQ-2, see the block above), which
+          # exposes all three; `-gnr` / `-srf` (Granite Rapids / Sierra Forest)
+          # have AVX-VNNI-INT8 but not necessarily AVX-VNNI-INT16 or AVX10.2 and
+          # are the documented fallbacks. The dual-feature guard makes any wrong
+          # flag fail LOUDLY rather than go silently green.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -future --"
         # `--features native` compiles the AVX10_V1_AUX C shims and exercises the
         # families-A-G native-vs-oracle differential under SDE (group-1 `dpbssd`
