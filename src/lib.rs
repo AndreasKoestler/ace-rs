@@ -123,3 +123,95 @@ mod tests {
         assert_eq!(dpbssd([0; 8], a, b), [30, 0, 0, 0, 0, 0, 0, 0]);
     }
 }
+
+/// Property-based tests. The hand-rolled tests above pin specific values; these
+/// assert the invariants hold across a randomly-sampled slice of the input space,
+/// which is far wider than any hand-picked vector can cover.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
+
+    /// A full, independently-random argument triple for [`dpbssd`].
+    ///
+    /// We wrap the three fixed-size arrays in a newtype because `quickcheck` does
+    /// not derive `Arbitrary` for arrays of this length; `from_fn` fills each lane
+    /// from the generator so every byte is sampled independently.
+    #[derive(Clone, Debug)]
+    struct Inputs {
+        src: [i32; 8],
+        a: [i8; 32],
+        b: [i8; 32],
+    }
+
+    impl Arbitrary for Inputs {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Inputs {
+                src: core::array::from_fn(|_| i32::arbitrary(g)),
+                a: core::array::from_fn(|_| i8::arbitrary(g)),
+                b: core::array::from_fn(|_| i8::arbitrary(g)),
+            }
+        }
+    }
+
+    quickcheck! {
+        /// Differential property — the headline guarantee. On any input the native
+        /// `VPDPBSSD` path must agree with the scalar oracle bit-for-bit. The case
+        /// is *discarded* (not passed) when the native path is unavailable, so a
+        /// runner without AVX-VNNI-INT8 cannot turn this into a vacuous green; under
+        /// CI's SDE job it exercises the real instruction over 100 random inputs.
+        fn prop_hw_matches_scalar(input: Inputs) -> TestResult {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avxvnniint8") {
+                    let want = dpbssd_scalar(input.src, input.a, input.b);
+                    // SAFETY: the feature was confirmed present immediately above.
+                    let got = unsafe { dpbssd_hw(input.src, input.a, input.b) };
+                    return TestResult::from_bool(got == want);
+                }
+            }
+            TestResult::discard()
+        }
+
+        /// The public dispatcher always equals the scalar oracle — this is the
+        /// contract callers rely on regardless of which path runs.
+        fn prop_public_matches_scalar(input: Inputs) -> bool {
+            dpbssd(input.src, input.a, input.b)
+                == dpbssd_scalar(input.src, input.a, input.b)
+        }
+
+        /// Accumulator linearity: `src` is a pure additive bias (wrapping i32),
+        /// independent of the dot products it is added to.
+        fn prop_src_is_additive(input: Inputs) -> bool {
+            let with_src = dpbssd_scalar(input.src, input.a, input.b);
+            let no_src = dpbssd_scalar([0; 8], input.a, input.b);
+            (0..8).all(|i| with_src[i] == input.src[i].wrapping_add(no_src[i]))
+        }
+
+        /// Operand symmetry: each lane is a dot product `a·b`, so swapping the two
+        /// multiplicand vectors leaves the result unchanged.
+        fn prop_operands_commute(input: Inputs) -> bool {
+            dpbssd_scalar(input.src, input.a, input.b)
+                == dpbssd_scalar(input.src, input.b, input.a)
+        }
+
+        /// A zeroed multiplicand contributes nothing: the output is exactly `src`.
+        fn prop_zero_operand_is_passthrough(input: Inputs) -> bool {
+            dpbssd_scalar(input.src, [0; 32], input.b) == input.src
+        }
+
+        /// Lane independence: output lane `i` depends only on `a[4i..4i+4]` and
+        /// `b[4i..4i+4]`. Zeroing every other lane's operands must not change it.
+        fn prop_lanes_are_independent(input: Inputs, lane: u8) -> bool {
+            let i = (lane % 8) as usize;
+            let mut a = [0i8; 32];
+            let mut b = [0i8; 32];
+            for k in 0..4 {
+                a[4 * i + k] = input.a[4 * i + k];
+                b[4 * i + k] = input.b[4 * i + k];
+            }
+            dpbssd_scalar(input.src, a, b)[i]
+                == dpbssd_scalar(input.src, input.a, input.b)[i]
+        }
+    }
+}

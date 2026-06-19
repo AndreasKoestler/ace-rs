@@ -11,3 +11,6 @@ publish = false
 name = "ace"
 
 [dependencies]
+
+[dev-dependencies]
+quickcheck = "1"
