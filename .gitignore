@@ -3,6 +3,3 @@
 
 # qrspi pipeline run artifacts and scratch diagrams (local-only)
 /.qrspi/
-/ticket.md
-/*.mmd
-/*.svg

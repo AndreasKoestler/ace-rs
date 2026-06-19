@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger. Use this to run the slow `native-sde` job against any branch
+  # (e.g. a PR branch) on demand: Actions tab → CI → "Run workflow" → pick the
+  # branch, or `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,26 +34,37 @@ jobs:
   # `ACE_REQUIRE_NATIVE=1` guard (`native_runs_when_required`) makes the job fail
   # if the native branch did NOT run, so this can never be a false green.
   #
-  # SDE is x86-host-only and its download URL/version rotates per release and is
-  # license-gated, so it can't be hardcoded here. Enable this job by setting a
-  # repository variable `SDE_URL` (Settings → Secrets and variables → Actions →
-  # Variables) to the SDE Linux tarball URL, e.g.
-  #   https://downloadmirror.intel.com/<id>/sde-external-<ver>-lin.tar.xz
-  # Until that variable is set the job is skipped (the `test` gate still runs).
-  # Alternatives: a self-hosted x86_64 runner with an AVX-VNNI-INT8 CPU (Sierra
-  # Forest / Granite Rapids / Arrow Lake), or a community SDE-install action.
+  # SDE is x86-host-only. Intel distributes it free under the Intel Simplified
+  # Software License, which permits redistribution of the *unmodified* Software
+  # provided the license accompanies it. Intel's own download mirror sits behind
+  # an AWS WAF that 202-challenges automated curl, so we self-host the verbatim
+  # tarball as a GitHub Release asset on this repo (license attached on the same
+  # release). Bump SDE_VERSION + SDE_URL together when upgrading: download the
+  # new tarball from Intel, attach it (plus its LICENSE) to a new release, and
+  # point SDE_URL at the new asset. This job is isolated from the `test` gate,
+  # so a hosting problem fails only this job — the core gate stays green.
+  # Alternative: a self-hosted x86_64 runner with an AVX-VNNI-INT8 CPU (Sierra
+  # Forest / Granite Rapids / Arrow Lake).
+  #
+  # When it runs: on pushes to `main` (post-merge regression) and on manual
+  # `workflow_dispatch` (run it against a PR branch on demand). It is skipped on
+  # ordinary pull_request events so the fast `test` gate isn't held up by the
+  # 33 MB download + emulated run on every push to a PR.
   native-sde:
     runs-on: ubuntu-latest
-    if: ${{ vars.SDE_URL != '' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    env:
+      SDE_VERSION: "10.8.0-2026-03-15"
+      # Self-hosted, unmodified SDE tarball (see release sde-10.8.0). Served by
+      # GitHub with a clean 200 — no WAF, no auth.
+      SDE_URL: "https://github.com/AndreasKoestler/ace-rs/releases/download/sde-10.8.0/sde-external-10.8.0-2026-03-15-lin.tar.xz"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Intel SDE
-        env:
-          SDE_URL: ${{ vars.SDE_URL }}
         run: |
           set -euo pipefail
-          curl -fSL "$SDE_URL" -o sde.tar.xz
+          curl -fSL --retry 3 --retry-delay 5 "$SDE_URL" -o sde.tar.xz
           mkdir -p "$HOME/sde"
           tar -xf sde.tar.xz -C "$HOME/sde" --strip-components=1
           echo "$HOME/sde" >> "$GITHUB_PATH"
