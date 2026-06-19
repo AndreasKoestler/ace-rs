@@ -112,9 +112,13 @@ pub use cvt_ps_ph::{cvt2ps_phx, cvt2ps_phx_scalar};
 
 // T1 toolchain risk gate (OQ-1, re-confirmed): `is_x86_feature_detected!("avxvnniint16")`
 // and all six word intrinsics (`_mm256_dpw{sud,suds,usd,usds,uud,uuds}_epi32`) plus the
-// five remaining byte intrinsics (`_mm256_dpb{ssds,sud,suds,uud,uuds}_epi32`) resolve on
-// stable Rust 1.96 (`cargo check --target x86_64-unknown-linux-gnu`, exit 0, no E0432) —
-// no MSRV bump and no nightly feature flags needed; the word-op phases may depend on them.
+// five remaining byte intrinsics (`_mm256_dpb{ssds,sud,suds,uud,uuds}_epi32`) resolve and
+// the macro-emitted dispatch/native bodies FULLY COMPILE on stable Rust 1.96 — verified by
+// a complete `cargo check --all-targets --target x86_64-unknown-linux-gnu` (exit 0), not
+// merely import resolution. (Import resolution alone is insufficient: an earlier "no E0432"
+// check passed while the macro bodies failed to compile — `is_x86_feature_detected!` rejects
+// a feature name forwarded as `:literal`, fixed by capturing `$feat` as `:tt`; see the macro.)
+// No MSRV bump and no nightly feature flags needed.
 
 /// Signed int8 dot-product-accumulate. (ACE group 1: AVX-VNNI-INT8, `VPDPBSSD`.)
 ///
@@ -231,7 +235,12 @@ macro_rules! define_dp {
         name = $name:ident,
         scalar = $scalar:ident,
         hw = $hw:ident,
-        feature = $feat:literal,
+        // `:tt`, NOT `:literal`: `is_x86_feature_detected!` (and `#[target_feature]`) reject a
+        // feature name forwarded as a pre-parsed `:literal` nonterminal — it arrives as one
+        // opaque token and `std_detect`'s name validation falls through to "unknown x86 target
+        // feature". A `:tt` forwards the bare string-literal token, which both accept. (The
+        // inline `dpbssd` works because its literal is at the macro's own call site.)
+        feature = $feat:tt,
         a = $a:ty,
         b = $b:ty,
         products = $ppl:expr,
@@ -292,9 +301,6 @@ macro_rules! define_dp {
     };
 }
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::_mm256_dpbssds_epi32;
-
 // First macro-emitted variant: dpbssds — signed×signed bytes, saturating (ACE group 1:
 // AVX-VNNI-INT8, `VPDPBSSDS`). Proves the `define_dp!` macro reproduces the `dpbssd` shape
 // end-to-end (dispatch → native _hw → scalar oracle) with the saturating accumulate path.
@@ -318,11 +324,6 @@ define_dp! {
 // wrapping (...D) and saturating (...DS) accumulate forms.
 // [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2]
 // [vnni-int8-int16-family.API.3] [vnni-int8-int16-family.NATIVE_PATH.1]
-
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{
-    _mm256_dpbsud_epi32, _mm256_dpbsuds_epi32, _mm256_dpbuud_epi32, _mm256_dpbuuds_epi32,
-};
 
 // dpbsud — signed×unsigned bytes, wrapping (ACE group 1: AVX-VNNI-INT8, `VPDPBSUD`).
 // `a: [i8;32]` sign-extends, `b: [u8;32]` zero-extends in the oracle widening cast.
@@ -395,9 +396,6 @@ define_dp! {
 // [vnni-int8-int16-family.NATIVE_PATH.1] [vnni-int8-int16-family.SCALAR_ORACLE.1-2]
 // [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm256_dpwsud_epi32, _mm256_dpwsuds_epi32, _mm256_dpwusd_epi32};
-
 // dpwsud — signed×unsigned words, wrapping (ACE group 1: AVX-VNNI-INT16, `VPDPWSUD`).
 // `a: [i16;16]` sign-extends, `b: [u16;16]` zero-extends in the oracle widening cast.
 define_dp! {
@@ -457,9 +455,6 @@ define_dp! {
 // [vnni-int8-int16-family.API.1] [vnni-int8-int16-family.API.2] [vnni-int8-int16-family.API.3]
 // [vnni-int8-int16-family.API.4] [vnni-int8-int16-family.NATIVE_PATH.1]
 // [vnni-int8-int16-family.SCALAR_ORACLE.1-2] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
-
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm256_dpwusds_epi32, _mm256_dpwuud_epi32, _mm256_dpwuuds_epi32};
 
 // dpwusds — unsigned×signed words, saturating (ACE group 1: AVX-VNNI-INT16, `VPDPWUSDS`).
 // `a: [u16;16]` zero-extends, `b: [i16;16]` sign-extends — inverse operand order of dpwsuds.
