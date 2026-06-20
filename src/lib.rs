@@ -195,11 +195,14 @@ unsafe fn dpbssd_hw(src: [i32; 8], a: [i8; 32], b: [i8; 32]) -> [i32; 8] {
 /// * `products` — products-per-lane (4 byte / 2 word); the operand arrays are `[_; products*8]`.
 /// * `intrinsic` — the matching `_mm256_dp<variant>_epi32` path.
 /// * `accumulate` — `wrap` (the `...D` variants: `wrapping_add` of the products onto the
-///   lane) or `saturate` (the `...DS` variants: a SINGLE signed-dword saturation of the
-///   full-precision sum — `out[i] = SIGNED_DWORD_SATURATE(src[i] + Σ products)`, per the
-///   Intel SDM / Felix Cloutier pseudocode for VPDPB*DS / VPDPW*DS; there is NO intermediate
-///   clamp of the product-sum before adding src). Products are summed in `i64` — wide enough
-///   that `u16×u16` cannot overflow before the single clamp.
+///   lane), `saturate` (the signed `...DS` variants — SS/SU/US: a SINGLE signed-dword
+///   saturation of the full-precision sum — `out[i] = SIGNED_DWORD_SATURATE(src[i] + Σ
+///   products)`), or `saturate_unsigned` (the UU `...DS` variants `VPDPBUUDS`/`VPDPWUUDS`: a
+///   SINGLE *unsigned*-dword saturation, `out[i] = UNSIGNED_DWORD_SATURATE(unsigned(src[i]) + Σ
+///   products)`, because both operands and the accumulator are unsigned). Both follow the Intel
+///   SDM / Felix Cloutier pseudocode for VPDPB*DS / VPDPW*DS; there is NO intermediate clamp of
+///   the product-sum before adding src. Products are summed in `i64` — wide enough that
+///   `u16×u16` cannot overflow before the single clamp.
 ///
 /// The native intrinsic is the differential tiebreaker for the saturation/accumulation-width
 /// question; the oracle is validated bit-for-bit against it under the SDE CI job.
@@ -228,6 +231,18 @@ macro_rules! define_dp {
     (@fold saturate, $src:expr, $acc:expr) => {{
         let total: i64 = ($src as i64) + $acc;
         total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }};
+    // `saturate_unsigned`: the UU `...DS` variants (`VPDPBUUDS` / `VPDPWUUDS`) saturate into
+    // the UNSIGNED dword range, NOT the signed range — both operands and the accumulator are
+    // unsigned. Per the Intel SDM / Felix Cloutier pseudocode:
+    //   DEST.dword[i] := UNSIGNED_DWORD_SATURATE( SRC.dword[i] + product1 + product2 [+ ...] )
+    // `SRC.dword[i]` is read as an unsigned dword; reinterpret `src`'s bits as `u32`, add the
+    // (non-negative) i64 product sum, clamp the total once into `[0, u32::MAX]`, then store the
+    // 32-bit pattern back as `i32`. (The lower bound never binds — both addends are >= 0 — but
+    // is kept for symmetry with the saturate semantics.)
+    (@fold saturate_unsigned, $src:expr, $acc:expr) => {{
+        let total: i64 = ($src as u32 as i64) + $acc;
+        total.clamp(0, u32::MAX as i64) as u32 as i32
     }};
 
     // ---- main entry: emit dispatch + scalar oracle + native _hw for one variant. -----
@@ -376,7 +391,7 @@ define_dp! {
     b = u8,
     products = 4,
     intrinsic = _mm256_dpbuuds_epi32,
-    accumulate = saturate
+    accumulate = saturate_unsigned
 }
 
 // ============== Phase 4: word variants part 1 — avxvnniint16, 2 products/lane ==============
@@ -439,16 +454,18 @@ define_dp! {
 }
 
 // ============== Phase 5: word variants part 2 — avxvnniint16, complete group-1 ==============
-// The final three word variants close the 12-cell grid: the last US-saturate (dpwusds), and
-// the unsigned×unsigned pair in both accumulate forms (dpwuud wrap, dpwuuds saturate). These
-// reuse the `define_dp!` macro UNCHANGED — `products = 2`, 16-element operand types, and the
-// macro's `@fold saturate` arm (a SINGLE signed-dword saturation of the FULL-PRECISION i64 sum
-// `src + Σ products`, per Intel SDM / Felix Cloutier VPDPW*DS — no intermediate product-sum
-// clamp). The UU variants carry the LARGEST product sums of the whole family (u16×u16 ≈ 4.29e9
-// per product, 2/lane ≈ 8.59e9), well beyond i32::MAX, so the i64 fold is load-bearing and the
-// single-saturate model is the only one matching hardware when src and the product sum have
-// opposite signs (e.g. src = i32::MIN + a large positive product sum clamps toward i32::MAX,
-// it does NOT collapse to ~0 as a two-stage clamp would).
+// The final three word variants close the 12-cell grid: the last US-saturate (dpwusds, signed
+// `@fold saturate`), and the unsigned×unsigned pair in both accumulate forms (dpwuud wrap,
+// dpwuuds saturate). These reuse the `define_dp!` macro `products = 2`, 16-element operand
+// types; dpwusds uses the signed `@fold saturate` arm (a SINGLE signed-dword saturation of the
+// FULL-PRECISION i64 sum `src + Σ products`, per Intel SDM / Felix Cloutier VPDPW*DS — no
+// intermediate product-sum clamp), while dpwuuds uses `@fold saturate_unsigned` — UU saturates
+// into the UNSIGNED dword range `[0, u32::MAX]` because both operands and the accumulator are
+// unsigned (VPDPWUUDS). The UU variants carry the LARGEST product sums of the whole family
+// (u16×u16 ≈ 4.29e9 per product, 2/lane ≈ 8.59e9), well beyond u32::MAX, so the i64 fold is
+// load-bearing: an unsigned total above u32::MAX clamps to u32::MAX (i32 `-1`), and one in
+// `(i32::MAX, u32::MAX]` is stored verbatim (reads back negative) rather than clamped to
+// i32::MAX as a signed-saturate would.
 //   * dpwusds is US (mixed signedness) — operand order significant (`dpwusds != dpwsuds`);
 //     A1's distinct [u16;16]/[i16;16] types make a `b,a` swap a compile error → NO commutativity.
 //   * dpwuud / dpwuuds are UU — both operands `[u16;16]` zero-extend, commutative.
@@ -486,8 +503,9 @@ define_dp! {
 }
 
 // dpwuuds — unsigned×unsigned words, saturating (ACE group 1: AVX-VNNI-INT16, `VPDPWUUDS`).
-// Commutative (UU); the largest-magnitude positive product sums of the family exercise the
-// single signed-dword saturation of `src + Σ products`.
+// Commutative (UU); both operands and the accumulator are unsigned, so the lane total
+// saturates into the UNSIGNED dword range `[0, u32::MAX]` (see the `@fold saturate_unsigned`
+// arm), NOT the signed range.
 define_dp! {
     name = dpwuuds,
     scalar = dpwuuds_scalar,
@@ -497,7 +515,7 @@ define_dp! {
     b = u16,
     products = 2,
     intrinsic = _mm256_dpwuuds_epi32,
-    accumulate = saturate
+    accumulate = saturate_unsigned
 }
 
 #[cfg(test)]
@@ -919,11 +937,18 @@ mod tests {
         assert_eq!(out[1], 700, "lane 1: -100 + 4*(10*20) = 700");
     }
 
-    /// Hand-computed value for `dpbuuds` (UU, saturate), covering the clamp.
+    /// Hand-computed value for `dpbuuds` (UU, saturate), covering UNSIGNED-dword saturation.
+    ///
+    /// `VPDPBUUDS` clamps the lane total into the *unsigned* dword range `[0, u32::MAX]` (not
+    /// the signed range), because both operands and the accumulator are unsigned.
     ///
     /// * lane 0: `src=0`, products `255*255 = 65025` ×4 → `260100` (no clamp).
-    /// * lane 1: `src=i32::MAX`, products `255*255` ×4 → clamps to `i32::MAX`.
-    /// * lane 2: `src=i32::MIN`, all products zero → stays `i32::MIN` (no underflow).
+    /// * lane 1: `src` bits = `i32::MAX`, products `255*255` ×4 → total `2_147_743_747` fits a
+    ///   u32 (no clamp) but has the high bit set, so the i32-reinterpreted result is negative —
+    ///   proving the saturation is UNSIGNED, not signed (signed-saturate would give i32::MAX).
+    /// * lane 2: `src` bits = `-1` (= u32::MAX), products `255*255` ×4 → overflows u32::MAX →
+    ///   clamps to u32::MAX (i32 `-1`).
+    /// * lane 3: `src` bits = `i32::MIN`, all products zero → stays `i32::MIN`.
     #[test]
     fn dpbuuds_known_value() {
         let mut a = [0u8; 32];
@@ -936,14 +961,27 @@ mod tests {
             a[slot] = 255;
             b[slot] = 255;
         }
+        for slot in 8..12 {
+            a[slot] = 255;
+            b[slot] = 255;
+        }
         let mut src = [0i32; 8];
         src[1] = i32::MAX;
-        src[2] = i32::MIN;
+        src[2] = -1;
+        src[3] = i32::MIN;
 
         let out = dpbuuds(src, a, b);
         assert_eq!(out[0], 260_100, "lane 0: 4 * 255*255 = 260100, no clamp");
-        assert_eq!(out[1], i32::MAX, "lane 1: i32::MAX + 260100 clamps to MAX");
-        assert_eq!(out[2], i32::MIN, "lane 2: i32::MIN + 0 stays MIN");
+        assert_eq!(
+            out[1],
+            (i32::MAX as u32).wrapping_add(260_100) as i32,
+            "lane 1: unsigned sum 2_147_743_747 fits u32 (no clamp) but reads negative as i32"
+        );
+        assert_eq!(
+            out[2], -1,
+            "lane 2: u32::MAX + 260100 clamps to u32::MAX (-1)"
+        );
+        assert_eq!(out[3], i32::MIN, "lane 3: i32::MIN bits + 0 stays i32::MIN");
     }
 
     // ================== Phase 4: hand-computed known-value tests (word variants) ==================
@@ -1243,66 +1281,56 @@ mod tests {
         assert_eq!(out[1], 124, "lane 1: 100 + 2*(3*4) = 124");
     }
 
-    /// Hand-computed value for `dpwuuds` (UU, saturate; words), covering the clamp AND the
-    /// opposite-sign single-saturate case.
+    /// Hand-computed value for `dpwuuds` (UU, saturate; words), covering UNSIGNED-dword
+    /// saturation.
     ///
-    /// * lane 0: `src=0`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450`
-    ///   (far above i32::MAX) → clamp to `i32::MAX`.
-    /// * lane 1: `src=i32::MAX`, products `65535*65535` ×2 (positive) → clamp to `i32::MAX`.
-    /// * lane 2: `src=i32::MIN`, all products zero → stays `i32::MIN` (no underflow).
-    /// * lane 3: `src=i32::MIN`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450`
-    ///   (a huge POSITIVE sum). Single-saturate: `i32::MIN + 8_589_672_450 = 6_442_188_802`,
-    ///   which exceeds i32::MAX → clamp to `i32::MAX`. This is the load-bearing opposite-sign
-    ///   case: a two-stage clamp would give `i32::MIN.saturating_add(i32::MAX) = -1`, NOT
-    ///   i32::MAX — so this lane proves the single-saturate model.
+    /// `VPDPWUUDS` clamps the lane total into the *unsigned* dword range `[0, u32::MAX]`, not
+    /// the signed range — both operands and the accumulator are unsigned.
+    ///
+    /// * lane 0: `src=0`, products `4*4 = 16` ×2 → `32` (no clamp).
+    /// * lane 1: `src` bits = `i32::MAX`, products `30000*30000 = 900_000_000` ×2 =
+    ///   `1_800_000_000` → total `3_947_483_647` fits a u32 (no clamp) but has the high bit set,
+    ///   so the i32-reinterpreted result is negative — proving the saturation is UNSIGNED, not
+    ///   signed (signed-saturate would give i32::MAX).
+    /// * lane 2: `src=0`, products `65535*65535 = 4_294_836_225` ×2 = `8_589_672_450` →
+    ///   overflows u32::MAX → clamps to u32::MAX (i32 `-1`).
+    /// * lane 3: `src` bits = `i32::MIN`, all products zero → stays `i32::MIN`.
     #[test]
     fn dpwuuds_known_value() {
         let mut a = [0u16; 16];
         let mut b = [0u16; 16];
-        // lane 0 (slots 0,1): big products, src=0 → clamp MAX.
+        // lane 0 (slots 0,1): small products, src=0 → no clamp.
         for slot in 0..2 {
-            a[slot] = 65535;
-            b[slot] = 65535;
+            a[slot] = 4;
+            b[slot] = 4;
         }
-        // lane 1 (slots 2,3): big positive products, src=i32::MAX → clamp MAX.
+        // lane 1 (slots 2,3): unsigned sum fits u32 but reads negative as i32.
         for slot in 2..4 {
+            a[slot] = 30000;
+            b[slot] = 30000;
+        }
+        // lane 2 (slots 4,5): products overflow u32::MAX → clamp to u32::MAX (-1).
+        for slot in 4..6 {
             a[slot] = 65535;
             b[slot] = 65535;
         }
-        // lane 2 (slots 4,5): left ZERO → src=i32::MIN stays MIN.
-        // lane 3 (slots 6,7): big positive products, src=i32::MIN → single-saturate clamps MAX.
-        for slot in 6..8 {
-            a[slot] = 65535;
-            b[slot] = 65535;
-        }
+        // lane 3 (slots 6,7): left ZERO → src=i32::MIN bits stay MIN.
         let mut src = [0i32; 8];
         src[1] = i32::MAX;
-        src[2] = i32::MIN;
         src[3] = i32::MIN;
 
         let out = dpwuuds(src, a, b);
-        assert_eq!(
-            out[0],
-            i32::MAX,
-            "lane 0: 2*(65535*65535) = 8589672450 > i32::MAX → clamp"
-        );
+        assert_eq!(out[0], 32, "lane 0: 2*(4*4) = 32, no clamp");
         assert_eq!(
             out[1],
-            i32::MAX,
-            "lane 1: i32::MAX + positive clamps to MAX"
-        );
-        assert_eq!(out[2], i32::MIN, "lane 2: i32::MIN + 0 stays MIN");
-        // lane 3: i32::MIN + 8_589_672_450 = 6_442_188_802 > i32::MAX → clamp to i32::MAX.
-        let lane3 = i32::MIN as i64 + 2 * 65535 * 65535;
-        assert_eq!(
-            lane3, 6_442_188_802,
-            "single-saturate full sum exceeds i32::MAX"
+            (i32::MAX as u32).wrapping_add(1_800_000_000) as i32,
+            "lane 1: unsigned sum 3_947_483_647 fits u32 (no clamp) but reads negative as i32"
         );
         assert_eq!(
-            out[3],
-            i32::MAX,
-            "lane 3: i32::MIN + huge positive sum clamps toward i32::MAX (single-saturate)"
+            out[2], -1,
+            "lane 2: 2*(65535*65535) = 8589672450 overflows u32::MAX → clamp to u32::MAX (-1)"
         );
+        assert_eq!(out[3], i32::MIN, "lane 3: i32::MIN bits + 0 stays i32::MIN");
     }
 }
 
@@ -1550,12 +1578,11 @@ mod proptests {
         for k in 0..4 {
             acc += a[4 * i + k] as i64 * b[4 * i + k] as i64;
         }
-        // Single signed-dword saturation of the full-precision sum (Intel SDM / Felix
-        // Cloutier VPDPB*DS): clamp `src + Σ products` once. (For bytes the product sum
-        // always fits i32, so this coincides with a two-stage clamp; the word ops are where
-        // the two models diverge.)
-        let total: i64 = src as i64 + acc;
-        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        // UNSIGNED-dword saturation of the full-precision sum (Intel SDM / Felix Cloutier
+        // VPDPBUUDS): `SRC.dword` is read as unsigned, so reinterpret `src`'s bits as u32 and
+        // clamp `unsigned(src) + Σ products` once into `[0, u32::MAX]`.
+        let total: i64 = src as u32 as i64 + acc;
+        total.clamp(0, u32::MAX as i64) as u32 as i32
     }
 
     quickcheck! {
@@ -1773,14 +1800,14 @@ mod proptests {
                 if out[i] != dpbuuds_lane_expected(input.src[i], &input.a_u, &input.b_u, i) {
                     return false;
                 }
-                let total: i64 = input.src[i] as i64
+                // UU saturates into the UNSIGNED dword range; `src` is read as unsigned and
+                // the only binding bound is `u32::MAX` (its bit pattern is `-1` as i32).
+                let total: i64 = input.src[i] as u32 as i64
                     + (0..4)
                         .map(|k| input.a_u[4 * i + k] as i64 * input.b_u[4 * i + k] as i64)
                         .sum::<i64>();
-                if total > i32::MAX as i64 {
-                    out[i] == i32::MAX
-                } else if total < i32::MIN as i64 {
-                    out[i] == i32::MIN
+                if total > u32::MAX as i64 {
+                    out[i] == -1
                 } else {
                     true
                 }
@@ -2022,8 +2049,10 @@ mod proptests {
         for k in 0..2 {
             acc += a[2 * i + k] as i64 * b[2 * i + k] as i64;
         }
-        let total: i64 = src as i64 + acc;
-        total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        // UNSIGNED-dword saturation (Intel SDM / Felix Cloutier VPDPWUUDS): reinterpret
+        // `src`'s bits as u32 and clamp `unsigned(src) + Σ products` once into `[0, u32::MAX]`.
+        let total: i64 = src as u32 as i64 + acc;
+        total.clamp(0, u32::MAX as i64) as u32 as i32
     }
 
     quickcheck! {
@@ -2189,10 +2218,11 @@ mod proptests {
         }
 
         /// Saturation property (...DS) for `dpwuuds`: the largest product sums of the family.
-        /// Every lane equals the single-full-sum-saturating reference and sits at the i32
-        /// boundary whenever the unbounded i64 total overflows — including the load-bearing
-        /// opposite-sign case (src negative, products large positive) which clamps toward
-        /// i32::MAX under the single-saturate model.
+        /// Every lane equals the unsigned-saturating reference and sits at the `u32::MAX`
+        /// boundary (bit pattern `-1` as i32) whenever the unbounded total exceeds it. UU
+        /// saturates into the UNSIGNED dword range, so — unlike the signed `...DS` variants —
+        /// there is no high-side clamp to `i32::MAX`: an unsigned total in `(i32::MAX, u32::MAX]`
+        /// is stored verbatim and reads back negative.
         /// [vnni-int8-int16-family.TESTS.3-3] [vnni-int8-int16-family.SCALAR_ORACLE.1-4]
         fn dpwuuds_prop_output_saturates(input: Inputs) -> bool {
             let out = dpwuuds_scalar(input.src, input.a_wu, input.b_wu);
@@ -2200,14 +2230,12 @@ mod proptests {
                 if out[i] != dpwuuds_lane_expected(input.src[i], &input.a_wu, &input.b_wu, i) {
                     return false;
                 }
-                let total: i64 = input.src[i] as i64
+                let total: i64 = input.src[i] as u32 as i64
                     + (0..2)
                         .map(|k| input.a_wu[2 * i + k] as i64 * input.b_wu[2 * i + k] as i64)
                         .sum::<i64>();
-                if total > i32::MAX as i64 {
-                    out[i] == i32::MAX
-                } else if total < i32::MIN as i64 {
-                    out[i] == i32::MIN
+                if total > u32::MAX as i64 {
+                    out[i] == -1
                 } else {
                     true
                 }
