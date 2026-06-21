@@ -70,12 +70,35 @@ jobs:
           echo "$HOME/sde" >> "$GITHUB_PATH"
       - name: Verify SDE is runnable
         run: sde64 --version
-      - name: Run tests with the native path executed under SDE
+      - name: Ensure an AVX10.2-capable C compiler (for the `native` feature)
+        # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` with
+        # `-mavx10.2` (design decision D7), which the `cc` crate drives via $CC.
+        # AVX10.2 intrinsics require GCC >= 15 or Clang >= 20. Probe the runner's
+        # default toolchains; fall back to an explicit gcc-15 install. Fail fast
+        # with an actionable message if none is available, rather than emitting a
+        # confusing mid-build cc error.
+        run: |
+          set -euo pipefail
+          probe() { printf '#include <immintrin.h>\nint main(){return 0;}\n' | "$1" -mavx10.2 -x c -c - -o /dev/null 2>/dev/null; }
+          if probe gcc; then echo "CC=gcc" >> "$GITHUB_ENV"
+          elif probe clang; then echo "CC=clang" >> "$GITHUB_ENV"
+          else
+            sudo apt-get update && sudo apt-get install -y gcc-15
+            probe gcc-15 || { echo "::error::No AVX10.2-capable C compiler (need GCC >= 15 or Clang >= 20) — cannot build the native feature"; exit 1; }
+            echo "CC=gcc-15" >> "$GITHUB_ENV"
+          fi
+      - name: Run tests with the native paths executed under SDE
         env:
           # Force the differential + guard tests to require the native branch.
           ACE_REQUIRE_NATIVE: "1"
           # Make cargo run each test binary under SDE emulating a CPU that has
-          # AVX-VNNI-INT8. `-future` selects the newest model; `-gnr` / `-srf`
-          # (Granite Rapids / Sierra Forest) also have the feature.
+          # both AVX-VNNI-INT8 (group 1, iteration-0 `dpbssd`) and AVX10_V1_AUX
+          # (group 2, families A-G). `-future` selects the newest model, which
+          # exposes both; `-gnr` / `-srf` (Granite Rapids / Sierra Forest) have
+          # AVX-VNNI-INT8 but not necessarily AVX10.2.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -future --"
-        run: cargo test --target x86_64-unknown-linux-gnu --verbose
+        # `--features native` compiles the AVX10_V1_AUX C shims and exercises the
+        # families-A-G native-vs-oracle differential under SDE (group-1 `dpbssd`
+        # uses the always-available stdlib intrinsic, so it runs either way). The
+        # core `test` gate above still covers the default oracle-only build.
+        run: cargo test --features native --target x86_64-unknown-linux-gnu --verbose

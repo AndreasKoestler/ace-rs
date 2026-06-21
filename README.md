@@ -56,5 +56,6 @@ cargo test --target x86_64-unknown-linux-gnu
 | Bullet | Primitive | Group |
 |--------|-----------|-------|
 | 0 ✅ | `dpbssd` | 1 (AVX-VNNI-INT8) |
-| 1 | `VCVTPS2HF8` (FP32→FP8) | 3 (OCP conversions) |
-| 2 | `TOP2BF16PS` (BF16 rank-2 outer product) | 4 (ACE tile) — gated, see design §7 |
+| 1 | FP16↔FP8 converts + EVEX VNNI (see `ticket.md`) | 2 (AVX10.2 subset, `AVX10_V1_AUX`) |
+| 2 | `VCVTPS2HF8` (FP32→FP8) | 3 (OCP conversions) |
+| 3 | `TOP2BF16PS` (BF16 rank-2 outer product) | 4 (ACE tile) — gated, see design §7 |

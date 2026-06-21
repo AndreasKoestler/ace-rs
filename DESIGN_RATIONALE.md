@@ -155,8 +155,9 @@ Capability-detect SDE coverage and **skip-with-warning**, do not fail: a one-ins
 | Bullet | Primitive | New axis introduced |
 |--------|-----------|---------------------|
 | 0 | `dpbssd` (group 1) | dispatch + oracle + differential-test skeleton (D9) |
-| 1 | `VCVTPS2HF8` FP32→FP8 (group 3) | AVX10.2 gating, FP8 format + rounding oracle, first SDE-only test |
-| 2 | `TOP2BF16PS` BF16 rank-2 outer product (group 4) | stateful RAII tile guard (D8), palette 2, the real engine — **`ACE`-gated; not in binutils 2.44 / likely not SDE 10.8 (§7): `.byte` encoding + layers 1–2 only until tooling lands** |
+| 1 | AVX10.2 Subset / `AVX10_V1_AUX` (group 2): FP16↔FP8 converts + EVEX VNNI | `AVX10_V1_AUX` gating, FP8 format + RTNE/bias rounding oracle, first SDE-only tests; EVEX-generalizes the group-1 dot product. See `ticket.md`. |
+| 2 | `VCVTPS2HF8` FP32→FP8 (group 3) | FP32→FP8 convert + round-to-odd oracle (reuses the FP8 format oracle from bullet 1) |
+| 3 | `TOP2BF16PS` BF16 rank-2 outer product (group 4) | stateful RAII tile guard (D8), palette 2, the real engine — **`ACE`-gated; not in binutils 2.44 / likely not SDE 10.8 (§7): `.byte` encoding + layers 1–2 only until tooling lands** |
 
 ---
 
