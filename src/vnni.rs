@@ -35,9 +35,10 @@
 //! module-qualified as `ace::vnni::*`).
 //!
 //! Every primitive is a safe public dispatcher that selects a native path when the running
-//! CPU supports `AVX10_V1_AUX` (oracle-only in v1: no stable EVEX intrinsic exists yet, so
-//! the native slot is dormant per `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]`) and
-//! otherwise falls back to its `_scalar` oracle. The `_scalar` oracle is the primary,
+//! CPU supports `AVX10_V1_AUX` (via a hand-written C shim behind the opt-in `native` feature
+//! — no stable `core::arch` EVEX intrinsic exists yet — per
+//! `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]`) and otherwise falls back to its `_scalar`
+//! oracle. The `_scalar` oracle is the primary,
 //! always-correct path on every target including non-x86
 //! (`[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`); the dispatcher equals it bit-for-bit
 //! (`[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.2]`). The names mirror the eventual stdarch
