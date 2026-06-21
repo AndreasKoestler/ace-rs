@@ -3,6 +3,7 @@
 ## Git
 
 - **Do not commit to `master`/`main`.** Always create or switch to a feature branch before committing. The default branch is reserved for merged, reviewed work.
+- **Never push.** Do not run `git push` (or any other remote-publishing command) under any circumstances. Commit locally only — the human handles all pushes.
 
 ## Testing
 
