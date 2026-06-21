@@ -15,9 +15,12 @@
 //!
 //! **Iteration 1** (in progress) adds the `AVX10_V1_AUX` family of FP16↔FP8 / FP32→FP16
 //! converts and the EVEX byte/word VNNI matrix, each behind a crate-owned capability check
-//! ([`detect`]) over the shared FP8/FP16 conversion oracle ([`fp8`]). In v1 every new
-//! primitive ships oracle-only: no stable EVEX intrinsic exists yet, so the native slot is
-//! dormant ([avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]).
+//! ([`detect`]) over the shared FP8/FP16 conversion oracle ([`fp8`]). The scalar oracle is
+//! the primary, always-present path; an **opt-in native path** (the `native` cargo feature)
+//! routes each primitive to a hand-written C shim compiled with `-mavx10.2` — there is no
+//! stable `core::arch` EVEX intrinsic for these forms yet — taken only when
+//! `detect::has_avx10_v1_aux()` confirms the running CPU
+//! ([avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]). The default build is oracle-only.
 //!
 //! It also **completes the group-1 VEX family**: alongside iteration-0 [`dpbssd`] the crate
 //! root now exposes the 11 remaining `avxvnniint8` byte (`VPDPB*`) and `avxvnniint16` word
@@ -59,17 +62,18 @@
 //! fallback, and that **both** `avxvnniint8` and `avxvnniint16` were detected — a green
 //! native run cannot mean "byte ops native, word ops silently scalar"
 //! ([avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.2],
-//! [avx10-v1-aux-fp16-fp8-evex-vnni.CI.2]). For the new `AVX10_V1_AUX` families (A–G) the
-//! tripwire is intentionally **dormant**: no stable EVEX intrinsic exists yet (OQ-3,
-//! oracle-only v1, [avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]), so there is no native
-//! branch for it to require. Each new family nonetheless ships a *structurally present*
-//! `prop_native_matches_oracle` differential (in its `proptests` module) that compares the
-//! public dispatcher to the oracle under `detect::has_avx10_v1_aux()` and calls
-//! `TestResult::discard()` — never `from_bool(false)` — when no native path is present, so a
-//! fallback-only runner can never produce a vacuous green
+//! [avx10-v1-aux-fp16-fp8-evex-vnni.CI.2]). For the `AVX10_V1_AUX` families (A–G) the hard
+//! `ACE_REQUIRE_NATIVE` guard does **not** yet enforce native execution: their native path is
+//! a hand-written C shim behind the opt-in `native` feature (no stable `core::arch` EVEX
+//! intrinsic exists, OQ-3, [avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]), so a default build
+//! has no native branch to require. Each family does ship a live `prop_native_matches_oracle`
+//! differential (in its `proptests` module): under `feature="native"` on x86_64 with
+//! `detect::has_avx10_v1_aux()` it compares the C-shim native path to the scalar oracle
+//! bit-for-bit, and calls `TestResult::discard()` — never `from_bool(false)` — when the
+//! feature or hardware is absent, so a fallback-only runner can never produce a vacuous green
 //! ([avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.1],
-//! [avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.1-1]). When a stable AVX10.2 intrinsic
-//! lands, wiring the dormant slot turns each family's tripwire live by the same pattern.
+//! [avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.1-1]). Folding the `native`-feature AVX10
+//! path into the `ACE_REQUIRE_NATIVE` guard would make its tripwire live by the same pattern.
 //!
 //! # v1 non-goals — confirmed NOT implemented
 //!

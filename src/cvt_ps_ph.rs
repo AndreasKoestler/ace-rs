@@ -18,9 +18,10 @@
 //! `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT2_PS2PHX.1-2]`).
 //!
 //! The public dispatcher is a safe fn that selects a native path when the running CPU
-//! supports `AVX10_V1_AUX` (oracle-only in v1: no stable EVEX intrinsic exists yet, so the
-//! native slot is dormant per `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]`) and otherwise
-//! falls back to its `_scalar` oracle. The `_scalar` oracle is the primary, always-correct
+//! supports `AVX10_V1_AUX` (via a hand-written C shim behind the opt-in `native` feature —
+//! no stable `core::arch` EVEX intrinsic exists yet — per
+//! `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]`) and otherwise falls back to its `_scalar`
+//! oracle. The `_scalar` oracle is the primary, always-correct
 //! path on every target including non-x86 (`[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`); it
 //! carries no cfg gate, reads no global state, and the dispatcher equals it bit-for-bit
 //! (`[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.2]`). The name mirrors the eventual stdarch
@@ -37,7 +38,7 @@ use crate::fp8;
 /// (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT2_PS2PHX.1]`,
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT2_PS2PHX.1-3]`).
 ///
-/// Dispatches to the native path under `AVX10_V1_AUX` (dormant in v1) and otherwise to
+/// Dispatches to the native path under `AVX10_V1_AUX` (C shim, opt-in `native` feature) and otherwise to
 /// [`cvt2ps_phx_scalar`]; both return identical FP16 bit patterns.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.1]`
 pub fn cvt2ps_phx(src1: [f32; 16], src2: [f32; 16]) -> [u16; 32] {
