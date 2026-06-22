@@ -1,5 +1,17 @@
 /target
 /Cargo.lock
 
-# qrspi pipeline run artifacts and scratch diagrams (local-only)
+# Environment / secrets
+.env
+.env.*
+
+# Editor / IDE
+/.idea/
+/.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Local-only run artifacts and scratch diagrams
 /.qrspi/

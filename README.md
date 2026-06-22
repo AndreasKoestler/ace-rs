@@ -124,3 +124,25 @@ cargo test --target x86_64-unknown-linux-gnu
 | 1 | FP16↔FP8 converts + EVEX VNNI (see `ticket.md`) | 2 (AVX10.2 subset, `AVX10_V1_AUX`) |
 | 2 | `VCVTPS2HF8` (FP32→FP8) | 3 (OCP conversions) |
 | 3 | `TOP2BF16PS` (BF16 rank-2 outer product) | 4 (ACE tile) — gated, see design §7 |
+
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for local
+setup, the test/lint gates, and how to wire a new primitive end to end. Please
+also read the [Code of Conduct](./CODE_OF_CONDUCT.md). To report a security
+issue privately, see [`SECURITY.md`](./SECURITY.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
