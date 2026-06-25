@@ -1,13 +1,16 @@
-//! `extern "C"` declarations for the opt-in native AVX10_V1_AUX backend (design decision D7).
+//! `extern "C"` declarations for the opt-in native AVX10_V1_AUX / AVX10_V2_AUX backends
+//! (design decision D7).
 //!
-//! These resolve to the shims in `src/native/avx10_v1_aux.c`, compiled with `-mavx10.2` by
-//! `build.rs` only when the `native` feature is enabled on an x86_64 target. The whole module
-//! is gated on `#[cfg(all(target_arch = "x86_64", feature = "native"))]` (see `lib.rs`), so
-//! the default build never references it.
+//! These resolve to the shims in `src/native/avx10_v1_aux.c` and
+//! `src/native/avx10_v2_aux.c`, compiled with `-mavx10.2` by `build.rs` only when the
+//! `native` feature is enabled on an x86_64 target. The whole module is gated on
+//! `#[cfg(all(target_arch = "x86_64", feature = "native"))]` (see `lib.rs`), so the default
+//! build never references it.
 //!
-//! Each shim takes plain pointers; the per-family `_hw` wrappers in the convert / VNNI modules
-//! marshal the fixed-size lane arrays into and out of these calls. Every `_hw` wrapper is
-//! `unsafe` and may only be called once `detect::has_avx10_v1_aux()` has confirmed the running
+//! Each shim takes plain pointers; the per-family `_hw` wrappers in the convert / VNNI
+//! modules marshal the fixed-size lane arrays into and out of these calls. Every `_hw`
+//! wrapper is `unsafe` and may only be called once the matching capability check
+//! (`detect::has_avx10_v1_aux()` / `detect::has_avx10_v2_aux()`) has confirmed the running
 //! CPU supports the EVEX forms — otherwise the EVEX-encoded instruction would fault (#UD).
 
 extern "C" {
