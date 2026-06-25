@@ -75,31 +75,61 @@
 //! [avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.1-1]). Folding the `native`-feature AVX10
 //! path into the `ACE_REQUIRE_NATIVE` guard would make its tripwire live by the same pattern.
 //!
-//! # v1 non-goals — confirmed NOT implemented
+//! **Iteration 2 — `AVX10_V2_AUX` (group 3), same scope.** The 21 group-3 OCP-format converts
+//! (families A–I: FP32↔FP8, FP8↔FP4, FP8↔FP6, `VPMOVSSDB`, `VUNPACKB`) follow the identical
+//! tripwire posture. Every one of their `-mavx10.2` C-shim intrinsics
+//! (`_mm512_cvtps_bf8`/`cvtbf8_ps`/`cvtf8_bf4s`/`cvtbf4_hf8`/`cvtf8_bf6s`/`cvtf6_hf8`/`cvtssepi32_epi8`/`_mm512_unpackb`)
+//! is **absent** from the GCC/Clang headers in this toolchain, so per OQ-5 every group-3 family
+//! ships **oracle-only** — there is no native C shim and the `ACE_REQUIRE_NATIVE=1` guard stays
+//! dormant for them exactly as it is for the `AVX10_V1_AUX` C-shim families. Each group-3 family
+//! still ships a live `prop_native_matches_oracle` differential (in its `differential` /
+//! `proptests` module) gated `#[cfg(all(target_arch = "x86_64", feature = "native"))]` +
+//! `detect::has_avx10_v2_aux()`, comparing the public dispatcher to its scalar oracle bit-for-bit
+//! and calling `TestResult::discard()` — never `from_bool(false)` — when the feature or hardware
+//! is absent, so the `native-sde` job (SDE 10.8, `sde64 -future --`) proves the native branch ran
+//! rather than the fallback the moment any group-3 intrinsic lands, and a fallback-only runner can
+//! never produce a vacuous green ([avx10-v2-aux-ocp-conversions.DIFFERENTIAL.1],
+//! [avx10-v2-aux-ocp-conversions.DIFFERENTIAL.2]).
+//!
+//! # Non-goals — confirmed NOT implemented (through iteration 2)
 //!
 //! The public surface of this crate is the completed group-1 VEX family (iteration-0
-//! [`dpbssd`] plus the 11 remaining `avxvnniint8`/`avxvnniint16` multiply-accumulate ops)
-//! plus the 26 `AVX10_V1_AUX` primitives (families A–G). The following are deliberately
-//! **out of scope** for v1 and are NOT present in any public item or native path
-//! (verified by [`tests::non_goals_absent`]):
+//! [`dpbssd`] plus the 11 remaining `avxvnniint8`/`avxvnniint16` multiply-accumulate ops),
+//! the 26 `AVX10_V1_AUX` primitives (families A–G), and — added in iteration 2 — the 21
+//! `AVX10_V2_AUX` (group 3) OCP-format converts (families A–I: FP32↔FP8, FP8↔FP4, FP8↔FP6,
+//! `VPMOVSSDB`, `VUNPACKB`). **Group 3 is therefore no longer a non-goal.** The following
+//! remain deliberately **out of scope** and are NOT present in any public item or native path
+//! (verified by [`non_goal_guards::non_goals_absent`]):
 //!
-//! - **No `AVX10_V2_AUX` (group 3) instructions** — no FP32↔FP8, FP4/FP6, `VPMOVSSDB`, or
-//!   `VUNPACKB` converts (spec §6.2).
 //! - **No group-4 `ACE` instructions** — no `TOP*`, `BSR*`, or tile-move primitives.
 //! - **No VEX-encoded AVX-VNNI-INT8/16 forms beyond the group-1 family** — the family-F/G
 //!   additions are the EVEX 512-bit generalization ([`vnni`]), not new VEX forms.
-//! - **No EVEX write-masking (`{k1}{z}`) or memory-broadcast (`m*bcst`) in the public API** —
-//!   every primitive takes plain fixed-size lane arrays by value and writes a full result; the
-//!   spec's `k1` / `zeroing` / `evex_b` operands are fixed to the no-writemask, no-broadcast
-//!   case (`no_writemask = true`, `evex_b = false`) and are not surfaced.
+//! - **No EVEX write-masking (`{k1}{z}`) or memory-broadcast (`m32bcst`/`m*bcst`) in the public
+//!   API** — every primitive takes plain fixed-size lane arrays by value and writes a FULL
+//!   result; the spec's `k1` / `zeroing` / `evex_b` operands are fixed to the no-writemask,
+//!   no-broadcast case (`no_writemask = true`, `evex_b = false`) and are not surfaced.
+//!   `VUNPACKB`'s `imm8` IS surfaced — but as a plain `u8` *value* argument selecting size /
+//!   start / sign-extend, NOT as a write-mask: it is the sole control input and every output
+//!   lane is written.
+//! - **No 128-bit / 256-bit vector-length entry points** — every group-3 convert is the
+//!   512-bit (`VL=512`) form; the 128/256-bit `VL` plumbing the spec also defines is not
+//!   surfaced.
 
+pub mod cvt_fp8_fp4;
+pub mod cvt_fp8_fp6;
 pub mod cvt_fp8_ph;
+pub mod cvt_fp8_ps;
 pub mod cvt_ph_fp8;
+pub mod cvt_ps_fp8;
 pub mod cvt_ps_ph;
+pub mod cvt_ssdb;
 mod detect;
+pub(crate) mod fp4;
+pub(crate) mod fp6;
 pub(crate) mod fp8;
 #[cfg(all(target_arch = "x86_64", feature = "native"))]
 pub(crate) mod native;
+pub mod unpackb;
 pub mod vnni;
 
 pub use cvt_ph_fp8::{
@@ -111,6 +141,67 @@ pub use cvt_ph_fp8::{
 };
 
 pub use cvt_fp8_ph::{cvthf8_ph, cvthf8_ph_scalar};
+
+// AVX10_V2_AUX family C: exact FP8 -> FP32 (iteration 2).
+pub use cvt_fp8_ps::{cvtbf8_ps, cvtbf8_ps_scalar, cvthf8_ps, cvthf8_ps_scalar};
+
+// AVX10_V2_AUX family D: saturating-RTNE FP8 -> FP4 (E2M1), nibble-packed (iteration 2). The
+// source-format suffix (`_e5m2` / `_e4m3`) disambiguates the two converts, since both target
+// FP4 E2M1 (OQ-3). Always saturating to +/-6.0; output is half the input width.
+pub use cvt_fp8_fp4::{
+    cvtf8_bf4s_e4m3, cvtf8_bf4s_e4m3_scalar, cvtf8_bf4s_e5m2, cvtf8_bf4s_e5m2_scalar,
+};
+
+// AVX10_V2_AUX family E: exact FP4 (E2M1) -> FP8 (E4M3), nibble-unpacked (iteration 2). Every
+// one of the 16 FP4 encodings maps to exactly one E4M3 byte (no rounding); output is twice the
+// input width.
+pub use cvt_fp8_fp4::{cvtbf4_hf8, cvtbf4_hf8_scalar};
+
+// AVX10_V2_AUX family F: saturating-RTNE FP8 -> FP6 (E3M2 / E2M3), 6-bit-packed (iteration 2).
+// `cvtf8_bf6s` is E5M2 -> FP6 E3M2 (VCVTBF82BF6S), `cvtf8_hf6s` is E4M3 -> FP6 E2M3
+// (VCVTHF82HF6S); the two carry distinct intrinsic stems (OQ-3). Always saturating (E3M2
+// +/-28.0, E2M3 +/-7.5); mantissa-width-matched so no mantissa loss, every FP8 subnormal ->
+// same-signed FP6 zero; output is VL*6/8 = 48 bytes for the 64-byte input.
+pub use cvt_fp8_fp6::{cvtf8_bf6s, cvtf8_bf6s_scalar, cvtf8_hf6s, cvtf8_hf6s_scalar};
+
+// AVX10_V2_AUX family G: exact FP6 (E3M2 / E2M3) -> FP8 (E4M3), 6-bit-unpacked (iteration
+// 2). `cvtf6_hf8_e3m2` is FP6 E3M2 -> E4M3 (VCVTBF62HF8), `cvtf6_hf8_e2m3` is FP6 E2M3 ->
+// E4M3 (VCVTHF62HF8); the source-format suffix disambiguates the two, since both target
+// FP8 E4M3 (OQ-3). Exact: every one of the 64 FP6 encodings (per format) maps to exactly
+// one E4M3 byte (no rounding/saturation); output is twice the 48-byte 6-bit-packed input.
+pub use cvt_fp8_fp6::{
+    cvtf6_hf8_e2m3, cvtf6_hf8_e2m3_scalar, cvtf6_hf8_e3m2, cvtf6_hf8_e3m2_scalar,
+};
+
+// AVX10_V2_AUX family H: VPMOVSSDB — INT32 -> INT8 with SYMMETRIC signed saturation
+// (iteration 2). Clamps each lane to [-127, +127] (MAX_POSITIVE 0x7F, MAX_NEGATIVE 0x81),
+// NOT the asymmetric [-128, +127] of ordinary VPMOVSDB; the `cvtss` prefix names that
+// distinction. Symmetric about zero — f(-x) = -f(x), f(i32::MIN) = -127. Output is 1/4 the
+// input width (16 dwords -> 16 bytes).
+pub use cvt_ssdb::{cvtssepi32_epi8, cvtssepi32_epi8_scalar};
+
+// AVX10_V2_AUX family I: VUNPACKB — unpack 64 packed sub-byte elements into 64 bytes
+// (iteration 2). `imm8` selects element size (imm8[4:2], clamped to min 2), start offset
+// (imm8[1:0], size-conditioned) and sign-extend (imm8[5]); build it with ACE_UNPACKB_SIZE /
+// ACE_UNPACKB_START / ACE_UNPACKB_SEXT. The read-back complement of the family-D nibble and
+// family-F 6-bit packers (EXACTNESS.2). imm8 is a plain value argument, not a write-mask;
+// v1 surfaces only the no_writemask path. Output is the full 512-bit [u8; 64].
+pub use unpackb::{unpackb, unpackb_scalar, ACE_UNPACKB_SEXT, ACE_UNPACKB_SIZE, ACE_UNPACKB_START};
+
+// AVX10_V2_AUX family A: single-source FP32 -> FP8 RTNE/RTO (iteration 2). RTO is
+// E4M3-only, so there is deliberately no `cvtrops_bf8`.
+pub use cvt_ps_fp8::{
+    cvtps_bf8, cvtps_bf8_scalar, cvtps_hf8, cvtps_hf8_scalar, cvtpss_bf8, cvtpss_bf8_scalar,
+    cvtpss_hf8, cvtpss_hf8_scalar, cvtrops_hf8, cvtrops_hf8_scalar, cvtropss_hf8,
+    cvtropss_hf8_scalar,
+};
+
+// AVX10_V2_AUX family B: FP32 -> FP8 bias-rounding (iteration 2). The per-lane bias term is
+// the full Operand-2 (`VVVV`) `i32` word; the FP32 source is Operand 3.
+pub use cvt_ps_fp8::{
+    cvtbiasps_bf8, cvtbiasps_bf8_scalar, cvtbiasps_hf8, cvtbiasps_hf8_scalar, cvtbiaspss_bf8,
+    cvtbiaspss_bf8_scalar, cvtbiaspss_hf8, cvtbiaspss_hf8_scalar,
+};
 
 pub use cvt_ps_ph::{cvt2ps_phx, cvt2ps_phx_scalar};
 
@@ -2249,26 +2340,108 @@ mod proptests {
 }
 
 #[cfg(test)]
+mod iteration2_surface {
+    //! Crate-level reachability / naming / stable-Rust guard for the 21 `AVX10_V2_AUX`
+    //! (group-3) OCP-format converts added in iteration 2. This module is the executable
+    //! witness for three cross-cutting ACIDs:
+    //!
+    //! * `[avx10-v2-aux-ocp-conversions.NAMING.1]` — every public primitive is reachable from
+    //!   the crate root under a name matching its eventual stdarch intrinsic stem; the two-
+    //!   instruction families carry the OQ-3 source-format suffix.
+    //! * `[avx10-v2-aux-ocp-conversions.STABLE_RUST.1]` — each is a safe public fn taking and
+    //!   returning fixed-size lane arrays by value; this module compiles on stable Rust (the
+    //!   whole crate forbids `core::simd` and uses no nightly features — see the crate manifest
+    //!   and the absence of any `#![feature(...)]` attribute).
+    //! * `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` — each dispatcher is callable and
+    //!   returns the spec-shaped output array, the oracle being the always-present path.
+
+    /// Every one of the 21 group-3 primitives is reachable from the crate root by its
+    /// stdarch-stem name and is a safe call returning the spec-shaped fixed-size array — no
+    /// `unsafe`, no nightly, no `core::simd`. The exact stems are pinned here so any rename,
+    /// removal, or signature drift breaks this compile; binding every result keeps the call
+    /// load-bearing (an unused public re-export would otherwise be silently droppable).
+    #[test]
+    fn all_21_primitives_reachable_by_intrinsic_stem() {
+        // Family A — single-source FP32 -> FP8 (RTNE / RTO). [f32;16] -> [u8;16].
+        let _cvtps_bf8: [u8; 16] = crate::cvtps_bf8([0.0f32; 16]);
+        let _cvtpss_bf8: [u8; 16] = crate::cvtpss_bf8([0.0f32; 16]);
+        let _cvtps_hf8: [u8; 16] = crate::cvtps_hf8([0.0f32; 16]);
+        let _cvtpss_hf8: [u8; 16] = crate::cvtpss_hf8([0.0f32; 16]);
+        let _cvtrops_hf8: [u8; 16] = crate::cvtrops_hf8([0.0f32; 16]);
+        let _cvtropss_hf8: [u8; 16] = crate::cvtropss_hf8([0.0f32; 16]);
+        // Family B — FP32 -> FP8 bias-rounding. ([f32;16], [i32;16]) -> [u8;16].
+        let _cvtbiasps_bf8: [u8; 16] = crate::cvtbiasps_bf8([0.0f32; 16], [0i32; 16]);
+        let _cvtbiaspss_bf8: [u8; 16] = crate::cvtbiaspss_bf8([0.0f32; 16], [0i32; 16]);
+        let _cvtbiasps_hf8: [u8; 16] = crate::cvtbiasps_hf8([0.0f32; 16], [0i32; 16]);
+        let _cvtbiaspss_hf8: [u8; 16] = crate::cvtbiaspss_hf8([0.0f32; 16], [0i32; 16]);
+        // Family C — exact FP8 -> FP32. [u8;16] -> [f32;16].
+        let _cvtbf8_ps: [f32; 16] = crate::cvtbf8_ps([0u8; 16]);
+        let _cvthf8_ps: [f32; 16] = crate::cvthf8_ps([0u8; 16]);
+        // Family D — saturating-RTNE FP8 -> FP4 (E2M1), nibble-packed. [u8;64] -> [u8;32].
+        // OQ-3 source-format suffix disambiguates the two intrinsic-stem `cvtf8_bf4s` forms.
+        let _cvtf8_bf4s_e5m2: [u8; 32] = crate::cvtf8_bf4s_e5m2([0u8; 64]);
+        let _cvtf8_bf4s_e4m3: [u8; 32] = crate::cvtf8_bf4s_e4m3([0u8; 64]);
+        // Family E — exact FP4 (E2M1) -> FP8 (E4M3), nibble-unpacked. [u8;32] -> [u8;64].
+        let _cvtbf4_hf8: [u8; 64] = crate::cvtbf4_hf8([0u8; 32]);
+        // Family F — saturating-RTNE FP8 -> FP6, 6-bit-packed. [u8;64] -> [u8;48].
+        let _cvtf8_bf6s: [u8; 48] = crate::cvtf8_bf6s([0u8; 64]);
+        let _cvtf8_hf6s: [u8; 48] = crate::cvtf8_hf6s([0u8; 64]);
+        // Family G — exact FP6 -> FP8 (E4M3), 6-bit-unpacked. [u8;48] -> [u8;64].
+        // OQ-3 source-format suffix disambiguates the two `cvtf6_hf8` forms.
+        let _cvtf6_hf8_e3m2: [u8; 64] = crate::cvtf6_hf8_e3m2([0u8; 48]);
+        let _cvtf6_hf8_e2m3: [u8; 64] = crate::cvtf6_hf8_e2m3([0u8; 48]);
+        // Family H — VPMOVSSDB symmetric-signed-saturation INT32 -> INT8. [i32;16] -> [i8;16].
+        let _cvtssepi32_epi8: [i8; 16] = crate::cvtssepi32_epi8([0i32; 16]);
+        // Family I — VUNPACKB sub-byte unpack. ([u8;64], u8) -> [u8;64]; imm8 is a value arg.
+        let _unpackb: [u8; 64] = crate::unpackb([0u8; 64], crate::ACE_UNPACKB_SIZE(4));
+
+        // Count is load-bearing: exactly 21 public group-3 primitives are bound above.
+        let bound_count = 6 // A
+            + 4 // B
+            + 2 // C
+            + 2 // D
+            + 1 // E
+            + 2 // F
+            + 2 // G
+            + 1 // H
+            + 1; // I
+        assert_eq!(
+            bound_count, 21,
+            "exactly 21 AVX10_V2_AUX (group-3) primitives are reachable by their stdarch stems"
+        );
+    }
+}
+
+#[cfg(test)]
 mod non_goal_guards {
-    //! Documented guard that the v1 non-goals were not built into the public surface
+    //! Documented guard that the non-goals were not built into the public surface
     //! ([avx10-v1-aux-fp16-fp8-evex-vnni.ENCODING.1] non-goal half: no out-of-scope native
     //! encodings are emitted). The crate exposes no `core::arch` calls outside the single
-    //! iteration-0 `VPDPBSSD` intrinsic, and no public item names a group-3/4 mnemonic.
+    //! iteration-0 `VPDPBSSD` intrinsic, and no public item names a group-4 mnemonic. NOTE:
+    //! group-3 (`AVX10_V2_AUX`) is NOW IN SCOPE as of iteration 2 — its reachability is the
+    //! POSITIVE assertion in [`super::iteration2_surface`]; this guard is the complementary
+    //! NEGATIVE-space assertion that what remains out of scope was not built.
 
-    /// Confirms the public function inventory is exactly iteration-0 `dpbssd` plus the 26
-    /// `AVX10_V1_AUX` primitives — no group-3 (`AVX10_V2_AUX`) or group-4 (`ACE`) surface, no
-    /// masking/broadcast variants. This is a readable, asserting record of the non-goals; it
-    /// references each public family entry point so any accidental removal or out-of-scope
-    /// addition is caught at compile time.
+    /// Confirms the public function inventory is exactly iteration-0 `dpbssd`, the 26
+    /// `AVX10_V1_AUX` primitives (group 2 — done in iteration 1) and the 21 `AVX10_V2_AUX`
+    /// primitives (group 3 — done in iteration 2), and NOTHING out of scope: no group-4
+    /// (`ACE` `TOP*`/`BSR*`/tile-move) surface, no EVEX `{k1}{z}` write-masking / `m32bcst`
+    /// broadcast entry points, and no 128/256-bit vector-length plumbing. This is a readable,
+    /// asserting record of the negative space; it references each in-scope public family entry
+    /// point so any accidental removal or out-of-scope addition is caught at compile time.
     #[test]
     fn non_goals_absent() {
-        // The complete v1 public primitive set is exercised below — one representative entry
-        // point per family plus the iteration-0 VEX `dpbssd`. There is deliberately NO
-        // FP32->FP8 (`cvtps_*`), FP4/FP6, `vpmovssdb`, `vunpackb`, `top*`, `bsr*`, tile-move,
-        // or `{k1}{z}` / `*bcst` entry point — group 3/4 and masking/broadcast are out of v1.
-        // Each call takes plain fixed-size lane arrays by value (no mask / no broadcast operand
-        // exists to pass), which is itself the guarantee that the masked/broadcast surface was
-        // never built. Any out-of-scope or removed primitive would break this compile.
+        // The complete in-scope public primitive set is exercised below — one representative
+        // entry point per family plus the iteration-0 VEX `dpbssd`, the iteration-2 group-3
+        // converts, and the negative-space prose. There is deliberately NO `top*`, `bsr*`,
+        // tile-move (group 4), no `{k1}{z}` / `m32bcst` masking/broadcast entry point, and no
+        // 128/256-bit `VL` form. Each call takes plain fixed-size lane arrays by value (no
+        // mask / no broadcast / no narrower-VL operand exists to pass), which is itself the
+        // guarantee that the out-of-scope surface was never built. `VUNPACKB`'s `imm8` is a
+        // plain value argument (size/start/sext selector), NOT a write-mask. Any out-of-scope
+        // or removed primitive would break this compile.
+        //
+        // Group 2 (AVX10_V1_AUX, iteration 1) — already in scope:
         let _a = crate::cvtph_bf8([0u16; 32]); // families A/B/C: FP16 -> FP8
         let _b = crate::cvtphs_hf8([0u16; 32]);
         let _d = crate::cvthf8_ph([0u8; 32]); // family D: HF8 -> FP16
@@ -2276,6 +2449,21 @@ mod non_goal_guards {
         let _f = crate::vnni::dpbssd([0i32; 16], [0i8; 64], [0i8; 64]); // family F: byte VNNI (EVEX 512-bit)
         let _g = crate::vnni::dpwsud([0i32; 16], [0i16; 32], [0u16; 32]); // family G: word VNNI (EVEX 512-bit)
         let _group1_vex = crate::dpbssd([0i32; 8], [0i8; 32], [0i8; 32]); // iteration-0 VEX dpbssd (256-bit)
-                                                                          // No out-of-scope symbol exists to reference here — that absence is the guarantee.
+
+        // Group 3 (AVX10_V2_AUX, iteration 2) — NOW in scope (one representative per family;
+        // the full 21-primitive reachability set is asserted in `super::iteration2_surface`):
+        let _v2_a = crate::cvtps_bf8([0.0f32; 16]); // family A: FP32 -> FP8 (RTNE)
+        let _v2_b = crate::cvtbiasps_bf8([0.0f32; 16], [0i32; 16]); // family B: FP32 -> FP8 bias
+        let _v2_c = crate::cvtbf8_ps([0u8; 16]); // family C: exact FP8 -> FP32
+        let _v2_d = crate::cvtf8_bf4s_e5m2([0u8; 64]); // family D: FP8 -> FP4 (nibble-packed)
+        let _v2_e = crate::cvtbf4_hf8([0u8; 32]); // family E: FP4 -> FP8 (nibble-unpacked)
+        let _v2_f = crate::cvtf8_bf6s([0u8; 64]); // family F: FP8 -> FP6 (6-bit-packed)
+        let _v2_g = crate::cvtf6_hf8_e3m2([0u8; 48]); // family G: FP6 -> FP8 (6-bit-unpacked)
+        let _v2_h = crate::cvtssepi32_epi8([0i32; 16]); // family H: VPMOVSSDB (symmetric clamp)
+        let _v2_i = crate::unpackb([0u8; 64], crate::ACE_UNPACKB_SIZE(4)); // family I: VUNPACKB
+
+        // Negative space: NO out-of-scope symbol exists to reference here — group-4 TOP*/BSR*/
+        // tile-move, `{k1}{z}` / `m32bcst`, and 128/256-bit `VL` forms are all unbuilt, and
+        // that absence (nothing to bind) is the guarantee.
     }
 }

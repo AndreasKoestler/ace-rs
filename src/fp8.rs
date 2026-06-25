@@ -30,6 +30,17 @@
 //! the bias as add-then-RTNE; that disagreed with hardware and is corrected here.)
 //! (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`,
 //! `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`).
+//!
+//! # Iteration-2 (`AVX10_V2_AUX`) open-question resolutions
+//!
+//! * **OQ-1 — shared vs FP32-only rounding-mode enum.** RESOLVED: the iteration-2 FP32→FP8
+//!   family gets a DEDICATED [`Fp8RoundMode`] `{ Rtne, Rto, Bias }` enum (declared below),
+//!   modeled directly on the §9.2.5 pseudocode. The iteration-1 FP16 path keeps its
+//!   `bias_mode: bool` contract byte-identical — the new enum is NOT retrofitted onto it.
+//! * **OQ-4 — per-family DAZ.** RESOLVED: DAZ is encoded per §16 helper, never as a global
+//!   pre-pass. The forward FP32→FP8 rounders ([`fp32_to_fp8_e5m2`] / [`fp32_to_fp8_e4m3`])
+//!   assume DAZ=1 (flush input subnormals to signed zero); the exact reverse FP8→FP32 decoders
+//!   ([`fp8_e5m2_to_fp32`] / [`fp8_e4m3_to_fp32`]) assume DAZ=0 (renormalise subnormals).
 
 /// Per-format parameters for an OCP MX FP8 target (no infinities).
 struct Fp8Format {
@@ -565,6 +576,406 @@ pub(crate) fn fp32_to_fp16_rne(f: f32) -> u16 {
     fp16_sign | ((exp_field as u16) << 10) | mant_field
 }
 
+/// FP32-family rounding mode for the AVX10_V2_AUX FP32->FP8 converts (spec section 9.1).
+///
+/// Distinct from the iteration-1 FP16 `bias_mode: bool` path (which stays byte-identical,
+/// OQ-1): the FP32 source supports three rounding contracts per the section-9.2.5
+/// `vcvtps2f8` pseudocode:
+///
+/// * `Rtne` — IEEE round-to-nearest-ties-to-even (spec section 2.6.1); used by the
+///   `VCVTPS2BF8`/`VCVTPS2HF8` forms.
+/// * `Rto` — round-to-odd (spec section 2.6.2); used by `VCVTROPS2HF8` (E4M3 only).
+/// * `Bias` — bias rounding (spec section 2.6.3); used by the `VCVTBIASPS2*` forms.
+///
+/// Consumed by the FP32 front-end [`fp32_to_fp8_e5m2`] / [`fp32_to_fp8_e4m3`]. `Rtne` and
+/// `Rto` are wired by the family-A converts (phase 3); `Bias` is wired by the family-B bias
+/// converts (phase 4). All three branches of the section-16.1 pseudocode are transcribed in
+/// the front-end so every variant is handled bit-exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fp8RoundMode {
+    Rtne,
+    Rto,
+    Bias,
+}
+
+/// Exact decode of one BF8 (FP8 E5M2) byte to the single FP32 (E8M23) value it maps to.
+///
+/// Per ACE v1 spec section 9.3 (`VCVTBF82PS`) the conversion is **exact** — every BF8
+/// encoding maps precisely to one FP32 encoding with no rounding, no saturation and no
+/// exceptions (`[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.1]`,
+/// `[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.3]`). DAZ=0/FTZ=0, MXCSR not consulted (spec
+/// section 9.3.1). E5M2 is sign / 5-bit exponent (bias 15) / 2-bit mantissa (spec section
+/// 2.4.1):
+///
+/// * `S.00000.00` -> FP32 `+/-0`.
+/// * `S.00000.mm` (mm != 0) is the subnormal `mm * 2^-16`. Both subnormal magnitudes
+///   (`2^-16`, `2^-15`, `3*2^-16`) are normal in FP32 (FP32 normals reach `2^-126`), so
+///   they renormalise exactly: the leading set mantissa bit becomes FP32's implicit bit.
+/// * `S.11111.00` is BF8 +/-Inf -> FP32 +/-Inf (the section-2.4.1 NaN set is
+///   `S.11111.{01,10,11}`, so a zero mantissa in the all-ones exponent is infinity).
+/// * `S.11111.mm` (mm != 0) is a BF8 NaN -> a quiet FP32 NaN (sign preserved).
+/// * Any other code is a normal `(1 + mm/4) * 2^(e-15)`. FP32 shares the implicit-1 normal
+///   form, so the unbiased exponent `e - 15` rebiases to `e - 15 + 127 = e + 112` and the
+///   2 mantissa bits sit at the top of FP32's 23-bit field (`mm << 21`). Exact.
+pub(crate) fn fp8_e5m2_to_fp32(byte: u8) -> f32 {
+    let sign = (byte >> 7) as u32 & 1;
+    let exp = ((byte >> 2) & 0x1f) as u32; // 5-bit biased exponent (bias 15)
+    let mant = (byte & 0x03) as u32; // 2-bit mantissa
+    let fp32_sign = sign << 31;
+
+    if exp == 0x1f {
+        if mant == 0 {
+            // S.11111.00 = BF8 +/-Inf -> FP32 +/-Inf.
+            return f32::from_bits(fp32_sign | (0xff << 23));
+        }
+        // BF8 NaN S.11111.{01,10,11} -> quiet FP32 NaN (top mantissa bit set), sign kept.
+        return f32::from_bits(fp32_sign | (0xff << 23) | (1 << 22));
+    }
+
+    if exp == 0 {
+        if mant == 0 {
+            // +/-0.
+            return f32::from_bits(fp32_sign);
+        }
+        // Subnormal mm * 2^-16, mm in 1..=3. Renormalise into an FP32 normal: with `k` the
+        // index of the leading set bit of mm (0..=1), the value is 1.<rest> * 2^(k-16), so
+        // the unbiased exponent is (k - 16) and the bits below the leading 1 shift up into
+        // the top of FP32's 23-bit field.
+        let k = 31 - mant.leading_zeros() as i32; // top set bit of mm (0..=1)
+        let unbiased = k - 16; // value = 1.f * 2^unbiased
+        let fp32_exp = (unbiased + 127) as u32; // FP32 bias 127; always normal
+        let frac = mant & ((1 << k) - 1); // bits below the leading 1 (k bits)
+        let fp32_mant = frac << (23 - k);
+        return f32::from_bits(fp32_sign | (fp32_exp << 23) | fp32_mant);
+    }
+
+    // Normal: value = (1 + mm/4) * 2^(exp - 15). FP32 shares the implicit-1 form, so the
+    // unbiased exponent (exp - 15) rebiases to (exp - 15 + 127) = exp + 112, and the 2
+    // mantissa bits occupy the top of FP32's 23-bit mantissa field.
+    let fp32_exp = exp + 112;
+    let fp32_mant = mant << 21;
+    f32::from_bits(fp32_sign | (fp32_exp << 23) | fp32_mant)
+}
+
+/// Exact decode of one HF8 (FP8 E4M3) byte to the single FP32 (E8M23) value it maps to.
+///
+/// Per ACE v1 spec section 9.3 (`VCVTHF82PS`) the conversion is **exact** — every HF8
+/// encoding maps precisely to one FP32 encoding with no rounding, no saturation and no
+/// exceptions (`[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.2]`,
+/// `[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.3]`). DAZ=0/FTZ=0 (spec section 9.3.1). E4M3
+/// is sign / 4-bit exponent (bias 7) / 3-bit mantissa (spec section 2.4.1):
+///
+/// * `S.0000.000` -> FP32 `+/-0`.
+/// * `S.0000.mmm` (mmm != 0) is the subnormal `mmm * 2^-9`; every such value is normal in
+///   FP32, so it renormalises exactly.
+/// * `S.1111.111` is the sole HF8 NaN (E4M3 has no infinity) -> a quiet FP32 NaN.
+/// * Any other code is a normal `(1 + mmm/8) * 2^(e-7)` -> FP32 exponent `e - 7 + 127 =
+///   e + 120`, mantissa `mmm << 20`. Exact.
+pub(crate) fn fp8_e4m3_to_fp32(byte: u8) -> f32 {
+    let sign = (byte >> 7) as u32 & 1;
+    let exp = ((byte >> 3) & 0x0f) as u32; // 4-bit biased exponent (bias 7)
+    let mant = (byte & 0x07) as u32; // 3-bit mantissa
+    let fp32_sign = sign << 31;
+
+    if exp == 0x0f && mant == 0x07 {
+        // Sole HF8 NaN S.1111.111 -> quiet FP32 NaN (top mantissa bit set), sign kept.
+        // (E4M3 has no infinity, so this is the only non-finite encoding.)
+        return f32::from_bits(fp32_sign | (0xff << 23) | (1 << 22));
+    }
+
+    if exp == 0 {
+        if mant == 0 {
+            // +/-0.
+            return f32::from_bits(fp32_sign);
+        }
+        // Subnormal mmm * 2^-9, mmm in 1..=7. Renormalise into an FP32 normal.
+        let k = 31 - mant.leading_zeros() as i32; // top set bit of mmm (0..=2)
+        let unbiased = k - 9; // value = 1.f * 2^unbiased
+        let fp32_exp = (unbiased + 127) as u32;
+        let frac = mant & ((1 << k) - 1);
+        let fp32_mant = frac << (23 - k);
+        return f32::from_bits(fp32_sign | (fp32_exp << 23) | fp32_mant);
+    }
+
+    // Normal: value = (1 + mmm/8) * 2^(exp - 7). FP32 unbiased exponent (exp - 7) rebiases
+    // to (exp - 7 + 127) = exp + 120, and the 3 mantissa bits occupy the top of FP32's
+    // 23-bit mantissa field.
+    let fp32_exp = exp + 120;
+    let fp32_mant = mant << 20;
+    f32::from_bits(fp32_sign | (fp32_exp << 23) | fp32_mant)
+}
+
+/// `mask(n)` from the section-16.1 pseudocode: the low-`n`-bit mask, with `mask(0) == 0`.
+#[inline]
+fn mask(n: i32) -> u32 {
+    if n <= 0 {
+        0
+    } else if n >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << n) - 1
+    }
+}
+
+/// FP32 (S1.E8.M23) -> FP8 E5M2 (BF8), transcribing the ACE v1 spec section 16.1
+/// `fp32_to_fp8_e5m2(i, saturating, rounding, bias)` helper bit-for-bit. The FP32 source is
+/// decoded to its exact `(sign, e_i, m_i)` fields and rounded **once** to the E5M2 target
+/// per `mode`. Per spec section 9.2.1 MXCSR is neither consulted nor updated, DAZ is assumed
+/// 1 / FTZ assumed 0, and no FP exceptions are raised.
+///
+/// Overflow / NaN handling follows the section-9.2.1 table for E5M2:
+/// * NaN input -> the BF8 NaN-coded value `S.11111.1x` (both modes).
+/// * post-rounding magnitude `> max_E5M2` -> the BF8 Inf/overflow-coded `S.11111.00`
+///   (non-saturating) or `±max_E5M2 = ±57344` `S.11110.11` (saturating).
+/// * signed zero -> same-signed E5M2 zero.
+///
+/// E5M2 has **no RTO form** (spec section 9.1 / 9.2.1): there is no `cvtrops_bf8`, so the
+/// family-A wiring never passes `Fp8RoundMode::Rto` here; `Bias` is supplied only by the
+/// family-B wiring (phase 4) via [`fp32_to_fp8_e5m2_biased`], so the plain converts pass
+/// `bias == 0`.
+/// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.1]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.5]`
+/// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.8]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.9]`
+pub(crate) fn fp32_to_fp8_e5m2(f: f32, mode: Fp8RoundMode, saturating: bool) -> u8 {
+    fp32_to_fp8_e5m2_biased(f, mode, saturating, 0)
+}
+
+/// E5M2 front-end with an explicit 21-bit `bias` term for the `Fp8RoundMode::Bias` branch
+/// (spec section 16.1). `Rtne`/`Rto` ignore `bias`; RTO is not an E5M2 form and is folded
+/// into RTNE.
+pub(crate) fn fp32_to_fp8_e5m2_biased(
+    f: f32,
+    mode: Fp8RoundMode,
+    saturating: bool,
+    bias: u32,
+) -> u8 {
+    let i = f.to_bits();
+    let s_i = (i >> 31) & 0x1;
+    let e_i = ((i >> 23) & 0xFF) as i32;
+    let m_i = i & 0x7FFFFF;
+
+    let (e_o, m_o): (i32, u32) = if e_i == 0xFF {
+        // Inf or NaN.
+        if saturating {
+            if m_i == 0 {
+                (0x1E, 0x3) // Inf -> clamp to max_normal
+            } else {
+                (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN -> coded NaN (kept even when sat)
+            }
+        } else if m_i != 0 {
+            (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN
+        } else {
+            (0x1F, 0x0) // Inf -> Inf/overflow-coded
+        }
+    } else if e_i == 0x00 {
+        // Zero or denorm (DAZ=1) -> same-signed zero.
+        (0, 0)
+    } else if mode == Fp8RoundMode::Bias {
+        // BIAS branch (spec section 16.1 E5M2). With bias == 0 this is add-then-truncate.
+        let mut e_b = e_i;
+        let mut m_b = m_i + (bias & 0x1FFFFF);
+        if m_b & 0xFF800000 != 0 {
+            e_b += 1;
+        }
+        m_b &= 0x7FFFFF;
+        let newexp = e_b - 127 + 15;
+        if newexp >= 31 {
+            if saturating {
+                (0x1E, 0x3)
+            } else {
+                (0x1F, 0x0)
+            }
+        } else if newexp <= 0 {
+            let mut m_o = 0u32;
+            if (22 - newexp) <= 24 {
+                let mant = m_b | 0x800000;
+                let shift = 22 - newexp;
+                m_o = mant >> shift;
+            }
+            (0, m_o)
+        } else {
+            (newexp, m_b >> 21)
+        }
+    } else {
+        // RTNE (RTO is not an E5M2 form; folded into RTNE).
+        let newexp = e_i - 127 + 15;
+        if newexp >= 31 {
+            if saturating {
+                (0x1E, 0x3)
+            } else {
+                (0x1F, 0x0)
+            }
+        } else if newexp <= 0 {
+            // underflow -> subnormal or zero
+            let mut e_o = 0i32;
+            let mut m_o = 0u32;
+            if (22 - newexp) <= 24 {
+                let mant = m_i | 0x800000;
+                let shift = 22 - newexp;
+                m_o = mant >> shift;
+                let low = mant & mask(shift);
+                let half = 1u32 << (shift - 1);
+                if low > half || (low == half && (m_o & 0x1) == 1) {
+                    m_o += 1;
+                    if (m_o & 0x3) == 0 {
+                        e_o += 1;
+                    }
+                }
+            }
+            (e_o, m_o)
+        } else {
+            // normal
+            let mut e_o = newexp;
+            let mut m_o = m_i >> 21;
+            if m_i & 0x100000 != 0
+                && ((m_i & 0x1FFFFF) > 0x100000 || (m_o & 0x1) == 1)
+                && !(saturating && e_o == 0x1E && m_o == 0x3)
+            {
+                m_o += 1;
+                if (m_o & 0x3) == 0 {
+                    e_o += 1;
+                }
+            }
+            (e_o, m_o)
+        }
+    };
+
+    ((s_i & 0x1) << 7 | ((e_o as u32) & 0x1F) << 2 | (m_o & 0x3)) as u8
+}
+
+/// FP32 -> FP8 E4M3 (HF8), transcribing the ACE v1 spec section 16.1
+/// `fp32_to_fp8_e4m3(i, saturating, rounding, bias)` helper bit-for-bit. Decode the FP32
+/// source to exact `(sign, e_i, m_i)` and round **once** to the E4M3 target per `mode`.
+/// MXCSR not consulted/updated; DAZ=1, FTZ=0; no FP exceptions (spec section 9.2.1).
+///
+/// Overflow / NaN handling per the section-9.2.1 table for E4M3:
+/// * NaN input -> the sole HF8 NaN `S.1111.111` (both modes).
+/// * post-rounding magnitude `> max_E4M3` -> NaN `S.1111.111` (non-saturating) or
+///   `±max_E4M3 = ±448` `S.1111.110` (saturating).
+/// * signed zero -> same-signed E4M3 zero.
+///
+/// `Rto` (spec section 2.6.2 round-to-odd) is the E4M3-only mode used by `VCVTROPS2HF8`: on
+/// an inexact normal/subnormal it ORs a sticky bit into the kept mantissa lsb, so the result
+/// mantissa is **odd** whenever the FP32 value is inexact in E4M3 — round-to-odd never selects
+/// an even target mantissa for an inexact value (spec section 16.1 E4M3 RTO branch).
+/// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.2]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.3]`
+/// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.4]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.6]`
+/// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.8]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.9]`
+pub(crate) fn fp32_to_fp8_e4m3(f: f32, mode: Fp8RoundMode, saturating: bool) -> u8 {
+    fp32_to_fp8_e4m3_biased(f, mode, saturating, 0)
+}
+
+/// E4M3 front-end with an explicit 20-bit `bias` term for the `Fp8RoundMode::Bias` branch
+/// (spec section 16.1). `Rtne`/`Rto` ignore `bias`.
+pub(crate) fn fp32_to_fp8_e4m3_biased(
+    f: f32,
+    mode: Fp8RoundMode,
+    saturating: bool,
+    bias: u32,
+) -> u8 {
+    let i = f.to_bits();
+    let s_i = (i >> 31) & 0x1;
+    let e_i = ((i >> 23) & 0xFF) as i32;
+    let m_i = i & 0x7FFFFF;
+
+    let (e_o, m_o): (i32, u32) = if e_i == 0xFF {
+        // Inf or NaN -> NaN-coded; saturating Inf clamps to max_normal.
+        if saturating && m_i == 0 {
+            (0xF, 0x6) // Inf -> clamp to max_normal
+        } else {
+            (0xF, 0x7)
+        }
+    } else if e_i == 0x00 {
+        // Zero or denorm (DAZ=1) -> same-signed zero.
+        (0, 0)
+    } else if mode == Fp8RoundMode::Rto {
+        // RTO (round-to-odd), E4M3 only.
+        let newexp = e_i - 127 + 7;
+        if newexp >= 16 {
+            (0xF, if saturating { 0x6 } else { 0x7 })
+        } else if newexp <= 0 {
+            if (21 - newexp) <= 24 {
+                let mant = m_i | 0x800000;
+                let shift = 21 - newexp;
+                let mut m_o = mant >> shift;
+                let sticky = if mant & mask(shift) != 0 { 1 } else { 0 };
+                m_o |= sticky;
+                (0, m_o)
+            } else {
+                // magnitude < 2^-10: J-bit below the subnormal lsb -> odd smallest subnormal.
+                (0, 1)
+            }
+        } else {
+            let e_o = newexp;
+            let mut m_o = m_i >> 20;
+            let sticky = if m_i & 0xFFFFF != 0 { 1 } else { 0 };
+            m_o |= sticky;
+            if saturating && e_o == 0xF && m_o == 0x7 {
+                (e_o, 0x6) // clamp NaN -> max_normal
+            } else {
+                (e_o, m_o)
+            }
+        }
+    } else if mode == Fp8RoundMode::Bias {
+        // BIAS branch (spec section 16.1 E4M3). With bias == 0 this is add-then-truncate.
+        let mut e_b = e_i;
+        let mut m_b = m_i + (bias & 0xFFFFF);
+        if m_b & 0xFF800000 != 0 {
+            e_b += 1;
+        }
+        m_b &= 0x7FFFFF;
+        let newexp = e_b - 127 + 7;
+        if newexp >= 16 {
+            (0xF, if saturating { 0x6 } else { 0x7 })
+        } else if newexp <= 0 {
+            (0, 0)
+        } else {
+            (newexp, m_b >> 20)
+        }
+    } else {
+        // RTNE.
+        let newexp = e_i - 127 + 7;
+        if newexp >= 16 {
+            (0xF, if saturating { 0x6 } else { 0x7 })
+        } else if newexp <= 0 {
+            let mut e_o = 0i32;
+            let mut m_o = 0u32;
+            if (21 - newexp) <= 24 {
+                let mant = m_i | 0x800000;
+                let shift = 21 - newexp;
+                m_o = mant >> shift;
+                let low = mant & mask(shift);
+                let half = 1u32 << (shift - 1);
+                if low > half || (low == half && (m_o & 0x1) == 1) {
+                    m_o += 1;
+                    if (m_o & 0x7) == 0 {
+                        e_o += 1;
+                    }
+                }
+            }
+            (e_o, m_o)
+        } else {
+            let mut e_o = newexp;
+            let mut m_o = m_i >> 20;
+            if saturating && e_o == 0xF && m_o == 0x7 {
+                m_o = 0x6;
+            }
+            if m_i & 0x80000 != 0 && ((m_i & 0xFFFFF) > 0x80000 || (m_o & 0x1) == 1) {
+                let clamp_sat = saturating && e_o == 0xF && m_o == 0x6;
+                let clamp_nan = !saturating && e_o == 0xF && m_o == 0x7;
+                if !(clamp_sat || clamp_nan) {
+                    m_o += 1;
+                    if (m_o & 0x7) == 0 {
+                        e_o += 1;
+                    }
+                }
+            }
+            (e_o, m_o)
+        }
+    };
+
+    ((s_i & 0x1) << 7 | ((e_o as u32) & 0xF) << 3 | (m_o & 0x7)) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,5 +1480,100 @@ mod tests {
             };
             assert_eq!(decoded, v, "exact value {v} not preserved (h={h:#06x})");
         }
+    }
+
+    // --- FP8 -> FP32 exact decode unit tests (spec section 9.3.5; CVT_FP8_PS.1-3) ---
+
+    // FP32 field accessors for readable assertions.
+    fn fp32_parts(f: f32) -> (u32, u32, u32) {
+        let b = f.to_bits();
+        ((b >> 31) & 1, (b >> 23) & 0xff, b & 0x007f_ffff)
+    }
+
+    #[test]
+    fn fp8_e5m2_to_fp32_zero_signed_zero_and_normals() {
+        // S.00000.00 -> +/-0 (sign-bit preserving, not numeric 0.0 == -0.0).
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b00000, 0b00)).to_bits(), 0);
+        assert_eq!(fp8_e5m2_to_fp32(bf8(1, 0b00000, 0b00)).to_bits(), 1 << 31);
+        // BF8 1.0 = S.01111.00 (exp field 15 = bias) -> FP32 1.0.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b01111, 0b00)), 1.0f32);
+        // BF8 1.5 = S.01111.10 (1.10b) -> FP32 1.5. mm=0b10 lands at FP32 mant bit 22.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b01111, 0b10)), 1.5f32);
+        // BF8 -2.0 = S.10000.00 -> -2.0.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(1, 0b10000, 0b00)), -2.0f32);
+        // BF8 max normal 57344 = S.11110.11 = 1.11b * 2^15.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b11110, 0b11)), 57344.0f32);
+    }
+
+    #[test]
+    fn fp8_e5m2_to_fp32_subnormals_renormalise_exactly() {
+        // BF8 min subnormal S.00000.01 = 2^-16 -> FP32 normal exp field (-16+127)=111, mant 0.
+        // This DISTINGUISHES the exact renormalising decode (FP32 normal) from a naive
+        // "subnormal stays subnormal" model, which would produce exp 0 and the wrong value.
+        let v = fp8_e5m2_to_fp32(bf8(0, 0b00000, 0b01));
+        assert_eq!(v, 2.0f32.powi(-16));
+        assert_eq!(fp32_parts(v), (0, 111, 0));
+        // S.00000.10 = 2*2^-16 = 2^-15 -> exp field 112, mant 0.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b00000, 0b10)), 2.0f32.powi(-15));
+        // S.00000.11 = 3*2^-16 = 1.1b * 2^-15 -> exp field 112, mant top bit set (bit 22).
+        let v3 = fp8_e5m2_to_fp32(bf8(0, 0b00000, 0b11));
+        assert_eq!(v3, 3.0 * 2.0f32.powi(-16));
+        assert_eq!(fp32_parts(v3), (0, 112, 1 << 22));
+        // Negative subnormal keeps sign.
+        assert_eq!(fp8_e5m2_to_fp32(bf8(1, 0b00000, 0b01)), -(2.0f32.powi(-16)));
+    }
+
+    #[test]
+    fn fp8_e5m2_to_fp32_inf_and_nan() {
+        // S.11111.00 = BF8 +Inf -> FP32 +Inf (zero mantissa in all-ones exp is Inf, NOT NaN
+        // — this rules out a model that treats the whole max-exponent binade as NaN).
+        assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b11111, 0b00)), f32::INFINITY);
+        assert_eq!(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b00)), f32::NEG_INFINITY);
+        // S.11111.01 / .10 / .11 are BF8 NaN -> FP32 NaN, sign preserved.
+        for m in [0b01u8, 0b10, 0b11] {
+            let v = fp8_e5m2_to_fp32(bf8(0, 0b11111, m));
+            assert!(v.is_nan(), "mm={m:#04b} should be NaN");
+            let (s, e, frac) = fp32_parts(v);
+            assert_eq!((s, e), (0, 0xff));
+            assert!(frac != 0, "NaN mantissa nonzero");
+        }
+        assert!(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b10)).is_nan());
+        assert_eq!(fp32_parts(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b10))).0, 1);
+    }
+
+    #[test]
+    fn fp8_e4m3_to_fp32_zero_normals_and_max() {
+        assert_eq!(fp8_e4m3_to_fp32(hf8(0, 0b0000, 0b000)).to_bits(), 0);
+        assert_eq!(fp8_e4m3_to_fp32(hf8(1, 0b0000, 0b000)).to_bits(), 1 << 31);
+        // HF8 1.0 = S.0111.000 (exp field 7 = bias) -> 1.0.
+        assert_eq!(fp8_e4m3_to_fp32(hf8(0, 0b0111, 0b000)), 1.0f32);
+        // HF8 1.5 = S.0111.100 (1.100b) -> 1.5.
+        assert_eq!(fp8_e4m3_to_fp32(hf8(0, 0b0111, 0b100)), 1.5f32);
+        // HF8 max normal 448 = S.1111.110 = 1.110b * 2^8. This sits in the max-exponent
+        // binade as a genuine normal (NOT NaN), distinguishing E4M3 from an E5M2-style
+        // "max exponent == NaN" model.
+        assert_eq!(fp8_e4m3_to_fp32(hf8(0, 0b1111, 0b110)), 448.0f32);
+        // HF8 384 = S.1111.100 = 1.100b * 2^8, also a max-exponent normal.
+        assert_eq!(fp8_e4m3_to_fp32(hf8(0, 0b1111, 0b100)), 384.0f32);
+    }
+
+    #[test]
+    fn fp8_e4m3_to_fp32_subnormals_and_nan() {
+        // HF8 min subnormal S.0000.001 = 2^-9 -> FP32 normal exp field (-9+127)=118, mant 0.
+        let v = fp8_e4m3_to_fp32(hf8(0, 0b0000, 0b001));
+        assert_eq!(v, 2.0f32.powi(-9));
+        assert_eq!(fp32_parts(v), (0, 118, 0));
+        // S.0000.111 = 7*2^-9 = 1.11b * 2^-7 -> exp field 120, mant top two bits set.
+        let v7 = fp8_e4m3_to_fp32(hf8(1, 0b0000, 0b111));
+        assert_eq!(v7, -(7.0 * 2.0f32.powi(-9)));
+        assert_eq!(fp32_parts(v7), (1, 120, 0b11 << 21));
+        // Sole HF8 NaN S.1111.111 -> FP32 NaN, sign preserved. Every OTHER all-ones-exp
+        // code is a finite normal, so this is the only NaN — rules out an E5M2-style
+        // "any all-ones exponent is non-finite" decode.
+        let nan = fp8_e4m3_to_fp32(hf8(0, 0b1111, 0b111));
+        assert!(nan.is_nan());
+        assert_eq!(fp32_parts(nan).1, 0xff);
+        assert!(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111)).is_nan());
+        assert_eq!(fp32_parts(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111))).0, 1);
     }
 }
