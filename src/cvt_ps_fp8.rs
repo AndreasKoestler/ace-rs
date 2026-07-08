@@ -76,8 +76,8 @@
 //! its `_scalar` sibling on every target. The differential test that would otherwise tie the
 //! native path to the oracle is discarded (no native path exists), so the oracle's correctness
 //! is grounded against the spec section-16.1 pseudocode, transcribed bit-for-bit in
-//! [`crate::fp8`]. The capability check is still consulted (and the wiring is ready for the
-//! shim once the intrinsics land).
+//! [`crate::fp8`]. The capability check is never consulted — the dispatchers only
+//! reference the detector to mark the gate site for the shim once the intrinsics land.
 
 use crate::detect;
 use crate::fp8::{self, Fp8RoundMode};
@@ -125,9 +125,9 @@ pub fn cvtropss_hf8_scalar(a: [f32; 16]) -> [u8; 16] {
 
 // ---------------------------------------------------------------------------------------
 // Family A public dispatchers. OQ-5: no native FP32->FP8 intrinsic exists in the toolchain,
-// so each consults the capability check (wiring the three-layer shape) then falls through to
-// its oracle on every target. The `if detect::...` arm is intentionally empty until the
-// intrinsic lands; the unconditional `_scalar` tail is the deliverable value.
+// so each merely references the capability check (marking the three-layer gate site) and
+// falls through to its oracle on every target; there is no `if detect::...` arm until the
+// intrinsic lands — the unconditional `_scalar` tail is the deliverable value.
 // ---------------------------------------------------------------------------------------
 
 /// FP32 -> BF8 (E5M2), RTNE, **non-saturating** (`VCVTPS2BF8`). On post-rounding overflow:
@@ -135,7 +135,7 @@ pub fn cvtropss_hf8_scalar(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.1]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.5]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtps_bf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtps_bf8_scalar(a)
 }
 
@@ -144,7 +144,7 @@ pub fn cvtps_bf8(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.1]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.5]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.7]` `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtpss_bf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtpss_bf8_scalar(a)
 }
 
@@ -153,7 +153,7 @@ pub fn cvtpss_bf8(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.2]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.6]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtps_hf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtps_hf8_scalar(a)
 }
 
@@ -162,7 +162,7 @@ pub fn cvtps_hf8(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.2]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.6]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.7]` `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtpss_hf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtpss_hf8_scalar(a)
 }
 
@@ -172,7 +172,7 @@ pub fn cvtpss_hf8(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.3]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.4]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.6]` `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtrops_hf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtrops_hf8_scalar(a)
 }
 
@@ -183,7 +183,7 @@ pub fn cvtrops_hf8(a: [f32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.6]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.7]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtropss_hf8(a: [f32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtropss_hf8_scalar(a)
 }
 
@@ -234,7 +234,8 @@ pub fn cvtbiaspss_hf8_scalar(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
 // ---------------------------------------------------------------------------------------
 // Family B public dispatchers. OQ-5: no native FP32->FP8 bias intrinsic exists in the
 // toolchain (`_mm512_cvtbiasps_bf8` etc. are absent — only the FP16-source siblings exist),
-// so each consults the capability check then falls through to its oracle on every target.
+// so each merely references the capability check and falls through to its oracle on every
+// target.
 // ---------------------------------------------------------------------------------------
 
 /// FP32 -> BF8 (E5M2) with per-lane **bias rounding**, **non-saturating** (`VCVTBIASPS2BF8`).
@@ -247,7 +248,7 @@ pub fn cvtbiaspss_hf8_scalar(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbiasps_bf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtbiasps_bf8_scalar(a, bias)
 }
 
@@ -259,7 +260,7 @@ pub fn cvtbiasps_bf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbiaspss_bf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtbiaspss_bf8_scalar(a, bias)
 }
 
@@ -273,7 +274,7 @@ pub fn cvtbiaspss_bf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbiasps_hf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtbiasps_hf8_scalar(a, bias)
 }
 
@@ -285,7 +286,7 @@ pub fn cvtbiasps_hf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
 /// `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbiaspss_hf8(a: [f32; 16], bias: [i32; 16]) -> [u8; 16] {
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtbiaspss_hf8_scalar(a, bias)
 }
 

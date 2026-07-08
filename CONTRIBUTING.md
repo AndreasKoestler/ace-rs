@@ -40,9 +40,9 @@ cargo test --target x86_64-unknown-linux-gnu
 `ACE_REQUIRE_NATIVE=1` makes the suite fail unless the native branch actually
 ran, so a feature-less runner cannot report a false green.
 
-The opt-in `native` cargo feature additionally compiles the `AVX10_V1_AUX` and
-`AVX10_V2_AUX` C shims (`src/native/*.c`) with `-mavx10.2`, which requires
-GCC >= 15 or Clang >= 20:
+The opt-in `native` cargo feature additionally compiles the `AVX10_V1_AUX` C
+shims (`src/native/avx10_v1_aux.c`) with `-mavx10.2`, which requires GCC >= 15
+or Clang >= 20:
 
 ```sh
 cargo test --features native --target x86_64-unknown-linux-gnu

@@ -97,9 +97,10 @@ jobs:
       - name: Verify SDE is runnable
         run: sde64 --version
       - name: Ensure an AVX10.2-capable C compiler (for the `native` feature)
-        # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` and
-        # `src/native/avx10_v2_aux.c` with `-mavx10.2` (design decision D7),
-        # which the `cc` crate drives via $CC.
+        # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` with
+        # `-mavx10.2` (design decision D7), which the `cc` crate drives via $CC.
+        # (No group-3 TU exists yet — the AVX10_V2_AUX intrinsics are absent
+        # from compiler headers, OQ-5.)
         # AVX10.2 intrinsics require GCC >= 15 or Clang >= 20. Probe the runner's
         # default toolchains; fall back to an explicit gcc-15 install. Fail fast
         # with an actionable message if none is available, rather than emitting a

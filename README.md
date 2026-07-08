@@ -184,7 +184,7 @@ cargo test --target x86_64-unknown-linux-gnu
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 
 - **`test`** (x86_64 Linux) — `fmt --check`, `clippy -D warnings`, `build`, `test`. Always runs; gates merges. Scalar-only on the runner; native execution is proven by `native-sde`.
-- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. It also builds with `--features native`, which compiles the `AVX10_V1_AUX` **and** `AVX10_V2_AUX` C shims and exercises the group-2 (families A–G) native-vs-oracle differentials under SDE; the group-3 differentials discard for now because group 3 is oracle-only (OQ-5). Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
+- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. It also builds with `--features native`, which compiles the `AVX10_V1_AUX` C shims and exercises the group-2 (families A–G) native-vs-oracle differentials under SDE; the group-3 differentials discard for now because group 3 is oracle-only (OQ-5, no C shims exist). Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
 
 ### Resolved open questions
 

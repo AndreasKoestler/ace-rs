@@ -104,7 +104,7 @@ pub(crate) fn fp8_e4m3_to_fp4_e2m1(byte: u8) -> u8 {
             let mant = m_i | 0x8; // restore hidden bit (E4M3 has 3 mantissa bits)
             let shift = (3 - new_exp) as u32;
             m_o = mant >> shift;
-            let lowmant = mant & ((1u32 << shift) - 1); // mask(shift)
+            let lowmant = mant & crate::fp8::mask(shift as i32);
             let halfway = 1u32 << (shift - 1);
             if lowmant > halfway || (lowmant == halfway && (m_o & 0x1) != 0) {
                 m_o += 1;
@@ -167,7 +167,7 @@ pub(crate) fn fp8_e5m2_to_fp4_e2m1(byte: u8) -> u8 {
             let mant = m_i | 0x4; // restore hidden bit (E5M2 has 2 mantissa bits)
             let shift = (2 - new_exp) as u32;
             m_o = mant >> shift;
-            let lowmant = mant & ((1u32 << shift) - 1); // mask(shift)
+            let lowmant = mant & crate::fp8::mask(shift as i32);
             let halfway = 1u32 << (shift - 1);
             if lowmant > halfway || (lowmant == halfway && (m_o & 0x1) != 0) {
                 m_o += 1;
@@ -230,21 +230,46 @@ pub(crate) fn fp4_e2m1_to_fp8_e4m3(nibble: u8) -> u8 {
     (sign << 7) | mag
 }
 
+/// Pack a slice of sub-byte values into a little-endian bit-packed byte buffer — the write
+/// side of [`extract_field`].
+///
+/// Lane `i` (low `size` bits of `values[i]`) is written at bit offset `size * i`,
+/// contiguously from bit 0, straddling a byte boundary when needed. This is the single
+/// generic packer behind the FP4 nibble pack ([`pack_nibbles`], `size = 4`), the FP6 6-bit
+/// pack ([`crate::fp6::pack`], `size = 6`), and the `unpackb` test inputs (sizes 2–7).
+/// `out` must hold at least `values.len() * size` bits; it is zeroed first, so bits past the
+/// last lane stay zero.
+pub(crate) fn pack_fields(values: &[u8], size: usize, out: &mut [u8]) {
+    debug_assert!((1..=8).contains(&size));
+    debug_assert!(values.len() * size <= out.len() * 8);
+    for byte in out.iter_mut() {
+        *byte = 0;
+    }
+    for (i, &v) in values.iter().enumerate() {
+        let field = (v as u16) & ((1u16 << size) - 1);
+        let bit_offset = size * i;
+        // A field of size <= 8 spans at most two output bytes.
+        let lo_byte = bit_offset >> 3;
+        let lo_shift = bit_offset & 7;
+        out[lo_byte] |= ((field << lo_shift) & 0xff) as u8;
+        let written = 8 - lo_shift; // bits placed in lo_byte
+        if written < size {
+            out[lo_byte + 1] |= (field >> written) as u8;
+        }
+    }
+}
+
 /// Pack a slice of 4-bit FP4 nibbles into a nibble-packed byte buffer.
 ///
 /// Lane `i` (low 4 bits of `nibbles[i]`) is written at bit offset `4 * i`: even lanes in the
 /// low nibble of their byte, odd lanes in the high nibble, two lanes per output byte from
 /// bit 0 (spec section 9.4.5). `nibbles.len()` must be even; the output is
 /// `nibbles.len() / 2` bytes. Every nibble is written (no masking/zeroing), the inverse of
-/// [`unpack_nibbles`].
+/// [`unpack_nibbles`]. Thin `size = 4` wrapper over [`pack_fields`].
 pub(crate) fn pack_nibbles(nibbles: &[u8], out: &mut [u8]) {
     debug_assert_eq!(nibbles.len() % 2, 0);
     debug_assert_eq!(out.len(), nibbles.len() / 2);
-    for (j, byte) in out.iter_mut().enumerate() {
-        let lo = nibbles[2 * j] & 0x0f;
-        let hi = nibbles[2 * j + 1] & 0x0f;
-        *byte = (hi << 4) | lo;
-    }
+    pack_fields(nibbles, 4, out);
 }
 
 /// Unpack a nibble-packed byte buffer into one right-aligned 4-bit value per lane.

@@ -73,10 +73,10 @@
 //! (GCC 16.1.1) shows that intrinsic is ABSENT — the compiler offers only `_mm512_kunpackb`
 //! (the unrelated *mask*-unpack), confirming `_mm512_unpackb` does not yet exist in the
 //! toolchain. Per OQ-5 there is therefore no native C shim, no `extern "C"` declaration, and
-//! no `_hw` path; the dispatcher resolves to its `_scalar` sibling on every target. The
-//! capability check [`crate::detect::has_avx10_v2_aux`] is still consulted (and returns
-//! `false` off AVX10_V2_AUX hardware), so the three-layer detection wiring is exercised; a
-//! native path is added once the intrinsic lands in the toolchain. The differential test
+//! no `_hw` path; the dispatcher resolves to its `_scalar` sibling on every target. The capability check
+//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! nothing to gate; the dispatcher only references the detector to mark the future gate
+//! site. A native path is added once the intrinsic lands in the toolchain. The differential test
 //! that would otherwise tie a native path to the oracle DISCARDS (no native path exists), so
 //! correctness is grounded against the section-9.9.4 pseudocode transcribed in
 //! [`unpackb_scalar`].
@@ -194,17 +194,17 @@ pub fn unpackb_scalar(a: [u8; 64], imm8: u8) -> [u8; 64] {
 /// only the `no_writemask` path, so every lane is written and `imm8` is the sole control input
 /// (`[avx10-v2-aux-ocp-conversions.UNPACKB.9]`). The output is the full 512-bit `[u8; 64]`.
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not wired (OQ-5, see
-/// the module docs — `_mm512_unpackb` is absent from the `-mavx10.2` toolchain), so the
-/// dispatcher falls through to [`unpackb_scalar`] on every target, returning the spec-defined
+/// No native path is wired, so [`detect::has_avx10_v2_aux`] is never consulted (OQ-5, see
+/// the module docs — `_mm512_unpackb` is absent from the `-mavx10.2` toolchain); the
+/// dispatcher resolves to [`unpackb_scalar`] on every target, returning the spec-defined
 /// value (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`).
 pub fn unpackb(a: [u8; 64], imm8: u8) -> [u8; 64] {
     // No native path this phase (OQ-5): the `_mm512_unpackb` intrinsic is absent from the
     // `-mavx10.2` toolchain (the compiler exposes only the unrelated mask-unpack
     // `_mm512_kunpackb`), so even under `feature="native"` on AVX10_V2_AUX hardware the oracle
-    // is the only path. The capability check is still consulted so detection is wired and
-    // ready for the shim once the intrinsic lands.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    // is the only path. The detector is only referenced
+    // (never called), marking the gate site for the shim once the intrinsic lands.
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     unpackb_scalar(a, imm8)
 }
 
@@ -216,24 +216,11 @@ mod tests {
     /// Pack `lanes` little-endian (LSB-from-bit-0) into a `[u8; 64]` at `size` bits per lane,
     /// the inverse of the size-`size` extraction `unpackb` performs at start 0. Used by the
     /// known-value and round-trip tests to build a packed input with known field contents.
+    /// Delegates to the shared production packer [`crate::fp4::pack_fields`] (bytes past the
+    /// last lane stay zero).
     fn pack_fields(lanes: &[u8], size: usize) -> [u8; 64] {
         let mut buf = [0u8; 64];
-        for (i, &lane) in lanes.iter().enumerate() {
-            let field = (lane as u16) & ((1u16 << size) - 1);
-            let mut bit = i * size;
-            let mut remaining = size;
-            let mut value = field;
-            while remaining > 0 {
-                let byte_idx = bit >> 3;
-                let bit_in_byte = bit & 7;
-                let take = (8 - bit_in_byte).min(remaining);
-                let mask = ((1u16 << take) - 1) as u8;
-                buf[byte_idx] |= ((value as u8) & mask) << bit_in_byte;
-                value >>= take;
-                remaining -= take;
-                bit += take;
-            }
-        }
+        crate::fp4::pack_fields(lanes, size, &mut buf);
         buf
     }
 

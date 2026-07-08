@@ -43,25 +43,12 @@ use crate::fp4::extract_field;
 /// Lane `i` (low 6 bits of `values[i]`) is written at bit offset `6 * i`, contiguously from
 /// bit 0, straddling byte boundaries as needed (spec section 9.6.5). `values.len() * 6` must
 /// be a multiple of 8; the output is `values.len() * 6 / 8` bytes. Every lane is written
-/// (no masking/zeroing), the inverse of [`unpack`].
+/// (no masking/zeroing), the inverse of [`unpack`]. Thin `size = 6` wrapper over
+/// [`crate::fp4::pack_fields`].
 pub(crate) fn pack(values: &[u8], out: &mut [u8]) {
     debug_assert_eq!((values.len() * 6) % 8, 0);
     debug_assert_eq!(out.len(), values.len() * 6 / 8);
-    for byte in out.iter_mut() {
-        *byte = 0;
-    }
-    for (i, &v) in values.iter().enumerate() {
-        let field = (v & 0x3f) as u16;
-        let bit_offset = 6 * i;
-        // The 6-bit field can span at most two output bytes.
-        let lo_byte = bit_offset >> 3;
-        let lo_shift = bit_offset & 7;
-        out[lo_byte] |= ((field << lo_shift) & 0xff) as u8;
-        let written = 8 - lo_shift; // bits placed in lo_byte
-        if written < 6 {
-            out[lo_byte + 1] |= (field >> written) as u8;
-        }
-    }
+    crate::fp4::pack_fields(values, 6, out);
 }
 
 /// Unpack a 6-bit-packed byte buffer into one right-aligned 6-bit value per lane.
@@ -124,7 +111,7 @@ pub(crate) fn fp8_e5m2_to_fp6_e3m2(byte: u8) -> u8 {
             let mant = m_i | 0x4; // restore hidden bit (E5M2 has 2 mantissa bits)
             let shift = (1 - new_exp) as u32;
             m_o = mant >> shift;
-            let lowmant = mant & ((1u32 << shift) - 1); // mask(shift)
+            let lowmant = mant & crate::fp8::mask(shift as i32);
             let halfway = 1u32 << (shift - 1);
             if lowmant > halfway || (lowmant == halfway && (m_o & 0x1) != 0) {
                 m_o += 1;
@@ -191,7 +178,7 @@ pub(crate) fn fp8_e4m3_to_fp6_e2m3(byte: u8) -> u8 {
             let mant = m_i | 0x8; // restore hidden bit (E4M3 has 3 mantissa bits)
             let shift = (1 - new_exp) as u32;
             m_o = mant >> shift;
-            let lowmant = mant & ((1u32 << shift) - 1); // mask(shift)
+            let lowmant = mant & crate::fp8::mask(shift as i32);
             let halfway = 1u32 << (shift - 1);
             if lowmant > halfway || (lowmant == halfway && (m_o & 0x1) != 0) {
                 m_o += 1;

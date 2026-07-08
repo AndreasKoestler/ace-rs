@@ -706,8 +706,9 @@ pub(crate) fn fp8_e4m3_to_fp32(byte: u8) -> f32 {
 }
 
 /// `mask(n)` from the section-16.1 pseudocode: the low-`n`-bit mask, with `mask(0) == 0`.
+/// Shared with the FP4/FP6 rounders in [`crate::fp4`] / [`crate::fp6`].
 #[inline]
-fn mask(n: i32) -> u32 {
+pub(crate) fn mask(n: i32) -> u32 {
     if n <= 0 {
         0
     } else if n >= 32 {

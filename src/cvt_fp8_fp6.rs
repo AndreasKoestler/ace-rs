@@ -57,9 +57,10 @@
 //! of function ... did you mean '_mm512_cvtph_hf8'?`). Per OQ-5 there is therefore no native C
 //! shim and no `extern "C"` declaration for any of them, and each dispatcher resolves to its
 //! `_scalar` sibling on every target. The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is still consulted (and the native branch is empty) so
-//! the three-layer detection wiring is exercised; a native path is added once the intrinsics
-//! land in the toolchain. The differential test that would otherwise tie a native path to the
+//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! nothing to gate; each dispatcher only references the detector to mark the future gate
+//! site. A native path is added once the intrinsics land in the toolchain. The differential
+//! test that would otherwise tie a native path to the
 //! oracle DISCARDS (no native path exists), so correctness is grounded against the
 //! section-9.6.5 / section-9.7.5 / section-16.3 pseudocode transcribed in [`crate::fp6`].
 
@@ -75,16 +76,16 @@ use crate::fp6;
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.2]`). Every BF8 subnormal -> FP6 same-signed
 /// zero (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.3]`).
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not yet wired
-/// (OQ-5, see the module docs), so the dispatcher falls through to [`cvtf8_bf6s_scalar`]
+/// No native path is wired yet (OQ-5, see the module docs), so
+/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_bf6s_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_bf6s(a: [u8; 64]) -> [u8; 48] {
     // No native path this phase (OQ-5): the FP8->FP6 intrinsic is absent from the `-mavx10.2`
     // toolchain, so even under `feature="native"` on AVX10_V2_AUX hardware the oracle is the
-    // only path. The capability check is still consulted so detection is wired and ready for
-    // the shim once the intrinsic lands.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    // only path. The detector is only referenced
+    // (never called), marking the gate site for the shim once the intrinsic lands.
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtf8_bf6s_scalar(a)
 }
 
@@ -111,13 +112,13 @@ pub fn cvtf8_bf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.2]`). Every HF8 subnormal -> FP6 same-signed
 /// zero (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.3]`).
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not yet wired
-/// (OQ-5, see the module docs), so the dispatcher falls through to [`cvtf8_hf6s_scalar`]
+/// No native path is wired yet (OQ-5, see the module docs), so
+/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_hf6s_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_hf6s(a: [u8; 64]) -> [u8; 48] {
     // No native path this phase (OQ-5); see the module docs and `cvtf8_bf6s`.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtf8_hf6s_scalar(a)
 }
 
@@ -146,16 +147,16 @@ pub fn cvtf8_hf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 /// E4M3 range. The output (`[u8; 64]`) is twice the 6-bit-packed input width (`[u8; 48]`), the
 /// input read from bit 0 (spec section 9.7.5).
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not yet wired
-/// (OQ-5, see the module docs), so the dispatcher falls through to [`cvtf6_hf8_e3m2_scalar`]
+/// No native path is wired yet (OQ-5, see the module docs), so
+/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf6_hf8_e3m2_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf6_hf8_e3m2(a: [u8; 48]) -> [u8; 64] {
     // No native path this phase (OQ-5): `_mm512_cvtf6_hf8` (`VCVTBF62HF8`) is absent from the
     // `-mavx10.2` toolchain (GCC 16.1.1), so even under `feature="native"` on AVX10_V2_AUX
-    // hardware the oracle is the only path. The capability check is still consulted so
-    // detection is wired and ready for the shim once the intrinsic lands.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    // hardware the oracle is the only path. The detector is only referenced
+    // (never called), marking the gate site for the shim once the intrinsic lands.
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtf6_hf8_e3m2_scalar(a)
 }
 
@@ -183,14 +184,14 @@ pub fn cvtf6_hf8_e3m2_scalar(a: [u8; 48]) -> [u8; 64] {
 /// E4M3 range. The output (`[u8; 64]`) is twice the 6-bit-packed input width (`[u8; 48]`), the
 /// input read from bit 0 (spec section 9.7.5).
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not yet wired
-/// (OQ-5, see the module docs), so the dispatcher falls through to [`cvtf6_hf8_e2m3_scalar`]
+/// No native path is wired yet (OQ-5, see the module docs), so
+/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf6_hf8_e2m3_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf6_hf8_e2m3(a: [u8; 48]) -> [u8; 64] {
     // No native path this phase (OQ-5): `_mm512_cvtf6_hf8` (`VCVTHF62HF8`) is absent from the
     // `-mavx10.2` toolchain (GCC 16.1.1); see the module docs and `cvtf6_hf8_e3m2`.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtf6_hf8_e2m3_scalar(a)
 }
 

@@ -38,9 +38,10 @@
 //! *unsigned*-saturation sibling), confirming the symmetric `cvtss` form does not yet exist
 //! in the toolchain. Per OQ-5 there is therefore no native C shim, no `extern "C"`
 //! declaration, and no `_hw` path; each dispatcher resolves to its `_scalar` sibling on every
-//! target. The capability check [`crate::detect::has_avx10_v2_aux`] is still consulted (and
-//! returns `false` here off AVX10_V2_AUX hardware), so the three-layer detection wiring is
-//! exercised; a native path is added once the intrinsic lands in the toolchain. The
+//! target. The capability check
+//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! nothing to gate; the dispatcher only references the detector to mark the future gate
+//! site. A native path is added once the intrinsic lands in the toolchain. The
 //! differential test that would otherwise tie a native path to the oracle DISCARDS (no native
 //! path exists), so correctness is grounded against the sect 9.8.5 pseudocode transcribed in
 //! [`saturate_int32_to_symmetric_int8`].
@@ -78,17 +79,17 @@ fn saturate_int32_to_symmetric_int8(x: i32) -> i8 {
 /// [`saturate_int32_to_symmetric_int8`]. The output is one quarter of the input width (16
 /// dwords -> 16 bytes, `[avx10-v2-aux-ocp-conversions.CVT_SSDB.3]`).
 ///
-/// Queries [`detect::has_avx10_v2_aux`] for the native path; that path is not wired (OQ-5,
-/// see the module docs — `_mm512_cvtssepi32_epi8` is absent from the `-mavx10.2` toolchain),
-/// so the dispatcher falls through to [`cvtssepi32_epi8_scalar`] on every target, returning
+/// No native path is wired, so [`detect::has_avx10_v2_aux`] is never consulted (OQ-5,
+/// see the module docs — `_mm512_cvtssepi32_epi8` is absent from the `-mavx10.2` toolchain);
+/// the dispatcher resolves to [`cvtssepi32_epi8_scalar`] on every target, returning
 /// the spec-defined value (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`).
 pub fn cvtssepi32_epi8(a: [i32; 16]) -> [i8; 16] {
     // No native path this phase (OQ-5): the symmetric-saturation intrinsic
     // `_mm512_cvtssepi32_epi8` is absent from the `-mavx10.2` toolchain (the compiler exposes
     // only the unsigned-saturation `_mm512_cvtusepi32_epi8`), so even under `feature="native"`
-    // on AVX10_V2_AUX hardware the oracle is the only path. The capability check is still
-    // consulted so detection is wired and ready for the shim once the intrinsic lands.
-    let _ = detect::has_avx10_v2_aux; // keep the capability gate referenced on every target
+    // on AVX10_V2_AUX hardware the oracle is the only path. The detector is only referenced
+    // (never called), marking the gate site for the shim once the intrinsic lands.
+    let _ = detect::has_avx10_v2_aux; // reference (not call) the future gate; see fn docs
     cvtssepi32_epi8_scalar(a)
 }
 

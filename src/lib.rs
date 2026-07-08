@@ -2395,20 +2395,42 @@ mod iteration2_surface {
         // Family I — VUNPACKB sub-byte unpack. ([u8;64], u8) -> [u8;64]; imm8 is a value arg.
         let _unpackb: [u8; 64] = crate::unpackb([0u8; 64], crate::ACE_UNPACKB_SIZE(4));
 
-        // Count is load-bearing: exactly 21 public group-3 primitives are bound above.
-        let bound_count = 6 // A
-            + 4 // B
-            + 2 // C
-            + 2 // D
-            + 1 // E
-            + 2 // F
-            + 2 // G
-            + 1 // H
-            + 1; // I
-        assert_eq!(
-            bound_count, 21,
-            "exactly 21 AVX10_V2_AUX (group-3) primitives are reachable by their stdarch stems"
-        );
+        // Count is machine-checked: the fixed-size array below references every binding
+        // above, so the 21-primitive inventory is a compile-time fact — adding or removing
+        // a binding without updating this list is a compile error, not a stale comment.
+        let bound: [&dyn core::fmt::Debug; 21] = [
+            // Family A (6)
+            &_cvtps_bf8,
+            &_cvtpss_bf8,
+            &_cvtps_hf8,
+            &_cvtpss_hf8,
+            &_cvtrops_hf8,
+            &_cvtropss_hf8,
+            // Family B (4)
+            &_cvtbiasps_bf8,
+            &_cvtbiaspss_bf8,
+            &_cvtbiasps_hf8,
+            &_cvtbiaspss_hf8,
+            // Family C (2)
+            &_cvtbf8_ps,
+            &_cvthf8_ps,
+            // Family D (2)
+            &_cvtf8_bf4s_e5m2,
+            &_cvtf8_bf4s_e4m3,
+            // Family E (1)
+            &_cvtbf4_hf8,
+            // Family F (2)
+            &_cvtf8_bf6s,
+            &_cvtf8_hf6s,
+            // Family G (2)
+            &_cvtf6_hf8_e3m2,
+            &_cvtf6_hf8_e2m3,
+            // Family H (1)
+            &_cvtssepi32_epi8,
+            // Family I (1)
+            &_unpackb,
+        ];
+        let _ = bound;
     }
 }
 
