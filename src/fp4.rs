@@ -291,8 +291,8 @@ mod tests {
         // Byte 1 = bits 8..15 = high 4 bits of field1.
         let field0 = 0b101101u8; // 45
         let field1 = 0b011010u8; // 26
-        let packed0 = (field0 | (field1 << 6)) & 0xff; // bits 0..7
-        let packed1 = (field1 >> 2) & 0xff; // bits 8..11
+        let packed0 = field0 | (field1 << 6); // bits 0..7
+        let packed1 = field1 >> 2; // bits 8..11
         let buf = [packed0, packed1];
 
         // field1 is the one that straddles the byte-0/byte-1 boundary (bits 6..11): this is

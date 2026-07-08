@@ -334,9 +334,9 @@ mod tests {
             let imm8 = ACE_UNPACKB_SIZE(2) | ACE_UNPACKB_START(start);
             let got = unpackb(buf, imm8);
             let expected = (start + 1) & 0x3;
-            for i in 0..64 {
+            for (i, &lane) in got.iter().enumerate() {
                 assert_eq!(
-                    got[i], expected,
+                    lane, expected,
                     "size-2 start={start} lane {i}: reads window {start} (field {expected})"
                 );
             }
@@ -537,7 +537,7 @@ mod proptests {
             let imm8 = input.imm8 & !ACE_UNPACKB_SEXT; // force zero-extend
             let (size, _sign, _start) = decode_imm8(imm8);
             let out = unpackb(input.a, imm8);
-            let high_mask: u8 = if size >= 8 { 0 } else { (0xffu8 << size) & 0xff };
+            let high_mask: u8 = if size >= 8 { 0 } else { 0xffu8 << size };
             out.iter().all(|&b| b & high_mask == 0)
         }
 
@@ -552,7 +552,7 @@ mod proptests {
             let (size, _sign, _start) = decode_imm8(imm8_se);
             let se = unpackb(input.a, imm8_se);
             let ze = unpackb(input.a, imm8_ze);
-            let high_mask: u8 = if size >= 8 { 0 } else { (0xffu8 << size) & 0xff };
+            let high_mask: u8 = if size >= 8 { 0 } else { 0xffu8 << size };
             (0..64).all(|i| {
                 let field = ze[i]; // zero-extended field (low `size` bits)
                 let msb = (field >> (size - 1)) & 0x1;
@@ -608,6 +608,12 @@ mod proptests {
 /// test becomes live the moment a native (constant-`imm8` dispatched) path lands.
 #[cfg(test)]
 mod differential {
+    // Without the native feature the quickcheck body compiles down to the discard arm, so the
+    // imports and struct fields are only read on the native+x86_64 configuration.
+    #![cfg_attr(
+        not(all(target_arch = "x86_64", feature = "native")),
+        allow(unused_imports, dead_code)
+    )]
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 

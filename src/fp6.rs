@@ -389,7 +389,7 @@ mod tests {
         let m = code & 0x7;
         let sign = if s == 1 { -1.0 } else { 1.0 };
         let mag = if e == 0 {
-            (m as f64 / 8.0) * 2f64.powi(1 - 1)
+            (m as f64 / 8.0) * 2f64.powi(0) // exp = 1 - bias, bias = 1
         } else {
             (1.0 + m as f64 / 8.0) * 2f64.powi(e as i32 - 1)
         };

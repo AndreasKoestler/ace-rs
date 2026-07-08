@@ -938,6 +938,12 @@ mod proptests {
 /// cannot produce a vacuous green.
 #[cfg(test)]
 mod differential {
+    // Without the native feature the quickcheck body compiles down to the discard arm, so the
+    // imports and struct fields are only read on the native+x86_64 configuration.
+    #![cfg_attr(
+        not(all(target_arch = "x86_64", feature = "native")),
+        allow(unused_imports, dead_code)
+    )]
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 

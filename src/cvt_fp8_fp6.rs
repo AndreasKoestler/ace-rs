@@ -440,7 +440,7 @@ mod tests {
         let m = code & 0x7;
         let sign = if s == 1 { -1.0 } else { 1.0 };
         let mag = if e == 0 {
-            (m as f64 / 8.0) * 2f64.powi(1 - 1)
+            (m as f64 / 8.0) * 2f64.powi(0) // exp = 1 - bias, bias = 1
         } else {
             (1.0 + m as f64 / 8.0) * 2f64.powi(e as i32 - 1)
         };
@@ -606,12 +606,11 @@ mod tests {
         let packed = pack6(&codes);
         let hf8_bytes = cvtf6_hf8_e2m3(packed); // [u8; 64], exact FP6 E2M3 -> E4M3
         let back = cvtf8_hf6s(hf8_bytes); // [u8; 48], E4M3 -> FP6 E2M3 (saturating-RTNE)
-        for i in 0..64 {
+        for (i, &code) in codes.iter().enumerate() {
             assert_eq!(
                 lane(&back, i),
-                codes[i],
-                "lane {i}: FP6 E2M3 {:#04x} -> E4M3 -> FP6 must recover the original code",
-                codes[i]
+                code,
+                "lane {i}: FP6 E2M3 {code:#04x} -> E4M3 -> FP6 must recover the original code"
             );
         }
     }
@@ -867,15 +866,15 @@ mod proptests {
 
         let out_bf6 = cvtf8_bf6s(a);
         let out_hf6 = cvtf8_hf6s(a);
-        for i in 0..64 {
+        for (i, &byte) in a.iter().enumerate() {
             assert_eq!(
                 lane_at(&out_bf6, i),
-                crate::fp6::fp8_e5m2_to_fp6_e3m2(a[i]),
+                crate::fp6::fp8_e5m2_to_fp6_e3m2(byte),
                 "E5M2->E3M2 lane {i} must equal the per-lane helper (no masking)"
             );
             assert_eq!(
                 lane_at(&out_hf6, i),
-                crate::fp6::fp8_e4m3_to_fp6_e2m3(a[i]),
+                crate::fp6::fp8_e4m3_to_fp6_e2m3(byte),
                 "E4M3->E2M3 lane {i} must equal the per-lane helper (no masking)"
             );
         }
@@ -924,6 +923,12 @@ mod proptests {
 /// cannot go vacuously green.
 #[cfg(test)]
 mod differential {
+    // Without the native feature the quickcheck body compiles down to the discard arm, so the
+    // imports and struct fields are only read on the native+x86_64 configuration.
+    #![cfg_attr(
+        not(all(target_arch = "x86_64", feature = "native")),
+        allow(unused_imports, dead_code)
+    )]
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 

@@ -292,7 +292,7 @@ mod proptests {
         // Spot-check that subnormals are RENORMALISED, not flushed: the BF8 / HF8 min
         // subnormals must decode to a nonzero FP32 NORMAL (exp field != 0), which a
         // flush-to-zero (DAZ=1) decode would violate.
-        let bf8_min_sub = 0b0_00000_01u8; // +2^-16
+        let bf8_min_sub = 0b0000_0001u8; // S.00000.01 = +2^-16
         let v = fp8::fp8_e5m2_to_fp32(bf8_min_sub);
         assert_ne!(v.to_bits(), 0, "BF8 subnormal not flushed to zero");
         assert_ne!(
@@ -301,7 +301,7 @@ mod proptests {
             "BF8 subnormal -> FP32 normal"
         );
 
-        let hf8_min_sub = 0b0_0000_001u8; // +2^-9
+        let hf8_min_sub = 0b0000_0001u8; // S.0000.001 = +2^-9
         let v = fp8::fp8_e4m3_to_fp32(hf8_min_sub);
         assert_ne!(v.to_bits(), 0, "HF8 subnormal not flushed to zero");
         assert_ne!(
@@ -323,6 +323,12 @@ mod proptests {
 /// `from_bool(false)` — so a fallback-only runner cannot manufacture a vacuous green.
 #[cfg(test)]
 mod differential {
+    // Without the native feature the quickcheck body compiles down to the discard arm, so the
+    // imports and struct fields are only read on the native+x86_64 configuration.
+    #![cfg_attr(
+        not(all(target_arch = "x86_64", feature = "native")),
+        allow(unused_imports, dead_code)
+    )]
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 

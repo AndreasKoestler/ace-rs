@@ -172,7 +172,7 @@ mod tests {
     // Read FP4 lane `i` back out of the nibble-packed output: even lanes are the low nibble
     // of byte `i/2`, odd lanes are the high nibble.
     fn lane(out: &[u8; 32], i: usize) -> u8 {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             out[i / 2] & 0x0f
         } else {
             (out[i / 2] >> 4) & 0x0f
@@ -387,12 +387,11 @@ mod tests {
         let hf8_bytes = cvtbf4_hf8(packed); // [u8; 64], exact FP4 -> E4M3
         let back = cvtf8_bf4s_e4m3(hf8_bytes); // [u8; 32], E4M3 -> FP4 (saturating-RTNE)
 
-        for i in 0..64 {
+        for (i, &nib) in nibbles.iter().enumerate() {
             assert_eq!(
                 lane(&back, i),
-                nibbles[i],
-                "lane {i}: FP4 {:#x} -> E4M3 -> FP4 must recover the original FP4 code",
-                nibbles[i]
+                nib,
+                "lane {i}: FP4 {nib:#x} -> E4M3 -> FP4 must recover the original FP4 code"
             );
         }
     }
@@ -449,7 +448,7 @@ mod proptests {
     }
 
     fn nibble_at(out: &[u8; 32], i: usize) -> u8 {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             out[i / 2] & 0x0f
         } else {
             (out[i / 2] >> 4) & 0x0f
@@ -544,15 +543,15 @@ mod proptests {
 
         let out_e4m3 = cvtf8_bf4s_e4m3(a);
         let out_e5m2 = cvtf8_bf4s_e5m2(a);
-        for i in 0..64 {
+        for (i, &byte) in a.iter().enumerate() {
             assert_eq!(
                 nibble_at(&out_e4m3, i),
-                crate::fp4::fp8_e4m3_to_fp4_e2m1(a[i]),
+                crate::fp4::fp8_e4m3_to_fp4_e2m1(byte),
                 "E4M3 lane {i} nibble must equal the per-lane helper (no masking)"
             );
             assert_eq!(
                 nibble_at(&out_e5m2, i),
-                crate::fp4::fp8_e5m2_to_fp4_e2m1(a[i]),
+                crate::fp4::fp8_e5m2_to_fp4_e2m1(byte),
                 "E5M2 lane {i} nibble must equal the per-lane helper (no masking)"
             );
         }
@@ -599,6 +598,12 @@ mod proptests {
 /// cannot go vacuously green.
 #[cfg(test)]
 mod differential {
+    // Without the native feature the quickcheck body compiles down to the discard arm, so the
+    // imports and struct fields are only read on the native+x86_64 configuration.
+    #![cfg_attr(
+        not(all(target_arch = "x86_64", feature = "native")),
+        allow(unused_imports, dead_code)
+    )]
     use super::*;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 
