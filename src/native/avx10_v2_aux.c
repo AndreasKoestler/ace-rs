@@ -11,7 +11,8 @@
  *
  * OQ-5 (a family whose intrinsic does not compile under the available -mavx10.2 toolchain
  * ships oracle-only): the FP8->FP32 (family C), FP32->FP8 (families A and B), FP8->FP4
- * (family D), FP4->FP8 (family E) and FP8->FP6 (family F) converts all ship oracle-only.
+ * (family D), FP4->FP8 (family E), FP8->FP6 (family F), FP6->FP8 (family G), VPMOVSSDB
+ * (family H) and VUNPACKB (family I) primitives all ship oracle-only.
  *
  *  - Family C: `VCVTBF82PS` has no `_mm512_cvtbf8_ps` intrinsic and `VCVTHF82PS` has no
  *    `_mm512_cvthf8_ps` intrinsic in the installed GCC 16.x `-mavx10.2` headers (the FP8->FP16
@@ -41,9 +42,15 @@
  *    and `... '_mm512_cvtf8_hf6s'; did you mean '_mm512_cvtph_hf8'?`); every naming variant
  *    (`_mm512_cvtbf8_bf6s`, `_mm512_cvthf8_hf6s`, `_mm512_cvtbf82bf6s`, `_mm512_cvts_bf8_bf6`,
  *    `_mm512_cvtbf8s_bf6`, `_mm512_cvtf8_bf6`) is equally absent.
+ *  - Family G (FP6 -> FP8 E4M3, exact, 6-bit unpacked): no `_mm512_cvtf6_hf8` /
+ *    `_mm512_cvtbf6_hf8` / `_mm512_cvthf6_hf8` (`VCVTBF62HF8` / `VCVTHF62HF8`) intrinsics
+ *    exist in GCC 16.1.1.
+ *  - Family H (`VPMOVSSDB`, INT32 -> INT8 symmetric saturation): no `_mm512_cvtssepi32_epi8`
+ *    intrinsic exists (only the ordinary asymmetric `_mm512_cvtsepi32_epi8` of `VPMOVSDB`).
+ *  - Family I (`VUNPACKB`): no `_mm512_unpackb` intrinsic exists (and the instruction's
+ *    `imm8` would additionally need a compile-time-constant dispatch).
  *
- * Per OQ-5 every family-A, family-B, family-C FP32<->FP8, family-D FP8->FP4, family-E
- * FP4->FP8 and family-F FP8->FP6 primitive therefore ships
+ * Per OQ-5 every group-3 family (A through I) therefore ships
  * **oracle-only**: there is no native shim and no `extern "C"` declaration for any of them, so
  * the always-correct scalar oracle is the only path until the intrinsics land in the
  * toolchain. The differential test that would otherwise tie a native path to the oracle

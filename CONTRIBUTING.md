@@ -7,7 +7,7 @@ tooling are all welcome.
 
 Please read [`DESIGN_RATIONALE.md`](./DESIGN_RATIONALE.md) before adding a new
 primitive — it documents the layering, the `core::arch` mapping, the testing
-strategy, and the design decisions (D1–D7) every primitive is expected to
+strategy, and the design decisions (D1–D11) every primitive is expected to
 follow.
 
 ## Local development setup
@@ -39,6 +39,19 @@ cargo test --target x86_64-unknown-linux-gnu
 
 `ACE_REQUIRE_NATIVE=1` makes the suite fail unless the native branch actually
 ran, so a feature-less runner cannot report a false green.
+
+The opt-in `native` cargo feature additionally compiles the `AVX10_V1_AUX` and
+`AVX10_V2_AUX` C shims (`src/native/*.c`) with `-mavx10.2`, which requires
+GCC >= 15 or Clang >= 20:
+
+```sh
+cargo test --features native --target x86_64-unknown-linux-gnu
+```
+
+Under SDE this also exercises the group-2 native-vs-oracle differentials. The
+group-3 (`AVX10_V2_AUX`) families are currently oracle-only — their intrinsics
+are absent from the compiler headers (OQ-5 in `DESIGN_RATIONALE.md`) — so their
+differentials discard until a toolchain supplies the intrinsics.
 
 ## Tests and lint
 
