@@ -927,9 +927,24 @@ pub(crate) fn fp32_to_fp8_e4m3_biased(
         if newexp >= 16 {
             (0xF, if saturating { 0x6 } else { 0x7 })
         } else if newexp <= 0 {
-            (0, 0)
+            // Underflow: truncate the biased mantissa into the E4M3 subnormal range
+            // (FTZ=0), mirroring the E5M2 Bias branch. Magnitudes below the subnormal
+            // window truncate to zero.
+            let mut m_o = 0u32;
+            if (21 - newexp) <= 24 {
+                let mant = m_b | 0x800000;
+                let shift = 21 - newexp;
+                m_o = mant >> shift;
+            }
+            (0, m_o)
         } else {
-            (newexp, m_b >> 20)
+            let e_o = newexp;
+            let m_o = m_b >> 20;
+            if saturating && e_o == 0xF && m_o == 0x7 {
+                (e_o, 0x6) // clamp NaN slot -> max_normal, as in the RTNE/RTO branches
+            } else {
+                (e_o, m_o)
+            }
         }
     } else {
         // RTNE.

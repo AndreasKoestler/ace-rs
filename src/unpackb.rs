@@ -107,6 +107,11 @@ pub const ACE_UNPACKB_SEXT: u8 = 1 << 5;
 ///
 /// The encoded size occupies bits `imm8[4:2]`. Note the oracle decodes `size = max(field, 2)`,
 /// so `n` values 0 and 1 still decode to a usable size of 2.
+///
+/// **The size field is 3 bits, so the maximum encodable element size is 7.** `n >= 8` wraps
+/// modulo 8 (the spec's `(n) & 0x7` mask): `ACE_UNPACKB_SIZE(8)` encodes size field 0, which
+/// then decodes as size **2** — there is no 8-bit "identity unpack". Requesting `n = 8` will
+/// silently read 2-bit fields, not bytes.
 #[allow(non_snake_case)]
 pub const fn ACE_UNPACKB_SIZE(n: u8) -> u8 {
     (n & 0x7) << 2

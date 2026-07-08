@@ -685,6 +685,55 @@ mod tests {
             "HF8 exact: bias0 == RTNE"
         );
     }
+
+    /// Regression: the E4M3 Bias branch must TRUNCATE underflow into the subnormal range
+    /// (FTZ=0), not flush to zero — mirroring the E5M2 Bias branch and the E4M3 RTNE/RTO
+    /// branches. `2^-7 = 4 * 2^-9` is exactly representable as the E4M3 subnormal
+    /// `S.0000.100` (0x04); a flush-to-zero model returns 0x00.
+    #[test]
+    fn known_value_bias_hf8_underflow_truncates_to_subnormal() {
+        let mut a = [0.0f32; 16];
+        a[0] = f32::from_bits(120u32 << 23); // +2^-7, exact E4M3 subnormal 4*2^-9
+        a[1] = -a[0];
+        a[2] = f32::from_bits((119u32 << 23) | 0x40_0000); // +3*2^-9 = 1.5*2^-8, exact
+        a[3] = f32::from_bits(117u32 << 23); // +2^-10, below the subnormal window -> 0
+        let zero = [0i32; 16];
+
+        let out = cvtbiasps_hf8(a, zero);
+        assert_eq!(out[0], hf8(0, 0b0000, 0b100), "+2^-7 -> subnormal 0x04");
+        assert_eq!(out[1], hf8(1, 0b0000, 0b100), "-2^-7 -> subnormal 0x84");
+        assert_eq!(out[2], hf8(0, 0b0000, 0b011), "+3*2^-9 -> subnormal 0x03");
+        assert_eq!(out[3], hf8(0, 0b0000, 0b000), "+2^-10 truncates to zero");
+        // Saturating variant shares the underflow path.
+        assert_eq!(
+            cvtbiaspss_hf8(a, zero)[0],
+            hf8(0, 0b0000, 0b100),
+            "saturating variant truncates into the subnormal range too"
+        );
+    }
+
+    /// Regression: the SATURATING E4M3 Bias convert must clamp the finite in-binade overflow
+    /// slot (truncated `e_o = 0xF`, `m_o = 0x7`, i.e. inputs in `[480, 512)`) to
+    /// `±max_E4M3 = ±448` (`S.1111.110`), never emit the NaN encoding `S.1111.111` for a
+    /// non-NaN input — matching the RTNE/RTO branches. The NON-saturating variant maps the
+    /// same slot to NaN per the section-9.2.1 overflow rule.
+    #[test]
+    fn known_value_bias_hf8_saturating_nan_slot_clamps() {
+        let mut a = [0.0f32; 16];
+        a[0] = 480.0;
+        a[1] = -480.0;
+        a[2] = 500.0; // still in [480, 512): truncates to the same slot
+        let zero = [0i32; 16];
+
+        let sat = cvtbiaspss_hf8(a, zero);
+        assert_eq!(sat[0], hf8(0, 0b1111, 0b110), "sat +480 -> +448, not NaN");
+        assert_eq!(sat[1], hf8(1, 0b1111, 0b110), "sat -480 -> -448, not NaN");
+        assert_eq!(sat[2], hf8(0, 0b1111, 0b110), "sat +500 -> +448, not NaN");
+
+        let nsat = cvtbiasps_hf8(a, zero);
+        assert_eq!(nsat[0], hf8(0, 0b1111, 0b111), "nsat +480 -> NaN-coded");
+        assert_eq!(nsat[1], hf8(1, 0b1111, 0b111), "nsat -480 -> NaN-coded");
+    }
 }
 
 /// Property tests for families A and B. The known-value tests above pin specific bytes; these
