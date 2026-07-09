@@ -1,7 +1,7 @@
 //! Build script for the opt-in `native` backend (design decision D7).
 //!
-//! It compiles the AVX10_V1_AUX C shims (`src/native/avx10_v1_aux.c`) with `-mavx10.2`
-//! ONLY when both conditions hold:
+//! It compiles the AVX10_V1_AUX C shims (`src/native/avx10_v1_aux.c`) and the ACE group-4
+//! tile shims (`src/native/ace_tile.c`) ONLY when both conditions hold:
 //!
 //!   * the `native` feature is enabled (`CARGO_FEATURE_NATIVE` set by Cargo), and
 //!   * the target architecture is `x86_64` (`CARGO_CFG_TARGET_ARCH == "x86_64"`).
@@ -16,8 +16,9 @@
 //! `src/native/avx10_v2_aux.c` here (plus its `rerun-if-changed` line) when the first
 //! group-3 intrinsic lands in a toolchain.
 fn main() {
-    // Always re-run if the source TU changes (cheap, and avoids stale objects).
+    // Always re-run if either source TU changes (cheap, and avoids stale objects).
     println!("cargo:rerun-if-changed=src/native/avx10_v1_aux.c");
+    println!("cargo:rerun-if-changed=src/native/ace_tile.c");
 
     // Cargo passes `--cfg feature="native"` when it compiles this build script, and the
     // optional `cc` build-dependency is only present (linkable) under that feature. So the
@@ -41,4 +42,17 @@ fn compile_native() {
         .flag("-mavx10.2")
         .opt_level(2)
         .compile("ace_native_avx10_v1_aux");
+
+    // ACE group-4 tile instructions (design decision D7, OQ-6). Families A/B-read/C use real
+    // GCC/Clang AMX-TILE + AMX-AVX512 intrinsics (assembler/intrinsic-reachable); the `ACE`-only
+    // forms (family B write, D, E, F, G) are hand-encoded `.byte` shims so the TU compiles even
+    // though no assembler knows the ACE mnemonics yet. The tile config/data + AVX-512 forms need
+    // `-mamx-tile -mamx-avx512` alongside `-mavx10.2`; the `.byte` shims need no ISA flag at all.
+    cc::Build::new()
+        .file("src/native/ace_tile.c")
+        .flag("-mavx10.2")
+        .flag("-mamx-tile")
+        .flag("-mamx-avx512")
+        .opt_level(2)
+        .compile("ace_native_ace_tile");
 }
