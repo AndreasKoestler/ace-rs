@@ -576,6 +576,53 @@ pub(crate) fn fp32_to_fp16_rne(f: f32) -> u16 {
     fp16_sign | ((exp_field as u16) << 10) | mant_field
 }
 
+/// Convert one FP32 value to BF16 (bfloat16, S1.E8.M7) under round-to-nearest-ties-to-even.
+///
+/// R6 / group-4 net-new codec: no BF16 codec existed in the crate before the ACE group-4
+/// tile instructions (`TOP2BF16PS`, `TCVTROWPS2BF16{H,L}`). BF16 is the **high 16 bits of
+/// FP32** — it shares FP32's sign bit, 8-bit exponent and bias 127, keeping only the top 7
+/// of FP32's 23 mantissa bits — so the value is obtained by rounding the discarded low 16
+/// mantissa bits into the retained 7, with no exponent rebiasing.
+///
+/// Rounding is IEEE round-to-nearest, ties-to-even (RNE) applied ONCE to the 16 discarded
+/// bits. Using the standard branch-free rounder: add `0x7FFF + lsb` (where `lsb` is bit 16
+/// of the FP32 pattern, the least-significant *kept* BF16 mantissa bit) then truncate the
+/// low 16 bits. The `+lsb` term makes an exact half round to the even neighbour; a carry out
+/// of the mantissa correctly propagates into the exponent (and, at the top of the finite
+/// range, to +/-Inf), because the whole 32-bit pattern is incremented before truncation.
+///
+/// Non-finite handling (matches the hardware BF16 narrowing convention):
+/// * +/-Inf -> BF16 +/-Inf (top 16 bits: exp all ones, mantissa 0).
+/// * NaN -> a quiet BF16 NaN with the sign preserved. The raw top-16 bits of an FP32 NaN can
+///   have a zero 7-bit mantissa (when the NaN's set payload bits live only in the discarded
+///   low 16), which would alias to Inf; and the round-bias add could likewise clear it, so
+///   the quiet bit (mantissa bit 6, `0x0040`) is forced on to guarantee the result stays a
+///   NaN rather than becoming Inf.
+pub(crate) fn fp32_to_bf16_rne(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if f.is_nan() {
+        // Quiet NaN, sign preserved: top 16 bits with the quiet mantissa bit forced on so a
+        // NaN can never collapse to the Inf encoding.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    // Round-to-nearest-even on the 16 discarded bits (branch-free): bias by 0x7FFF plus the
+    // least-significant kept bit, then truncate. A tie (low 16 == 0x8000) rounds to even.
+    let lsb = (bits >> 16) & 1;
+    let rounding_bias = 0x0000_7fff + lsb;
+    ((bits + rounding_bias) >> 16) as u16
+}
+
+/// Exact lossless decode of one BF16 (S1.E8.M7) value to the FP32 (S1.E8.M23) it represents.
+///
+/// BF16 is exactly the high 16 bits of FP32 with a zero low half, so the decode is a pure
+/// left shift — no rounding, no saturation, no exceptions. Every BF16 encoding (zeros,
+/// subnormals, normals, +/-Inf, NaN) maps to the single FP32 value whose top 16 bits are
+/// `bits` and whose low 16 bits are zero. This is the exact inverse of [`fp32_to_bf16_rne`]
+/// on any FP32 already representable in BF16 (low 16 mantissa bits zero).
+pub(crate) fn bf16_to_fp32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 /// FP32-family rounding mode for the AVX10_V2_AUX FP32->FP8 converts (spec section 9.1).
 ///
 /// Distinct from the iteration-1 FP16 `bias_mode: bool` path (which stays byte-identical,
@@ -1591,5 +1638,109 @@ mod tests {
         assert_eq!(fp32_parts(nan).1, 0xff);
         assert!(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111)).is_nan());
         assert_eq!(fp32_parts(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111))).0, 1);
+    }
+
+    /// True when a BF16 (S1.E8.M7) bit pattern is a NaN: exponent all ones, mantissa nonzero.
+    fn bf16_is_nan(b: u16) -> bool {
+        (b >> 7) & 0xff == 0xff && (b & 0x7f) != 0
+    }
+
+    /// Discriminating known-value pins for the FP32->BF16 round-to-nearest-ties-to-even
+    /// rounder. Each case is chosen so its expected output DIFFERS from the two leading wrong
+    /// models — plain truncation (drop the low 16 bits) and round-half-away-from-zero — so a
+    /// passing test uniquely identifies RNE (differential tiebreaker unavailable here;
+    /// grounded against the IEEE-754 roundTiesToEven rule for the 16 discarded bits).
+    #[test]
+    fn fp32_to_bf16_rne_known_values() {
+        // Exact (low 16 bits already zero): no rounding, top 16 bits verbatim.
+        assert_eq!(fp32_to_bf16_rne(1.0f32), 0x3f80, "1.0 -> 0x3F80 exact");
+        assert_eq!(fp32_to_bf16_rne(-1.0f32), 0xbf80, "-1.0 -> 0xBF80 exact");
+        assert_eq!(fp32_to_bf16_rne(0.0f32), 0x0000, "+0 -> +0");
+        assert_eq!(fp32_to_bf16_rne(-0.0f32), 0x8000, "-0 -> -0 (sign kept)");
+
+        // Exact half (low 16 == 0x8000), kept-lsb EVEN (0x3F80, bit16 = 0): ties-to-even
+        // rounds DOWN to 0x3F80. Truncation also gives 0x3F80, but round-half-away gives
+        // 0x3F81 — so this case alone rules out round-half-away.
+        assert_eq!(
+            fp32_to_bf16_rne(f32::from_bits(0x3f80_8000)),
+            0x3f80,
+            "half, even kept-lsb -> round to even (down)"
+        );
+        // Exact half, kept-lsb ODD (0x3F81, bit16 = 1): ties-to-even rounds UP to 0x3F82.
+        // Truncation would give 0x3F81 — so this case rules out truncation; together the two
+        // half cases uniquely pin RNE.
+        assert_eq!(
+            fp32_to_bf16_rne(f32::from_bits(0x3f81_8000)),
+            0x3f82,
+            "half, odd kept-lsb -> round to even (up)"
+        );
+        // Just above half -> always rounds up (all models agree, guards the carry path).
+        assert_eq!(
+            fp32_to_bf16_rne(f32::from_bits(0x3f80_8001)),
+            0x3f81,
+            "just above half -> up"
+        );
+        // Just below half -> always rounds down.
+        assert_eq!(
+            fp32_to_bf16_rne(f32::from_bits(0x3f80_7fff)),
+            0x3f80,
+            "just below half -> down"
+        );
+
+        // Mantissa carry propagates into the exponent: 0x3FFF_8000 rounds up from mantissa
+        // all-ones into the next binade (0x4000), not a wrapped mantissa.
+        assert_eq!(
+            fp32_to_bf16_rne(f32::from_bits(0x3fff_8000)),
+            0x4000,
+            "mantissa carry into exponent"
+        );
+
+        // Non-finite: +/-Inf exact; NaN stays a NaN (quiet bit forced, sign kept).
+        assert_eq!(fp32_to_bf16_rne(f32::INFINITY), 0x7f80, "+Inf");
+        assert_eq!(fp32_to_bf16_rne(f32::NEG_INFINITY), 0xff80, "-Inf");
+        assert!(bf16_is_nan(fp32_to_bf16_rne(f32::NAN)), "NaN stays NaN");
+        // An FP32 NaN whose payload lives only in the discarded low 16 bits must NOT alias to
+        // Inf (the raw top-16 would be 0x7F80): the quiet-bit force keeps it a NaN.
+        let sneaky_nan = f32::from_bits(0x7f80_0001);
+        assert!(sneaky_nan.is_nan());
+        assert!(
+            bf16_is_nan(fp32_to_bf16_rne(sneaky_nan)),
+            "low-payload NaN does not collapse to Inf"
+        );
+    }
+
+    /// `bf16_to_fp32` is the exact left-shift decode and the inverse of the RNE rounder on
+    /// every BF16 pattern. Exhaustive over all 65536 encodings (fast, deterministic): each
+    /// non-NaN pattern round-trips bit-for-bit through decode-then-encode, and each NaN
+    /// pattern decodes to an FP32 NaN that re-encodes to a BF16 NaN.
+    /// `fp8::fp32_bf16_round_trip`
+    #[test]
+    fn fp32_bf16_round_trip() {
+        for b in 0u32..=0xffff {
+            let bits = b as u16;
+            let f = bf16_to_fp32(bits);
+            // Exact decode: low 16 bits are zero, top 16 are the BF16 pattern.
+            assert_eq!(
+                f.to_bits(),
+                (b) << 16,
+                "bf16_to_fp32 is an exact left shift"
+            );
+            if f.is_nan() {
+                assert!(
+                    bf16_is_nan(bits),
+                    "decoded NaN came from a BF16 NaN pattern"
+                );
+                assert!(
+                    bf16_is_nan(fp32_to_bf16_rne(f)),
+                    "NaN re-encodes to a BF16 NaN"
+                );
+            } else {
+                assert_eq!(
+                    fp32_to_bf16_rne(f),
+                    bits,
+                    "non-NaN BF16 round-trips exactly (decode then RNE encode)"
+                );
+            }
+        }
     }
 }

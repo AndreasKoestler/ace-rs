@@ -75,6 +75,24 @@
 //! [avx10-v1-aux-fp16-fp8-evex-vnni.DIFFERENTIAL.1-1]). Folding the `native`-feature AVX10
 //! path into the `ACE_REQUIRE_NATIVE` guard would make its tripwire live by the same pattern.
 //!
+//! **Iteration 3 — `ACE` group-4 tile instructions, same tripwire posture.** The 25 group-4
+//! tile instructions (families A–G) follow the identical `ACE_REQUIRE_NATIVE` posture. Their
+//! native backend is the opt-in `native` C-shim / `.byte` path (design D7, OQ-6): families A /
+//! B-read / C are intrinsic-reachable and execute under Intel SDE, while the `ACE`-only forms
+//! (family B write, D, E, F, G) are `.byte` raw encodings that are BUILT but not executed until
+//! SDE gains ACE emulation (R2). The hard `ACE_REQUIRE_NATIVE` guard therefore stays **dormant**
+//! for group 4 exactly as it does for the AVX10 C-shim families — the group-4-scoped
+//! `ace_tile_native_runs_when_required` test presence-checks the variable and records the
+//! per-family tile detection status rather than vacuously asserting a native branch that cannot
+//! yet run. Each family ships a live `prop_native_matches_oracle` differential (in its
+//! `differential` module) that compares the C / `.byte` native path to the scalar oracle
+//! bit-for-bit under `feature="native"` + the per-family `detect::has_amx_tile()` /
+//! `has_amx_avx512()` / `has_ace()` gate and calls `TestResult::discard()` — never
+//! `from_bool(false)` — when the feature or hardware is absent, so a fallback-only runner can
+//! never go vacuously green ([ace-tile-instructions.TESTING.1], [ace-tile-instructions.TESTING.2]).
+//! The layer-2 `tests/encoding.rs` harness golden-checks every `.byte` encoding with no external
+//! tool, so `.byte` transcription errors are caught before SDE ACE lands.
+//!
 //! **Iteration 2 — `AVX10_V2_AUX` (group 3), same scope.** The 21 group-3 OCP-format converts
 //! (families A–I: FP32↔FP8, FP8↔FP4, FP8↔FP6, `VPMOVSSDB`, `VUNPACKB`) follow the identical
 //! tripwire posture. Every one of their `-mavx10.2` C-shim intrinsics
@@ -91,17 +109,28 @@
 //! never produce a vacuous green ([avx10-v2-aux-ocp-conversions.DIFFERENTIAL.1],
 //! [avx10-v2-aux-ocp-conversions.DIFFERENTIAL.2]).
 //!
-//! # Non-goals — confirmed NOT implemented (through iteration 2)
+//! # Non-goals — confirmed NOT implemented (through iteration 3)
 //!
 //! The public surface of this crate is the completed group-1 VEX family (iteration-0
 //! [`dpbssd`] plus the 11 remaining `avxvnniint8`/`avxvnniint16` multiply-accumulate ops),
-//! the 26 `AVX10_V1_AUX` primitives (families A–G), and — added in iteration 2 — the 21
-//! `AVX10_V2_AUX` (group 3) OCP-format converts (families A–I: FP32↔FP8, FP8↔FP4, FP8↔FP6,
-//! `VPMOVSSDB`, `VUNPACKB`). **Group 3 is therefore no longer a non-goal.** The following
-//! remain deliberately **out of scope** and are NOT present in any public item or native path
-//! (verified by [`non_goal_guards::non_goals_absent`]):
+//! the 26 `AVX10_V1_AUX` primitives (families A–G), the 21 `AVX10_V2_AUX` (group 3) OCP-format
+//! converts added in iteration 2 (families A–I: FP32↔FP8, FP8↔FP4, FP8↔FP6, `VPMOVSSDB`,
+//! `VUNPACKB`), and — added in iteration 3 — the 25 `ACE` group-4 tile instructions (families
+//! A–G: the palette-2 tile lifecycle + [`TileScope`] RAII guard, tile↔ZMM moves, tile-row
+//! converts, block-scale [`BsrReg`] registers, and the `TOP*` outer products). **Group 4 is
+//! therefore no longer a non-goal** — its reachability is the positive assertion in
+//! [`iteration_surface::iteration_surface_includes_group4`]. The following remain deliberately
+//! **out of scope** and are NOT present in any public item or native path (verified by
+//! [`non_goal_guards::non_goals_absent`]):
 //!
-//! - **No group-4 `ACE` instructions** — no `TOP*`, `BSR*`, or tile-move primitives.
+//! - **No palette-1 tile configuration and no AMX `TMUL` dot-product instructions** — the tile
+//!   surface is the palette-2 `ACE` group-4 engine only; the legacy AMX palette-1 configuration
+//!   and the `TMUL` dot products (`TDPBSSD`/`TDPBF16PS`/`TDPFP16PS` and siblings) are NOT
+//!   implemented. Group 4's outer products (`TOP*`) are a distinct engine.
+//! - **No nightly `x86_amx_intrinsics`** — the group-4 native backend is the opt-in `native`
+//!   C-shim / `.byte` path (design D7); the crate uses no `core::simd`, no
+//!   `link_llvm_intrinsics`, and no nightly `x86_amx_intrinsics` feature anywhere
+//!   ([ace-tile-instructions.STABLE.1]).
 //! - **No VEX-encoded AVX-VNNI-INT8/16 forms beyond the group-1 family** — the family-F/G
 //!   additions are the EVEX 512-bit generalization ([`vnni`]), not new VEX forms.
 //! - **No EVEX write-masking (`{k1}{z}`) or memory-broadcast (`m32bcst`/`m*bcst`) in the public
@@ -115,6 +144,7 @@
 //!   512-bit (`VL=512`) form; the 128/256-bit `VL` plumbing the spec also defines is not
 //!   surfaced.
 
+pub mod bsr;
 pub mod cvt_fp8_fp4;
 pub mod cvt_fp8_fp6;
 pub mod cvt_fp8_ph;
@@ -129,6 +159,10 @@ pub(crate) mod fp6;
 pub(crate) mod fp8;
 #[cfg(all(target_arch = "x86_64", feature = "native"))]
 pub(crate) mod native;
+pub mod tcvtrow;
+pub mod tile;
+pub mod tile_move;
+pub mod top;
 pub mod unpackb;
 pub mod vnni;
 
@@ -204,6 +238,94 @@ pub use cvt_ps_fp8::{
 };
 
 pub use cvt_ps_ph::{cvt2ps_phx, cvt2ps_phx_scalar};
+
+// ACE group-4 family A: tile configuration lifecycle wrapped in the crate's first RAII guard
+// (`TileScope`). `_tile_loadconfig`/`_tile_storeconfig`/`_tile_zero` mirror their eventual
+// stdarch intrinsic stems ([ace-tile-instructions.NAMING.1]); `_tile_release` is Drop-only, so
+// it has no free-standing re-export. Each dispatcher pairs a cfg-free `_scalar` oracle (the
+// primary path). Pure stable Rust — no core::simd / nightly ([ace-tile-instructions.STABLE.1]).
+pub use tile::{
+    _tile_loadconfig, _tile_loadconfig_scalar, _tile_storeconfig, _tile_storeconfig_scalar,
+    _tile_zero, _tile_zero_scalar, TileConfig, TileConfigError, TileId, TileScope,
+};
+
+// ACE group-4 family B: tile <-> vector row/column moves. Read forms (`_tile_movrow` /
+// `_tile_movcol`, tile -> ZMM) gate on AMX-AVX512 or ACE_VSN>=1; the ACE-only write forms
+// (`_tile_mov{row,col}_write`, ZMM -> tile) gate on full ACE. Each dispatcher mirrors its
+// eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
+// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 placeholders.
+pub use tile_move::{
+    _tile_movcol, _tile_movcol_scalar, _tile_movcol_write, _tile_movcol_write_scalar, _tile_movrow,
+    _tile_movrow_scalar, _tile_movrow_write, _tile_movrow_write_scalar, ZMM_BYTES,
+};
+
+// ACE group-4 family C: tile-row converts. Each convert reads one addressed tile row and
+// writes a destination ZMM: `_tile_tcvtrowd2ps` (INT32 -> FP32), `_tile_tcvtrowps2bf16{h,l}`
+// (FP32 -> BF16 via the net-new RNE rounder), and `_tile_tcvtrowps2ph{h,l}` (FP32 -> FP16 via
+// the reused RNE rounder), the H/L pair writing disjoint high/low half-lanes (INV-7). All five
+// gate on AMX-AVX512 or ACE_VSN>=1 ([ace-tile-instructions.DETECT.1-2]); each dispatcher mirrors
+// its eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
+// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+pub use tcvtrow::{
+    _tile_tcvtrowd2ps, _tile_tcvtrowd2ps_scalar, _tile_tcvtrowps2bf16h,
+    _tile_tcvtrowps2bf16h_scalar, _tile_tcvtrowps2bf16l, _tile_tcvtrowps2bf16l_scalar,
+    _tile_tcvtrowps2phh, _tile_tcvtrowps2phh_scalar, _tile_tcvtrowps2phl,
+    _tile_tcvtrowps2phl_scalar, ROW_FP32_LANES, ZMM_WORD_LANES,
+};
+
+// ACE group-4 family D: block-scale (`BSR`) registers. `_tile_bsrinit` seeds a block-scale
+// register with per-block scale exponents; `_tile_bsrmov{f,h,l}` move the full / high-nibble /
+// low-nibble block-scale factor of one addressed block. The `BSR` file is owned by the
+// `TileScope` guard, so the MX-FP8 outer products (phase 7) read back the same block scale
+// these ops wrote (INV-5, `[ace-tile-instructions.BSR.4-1]`). Family D is `ACE`-only and gates
+// on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each dispatcher mirrors its eventual
+// stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
+// ([ace-tile-instructions.NAMING.1]). The scale-field layout is an OQ-3 assumption grounded
+// against ACE v1 §12 (per-block E8M0 exponents); widths are canonical OQ-3/OQ-8 forms.
+pub use bsr::{
+    _tile_bsrinit, _tile_bsrinit_scalar, _tile_bsrmovf, _tile_bsrmovf_scalar, _tile_bsrmovh,
+    _tile_bsrmovh_scalar, _tile_bsrmovl, _tile_bsrmovl_scalar, BsrId, BsrReg, BSR_SCALE_BLOCKS,
+    NUM_BSR,
+};
+
+// ACE group-4 family G: INT8 rank-4 outer-product accumulates, generated by the sibling
+// `define_top!` macro (§3 Option B). `_tile_top4b{ss,su,us,uu}d` widen INT8 (signedness carried
+// in the operand element type, D10) and accumulate the rank-4 outer product into an INT32
+// destination tile with exact i32 wraparound, in the pinned ACE v1 §14 order (see `src/top.rs`).
+// A wrong-signedness or operand-swap call does not compile (E0308, INV-9). Family G is `ACE`-only
+// and gates on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each dispatcher mirrors its
+// eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
+// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+pub use top::{
+    _tile_top4bssd, _tile_top4bssd_scalar, _tile_top4bsud, _tile_top4bsud_scalar, _tile_top4busd,
+    _tile_top4busd_scalar, _tile_top4buud, _tile_top4buud_scalar,
+};
+
+// ACE group-4 family F: the BF16 rank-2 outer-product accumulate, `TOP2BF16PS`. It decodes BF16
+// operands (raw `u16` bits) via `fp8::bf16_to_fp32` and accumulates the rank-2 outer product into
+// an FP32 destination tile with NO block scale, in the same pinned ACE v1 §14 order as family G
+// (see `src/top.rs`). Family F is `ACE`-only and gates on full `ACE`
+// ([ace-tile-instructions.DETECT.1-3]); the dispatcher mirrors its eventual stdarch intrinsic stem
+// and pairs a cfg-free `_scalar` oracle (the primary path) ([ace-tile-instructions.NAMING.1]).
+// Widths are canonical OQ-8 forms.
+pub use top::{_tile_top2bf16ps, _tile_top2bf16ps_scalar};
+
+// ACE group-4 family E: the MX-FP8 rank-4 outer-product accumulates. Each decodes its FP8
+// operands via the shared `fp8::fp8_e5m2_to_fp32` (BF8/E5M2) / `fp8::fp8_e4m3_to_fp32` (HF8/E4M3)
+// codecs, applies the per-block E8M0 BSR scale addressed by a `BsrId` (reading back exactly the
+// scale the family-D `BSR*` ops wrote, INV-5, [ace-tile-instructions.BSR.4-1]), and accumulates
+// the rank-4 outer product into an FP32 destination tile in the pinned ACE v1 §14 order (scale
+// applied to each decoded operand before the multiply; see `src/top.rs`). The four mixed-format
+// forms are BF8×BF8 / BF8×HF8 / HF8×BF8 / HF8×HF8 ([ace-tile-instructions.MX_TOP.1..4]);
+// `_tile_top4mxbssps` is the block-scaled signed×signed INT8 analogue ([ace-tile-instructions.MX_TOP.5]).
+// Family E is `ACE`-only and gates on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each
+// dispatcher mirrors its eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle
+// (the primary path) ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+pub use top::{
+    _tile_top4mxbf8ps, _tile_top4mxbf8ps_scalar, _tile_top4mxbhf8ps, _tile_top4mxbhf8ps_scalar,
+    _tile_top4mxbssps, _tile_top4mxbssps_scalar, _tile_top4mxhbf8ps, _tile_top4mxhbf8ps_scalar,
+    _tile_top4mxhf8ps, _tile_top4mxhf8ps_scalar,
+};
 
 // T1 toolchain risk gate (OQ-1, re-confirmed): `is_x86_feature_detected!("avxvnniint16")`
 // and all six word intrinsics (`_mm256_dpw{sud,suds,usd,usds,uud,uuds}_epi32`) plus the
@@ -881,6 +1003,39 @@ mod tests {
         }
         #[cfg(not(target_arch = "x86_64"))]
         panic!("ACE_REQUIRE_NATIVE=1 on a non-x86_64 target — the native path cannot run here");
+    }
+
+    /// Group-4 (`ACE` tile) counterpart of [`native_runs_when_required`], honoring
+    /// `ACE_REQUIRE_NATIVE=1` per the same pattern ([ace-tile-instructions.TESTING.2]). Group-4
+    /// native execution is deferred to Intel SDE ACE emulation (OQ-6, R2): families A / B-read /
+    /// C are intrinsic-reachable and light up under SDE, while the `ACE`-only `.byte` families
+    /// (B write, D, E, F, G) stay dormant until SDE gains ACE emulation. This guard therefore
+    /// stays **dormant** for group 4 — exactly as the hard guard does for the AVX10 C-shim
+    /// families — recording the per-family tile detection status rather than vacuously asserting
+    /// a native branch that cannot yet run. When the var is unset (local / non-CI) it returns
+    /// early, so the host `cargo test` stays green without any native tile path.
+    #[test]
+    fn ace_tile_native_runs_when_required() {
+        // ACE_REQUIRE_NATIVE absent → dormant, suite stays green without native tile execution.
+        if std::env::var_os("ACE_REQUIRE_NATIVE").is_none() {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Non-vacuous record: a future ACE-capable SDE run surfaces these as `true` and the
+            // per-family `prop_native_matches_oracle` differentials stop discarding. Until then
+            // the group-4 native path is built (encoding-asserted) but not executed — no hard
+            // requirement is asserted here, matching the AVX10 C-shim families' dormant posture.
+            eprintln!(
+                "ACE_REQUIRE_NATIVE=1: group-4 tile native execution deferred to SDE ACE \
+                 (has_amx_tile={} has_amx_avx512={} has_ace={}); .byte families discard until then",
+                crate::detect::has_amx_tile(),
+                crate::detect::has_amx_avx512(),
+                crate::detect::has_ace(),
+            );
+        }
+        // On non-x86_64 the group-4 native path cannot exist; the group-1 guard
+        // (`native_runs_when_required`) already panics for that case, so nothing to add here.
     }
 
     /// Hand-computed value, independent of the implementation.
@@ -2435,22 +2590,105 @@ mod iteration2_surface {
 }
 
 #[cfg(test)]
+mod iteration_surface {
+    //! Crate-level reachability / naming / stable-Rust guard for the `ACE` group-4 tile
+    //! instructions added in iteration 3 — the POSITIVE half that complements
+    //! [`super::non_goal_guards`]. It is the executable witness that every group-4 dispatcher is
+    //! reachable from the crate root under a name matching its eventual stdarch intrinsic stem
+    //! ([ace-tile-instructions.NAMING.1]), is a safe stable-Rust entry point
+    //! ([ace-tile-instructions.STABLE.1]), and is callable against the `TileScope` guard.
+
+    /// Every group-4 dispatcher is reachable from the crate root by its stdarch-stem name. The
+    /// inventory is machine-checked: the fixed-size array references every `_tile_*` dispatcher
+    /// by path, so a rename, removal, or a missing re-export breaks this compile. `TILERELEASE`
+    /// is Drop-only (the guard's `Drop`), so it is the one group-4 op with no free-standing fn.
+    ///
+    /// `lib::iteration_surface_includes_group4`
+    #[test]
+    fn iteration_surface_includes_group4() {
+        // 26 group-4 dispatcher fns: A(3) + B(4) + C(5) + D(4) + G(4) + F(1) + E(5). Plus the
+        // Drop-only `_tile_release` (TILERELEASE) the family covers every group-4 instruction.
+        let inventory: [*const (); 26] = [
+            // Family A — tile config lifecycle (LDTILECFG / STTILECFG / TILEZERO).
+            crate::_tile_loadconfig as *const (),
+            crate::_tile_storeconfig as *const (),
+            crate::_tile_zero as *const (),
+            // Family B — tile <-> ZMM row/column moves (read + write forms).
+            crate::_tile_movrow as *const (),
+            crate::_tile_movcol as *const (),
+            crate::_tile_movrow_write as *const (),
+            crate::_tile_movcol_write as *const (),
+            // Family C — tile-row converts (INT32->FP32, FP32->BF16 H/L, FP32->FP16 H/L).
+            crate::_tile_tcvtrowd2ps as *const (),
+            crate::_tile_tcvtrowps2bf16h as *const (),
+            crate::_tile_tcvtrowps2bf16l as *const (),
+            crate::_tile_tcvtrowps2phh as *const (),
+            crate::_tile_tcvtrowps2phl as *const (),
+            // Family D — block-scale (BSR) registers.
+            crate::_tile_bsrinit as *const (),
+            crate::_tile_bsrmovf as *const (),
+            crate::_tile_bsrmovh as *const (),
+            crate::_tile_bsrmovl as *const (),
+            // Family G — INT8 rank-4 outer products.
+            crate::_tile_top4bssd as *const (),
+            crate::_tile_top4bsud as *const (),
+            crate::_tile_top4busd as *const (),
+            crate::_tile_top4buud as *const (),
+            // Family F — BF16 rank-2 outer product.
+            crate::_tile_top2bf16ps as *const (),
+            // Family E — MX-FP8 rank-4 outer products.
+            crate::_tile_top4mxbf8ps as *const (),
+            crate::_tile_top4mxbhf8ps as *const (),
+            crate::_tile_top4mxhbf8ps as *const (),
+            crate::_tile_top4mxhf8ps as *const (),
+            crate::_tile_top4mxbssps as *const (),
+        ];
+        // Non-zero function addresses (they are real, reachable symbols) and the count is a
+        // compile-time fact — adding or removing a dispatcher without updating this list is a
+        // compile error, not a stale comment.
+        assert!(inventory.iter().all(|&p| !p.is_null()));
+        assert_eq!(inventory.len(), 26);
+
+        // Callable against the guard (safe stable Rust, no `unsafe`, no nightly): drive a full
+        // slice of the surface end-to-end.
+        let cfg = crate::TileConfig {
+            palette_id: 2,
+            rows: [16, 0, 0, 0, 0, 0, 0, 0],
+            colsb: [64, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut scope = crate::_tile_loadconfig(&cfg).expect("valid palette-2 descriptor");
+        assert_eq!(crate::_tile_storeconfig(&scope), cfg); // STTILECFG round-trip
+        let dst = scope.tile(0).unwrap();
+        let bsr = scope.bsr(0).unwrap();
+        crate::_tile_zero(&mut scope, dst);
+        assert!(crate::_tile_movrow(&scope, dst, 0).is_some());
+        assert!(crate::_tile_tcvtrowd2ps(&scope, dst, 0).is_some());
+        crate::_tile_bsrinit(&mut scope, bsr, [127; crate::BSR_SCALE_BLOCKS]);
+        crate::_tile_top4bssd(&mut scope, dst, [1i8; 64], [1i8; 64]);
+        crate::_tile_top2bf16ps(&mut scope, dst, [0u16; 32], [0u16; 32]);
+        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], bsr);
+    }
+}
+
+#[cfg(test)]
 mod non_goal_guards {
-    //! Documented guard that the non-goals were not built into the public surface
-    //! ([avx10-v1-aux-fp16-fp8-evex-vnni.ENCODING.1] non-goal half: no out-of-scope native
-    //! encodings are emitted). The crate exposes no `core::arch` calls outside the single
-    //! iteration-0 `VPDPBSSD` intrinsic, and no public item names a group-4 mnemonic. NOTE:
-    //! group-3 (`AVX10_V2_AUX`) is NOW IN SCOPE as of iteration 2 — its reachability is the
-    //! POSITIVE assertion in [`super::iteration2_surface`]; this guard is the complementary
-    //! NEGATIVE-space assertion that what remains out of scope was not built.
+    //! Documented guard that the non-goals were not built into the public surface. NOTE:
+    //! group-3 (`AVX10_V2_AUX`) went in scope in iteration 2 — its reachability is the POSITIVE
+    //! assertion in [`super::iteration2_surface`] — and group-4 (`ACE` tile instructions) went in
+    //! scope in iteration 3, asserted positively in
+    //! [`super::iteration_surface::iteration_surface_includes_group4`]. This guard is the
+    //! complementary NEGATIVE-space assertion that what remains out of scope was not built:
+    //! palette-1 tile config, the AMX `TMUL` dot products, the nightly `x86_amx_intrinsics`
+    //! feature, EVEX `{k1}{z}` masking / broadcast, and sub-512 vector lengths.
 
     /// Confirms the public function inventory is exactly iteration-0 `dpbssd`, the 26
-    /// `AVX10_V1_AUX` primitives (group 2 — done in iteration 1) and the 21 `AVX10_V2_AUX`
-    /// primitives (group 3 — done in iteration 2), and NOTHING out of scope: no group-4
-    /// (`ACE` `TOP*`/`BSR*`/tile-move) surface, no EVEX `{k1}{z}` write-masking / `m32bcst`
-    /// broadcast entry points, and no 128/256-bit vector-length plumbing. This is a readable,
-    /// asserting record of the negative space; it references each in-scope public family entry
-    /// point so any accidental removal or out-of-scope addition is caught at compile time.
+    /// `AVX10_V1_AUX` primitives (group 2 — iteration 1), the 21 `AVX10_V2_AUX` primitives
+    /// (group 3 — iteration 2), the 25 `ACE` group-4 tile instructions (iteration 3), and
+    /// NOTHING out of scope: no palette-1 / AMX `TMUL` dot-product tile instructions, no nightly
+    /// `x86_amx_intrinsics`, no EVEX `{k1}{z}` write-masking / `m32bcst` broadcast entry points,
+    /// and no 128/256-bit vector-length plumbing. This is a readable, asserting record of the
+    /// negative space; it references each in-scope public family entry point so any accidental
+    /// removal or out-of-scope addition is caught at compile time.
     #[test]
     fn non_goals_absent() {
         // The complete in-scope public primitive set is exercised below — one representative
@@ -2484,8 +2722,29 @@ mod non_goal_guards {
         let _v2_h = crate::cvtssepi32_epi8([0i32; 16]); // family H: VPMOVSSDB (symmetric clamp)
         let _v2_i = crate::unpackb([0u8; 64], crate::ACE_UNPACKB_SIZE(4)); // family I: VUNPACKB
 
-        // Negative space: NO out-of-scope symbol exists to reference here — group-4 TOP*/BSR*/
-        // tile-move, `{k1}{z}` / `m32bcst`, and 128/256-bit `VL` forms are all unbuilt, and
-        // that absence (nothing to bind) is the guarantee.
+        // Group 4 (ACE tile instructions, iteration 3) — NOW in scope (one representative per
+        // family; the full 25-primitive reachability set is asserted in
+        // `super::iteration_surface`). Group 4 is stateful, so its ops run against a `TileScope`.
+        let cfg = crate::TileConfig {
+            palette_id: 2,
+            rows: [16, 0, 0, 0, 0, 0, 0, 0],
+            colsb: [64, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut scope = crate::_tile_loadconfig(&cfg).unwrap(); // family A: LDTILECFG lifecycle
+        let dst = scope.tile(0).unwrap();
+        let bsr = scope.bsr(0).unwrap();
+        let _g4_c = crate::_tile_movrow(&scope, dst, 0); // family B: tile -> ZMM read move
+        let _g4_conv = crate::_tile_tcvtrowd2ps(&scope, dst, 0); // family C: tile-row convert
+        crate::_tile_bsrinit(&mut scope, bsr, [127; crate::BSR_SCALE_BLOCKS]); // family D: BSR
+        crate::_tile_top4bssd(&mut scope, dst, [0i8; 64], [0i8; 64]); // family G: INT8 TOP
+        crate::_tile_top2bf16ps(&mut scope, dst, [0u16; 32], [0u16; 32]); // family F: BF16 TOP
+        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], bsr); // family E: MX-FP8 TOP
+
+        // Negative space: NO out-of-scope symbol exists to reference here — the palette-1 tile
+        // configuration and the AMX `TMUL` dot products (`TDPBSSD`/`TDPBF16PS`/… — a distinct
+        // engine from group-4 `TOP*`), the nightly `x86_amx_intrinsics` feature, `{k1}{z}` /
+        // `m32bcst`, and 128/256-bit `VL` forms are all unbuilt, and that absence (nothing to
+        // bind, no `#![feature(x86_amx_intrinsics)]` / `core::simd` in the crate) is the
+        // guarantee.
     }
 }

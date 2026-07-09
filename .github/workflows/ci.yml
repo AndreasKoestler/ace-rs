@@ -28,7 +28,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --verbose
+      # Scalar-only suite. This also runs the net-new layer-2 encoding harness
+      # (`tests/encoding.rs`): the golden `.byte` byte-sequence assertions for the
+      # ACE group-4 primitives always run with NO external tool, and the
+      # disassembly assertion skips-with-warning when no disassembler is present
+      # (or when it does not yet know the ACE mnemonics) — never a failure.
       - run: cargo test --verbose
+      - run: cargo test --verbose encoding
 
   # Native-path verification: executes the real group-1 multiply-accumulate
   # instructions (the avxvnniint8 byte ops AND the avxvnniint16 word ops) and,
@@ -96,23 +102,25 @@ jobs:
           echo "$HOME/sde" >> "$GITHUB_PATH"
       - name: Verify SDE is runnable
         run: sde64 --version
-      - name: Ensure an AVX10.2-capable C compiler (for the `native` feature)
+      - name: Ensure an AVX10.2 + AMX-tile-capable C compiler (for the `native` feature)
         # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` with
-        # `-mavx10.2` (design decision D7), which the `cc` crate drives via $CC.
-        # (No group-3 TU exists yet — the AVX10_V2_AUX intrinsics are absent
-        # from compiler headers, OQ-5.)
-        # AVX10.2 intrinsics require GCC >= 15 or Clang >= 20. Probe the runner's
-        # default toolchains; fall back to an explicit gcc-15 install. Fail fast
-        # with an actionable message if none is available, rather than emitting a
+        # `-mavx10.2` and `src/native/ace_tile.c` with `-mavx10.2 -mamx-tile
+        # -mamx-avx512` (design decision D7 / OQ-6), which the `cc` crate drives
+        # via $CC. The ACE group-4 tile shims use real AMX-TILE + AMX-AVX512
+        # intrinsics for families A/B-read/C and `.byte` raw encodings for the
+        # ACE-only rest, so the compiler must know all three ISA flags.
+        # These require GCC >= 15 or Clang >= 20. Probe the runner's default
+        # toolchains; fall back to an explicit gcc-15 install. Fail fast with an
+        # actionable message if none is available, rather than emitting a
         # confusing mid-build cc error.
         run: |
           set -euo pipefail
-          probe() { printf '#include <immintrin.h>\nint main(){return 0;}\n' | "$1" -mavx10.2 -x c -c - -o /dev/null 2>/dev/null; }
+          probe() { printf '#include <immintrin.h>\nint main(){return 0;}\n' | "$1" -mavx10.2 -mamx-tile -mamx-avx512 -x c -c - -o /dev/null 2>/dev/null; }
           if probe gcc; then echo "CC=gcc" >> "$GITHUB_ENV"
           elif probe clang; then echo "CC=clang" >> "$GITHUB_ENV"
           else
             sudo apt-get update && sudo apt-get install -y gcc-15
-            probe gcc-15 || { echo "::error::No AVX10.2-capable C compiler (need GCC >= 15 or Clang >= 20) — cannot build the native feature"; exit 1; }
+            probe gcc-15 || { echo "::error::No AVX10.2 + AMX-tile-capable C compiler (need GCC >= 15 or Clang >= 20) — cannot build the native feature"; exit 1; }
             echo "CC=gcc-15" >> "$GITHUB_ENV"
           fi
       - name: Run tests with the native paths executed under SDE
@@ -130,11 +138,21 @@ jobs:
           # rather than go silently green.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -future --"
         # `--features native` compiles the AVX10_V1_AUX and AVX10_V2_AUX C shims
-        # and exercises the group-2 families-A-G native-vs-oracle differential
-        # under SDE (group-1 `dpbssd` uses the always-available stdlib intrinsic,
-        # so it runs either way). The group-3 (AVX10_V2_AUX) differentials
-        # DISCARD for now: those families ship oracle-only because their
-        # intrinsics are absent from current GCC/Clang headers (OQ-5) — they go
-        # live automatically once a toolchain supplies the intrinsics. The core
-        # `test` gate above still covers the default oracle-only build.
+        # and the ACE group-4 tile shims (`src/native/ace_tile.c`), and exercises
+        # the group-2 families-A-G native-vs-oracle differential under SDE
+        # (group-1 `dpbssd` uses the always-available stdlib intrinsic, so it runs
+        # either way). The group-3 (AVX10_V2_AUX) differentials DISCARD for now
+        # (intrinsics absent from current GCC/Clang headers, OQ-5).
+        #
+        # ACE group 4 (iteration 3, OQ-6): the intrinsic families A / B-read / C
+        # (tile config lifecycle, tile->ZMM read moves, tile-row converts) EXECUTE
+        # under SDE, so their `prop_native_matches_oracle` differentials light up
+        # here; the `ACE`-only families (B write, D, E, F, G) are `.byte` raw
+        # encodings that are BUILT + encoding-asserted (`tests/encoding.rs`) but
+        # not executed — SDE 10.8 has no ACE emulation yet (R2), so their
+        # differentials DISCARD until a `sde64` ACE probe passes. The
+        # `ace_tile_native_runs_when_required` guard stays dormant for them
+        # (documented, non-vacuous), exactly as the AVX10 C-shim families' guard
+        # does. The core `test` gate above still covers the default oracle-only
+        # build and the always-run golden `.byte` encoding assertions.
         run: cargo test --features native --target x86_64-unknown-linux-gnu --verbose
