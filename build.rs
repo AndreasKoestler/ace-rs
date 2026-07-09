@@ -9,6 +9,12 @@
 //! In every other configuration the build script is a no-op: the default build pulls in no
 //! `cc` dependency (it is an optional build-dependency, gated behind `native`) and compiles
 //! no C, preserving the pure-stable-Rust default that is correct on non-x86 targets.
+//!
+//! There is deliberately NO AVX10_V2_AUX translation unit: every group-3 intrinsic is
+//! absent from the current GCC/Clang `-mavx10.2` headers (OQ-5, see the module docs of
+//! `src/native.rs`), so a group-3 TU would contain no shims. Add
+//! `src/native/avx10_v2_aux.c` here (plus its `rerun-if-changed` line) when the first
+//! group-3 intrinsic lands in a toolchain.
 fn main() {
     // Always re-run if the source TU changes (cheap, and avoids stale objects).
     println!("cargo:rerun-if-changed=src/native/avx10_v1_aux.c");

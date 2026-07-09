@@ -18,7 +18,7 @@ Tracking the feature groups of the ACE v1 instruction summary (§4):
 |---|---------------|--------|
 | **4.1** | **AVX-VNNI-INT8 and AVX-VNNI-INT16** — VEX-encoded integer multiply-accumulate | ✅ implemented |
 | **4.2** | **AVX10.2 Subset (`AVX10_V1_AUX`)** — FP16↔FP8 conversions and EVEX VNNI forms | ✅ implemented |
-| **4.3** | **OCP Format Conversions (`AVX10_V2_AUX`)** — FP32↔FP8, FP8↔FP4/FP6, utility ops | ⬜ todo |
+| **4.3** | **OCP Format Conversions (`AVX10_V2_AUX`)** — FP32↔FP8, FP8↔FP4/FP6, utility ops | ✅ implemented |
 | **4.4** | **ACE Tile Instructions (ACE v1)** — tile management, data movement, outer products | ⬜ todo |
 
 ### 4.1 — AVX-VNNI-INT8 and AVX-VNNI-INT16 ✅
@@ -108,17 +108,40 @@ against the oracle under Intel SDE.
 The EVEX byte/word VNNI ops live in the `vnni` module (e.g. `ace::vnni::dpbssd`), distinct
 from the 256-bit VEX `ace::dpbssd` of group 4.1.
 
-### 4.3 — OCP Format Conversions (`AVX10_V2_AUX`) ⬜ todo
+### 4.3 — OCP Format Conversions (`AVX10_V2_AUX`) ✅
 
-Not yet implemented. FP32↔FP8, FP8↔FP4/FP6 conversions and utility instructions:
+The 21 group-3 OCP-format converts (families A–I) are implemented: FP32↔FP8, FP8↔FP4,
+FP8↔FP6, and the two utility ops. All are the 512-bit (`VL=512`) forms, dispatch-gated on
+`AVX10_V2_AUX` detection, and each ships a scalar oracle plus a native-vs-oracle
+differential property that discards (never passes vacuously) when the native path is
+absent.
 
-- **FP32→FP8 converts:** `VCVTPS2BF8`, `VCVTPS2BF8S`, `VCVTPS2HF8`, `VCVTPS2HF8S`
-- **Round FP32→FP8 converts:** `VCVTROPS2HF8`, `VCVTROPS2HF8S`
-- **Bias FP32→FP8 converts:** `VCVTBIASPS2BF8`, `VCVTBIASPS2BF8S`, `VCVTBIASPS2HF8`, `VCVTBIASPS2HF8S`
-- **FP8→FP32 converts:** `VCVTBF82PS`, `VCVTHF82PS`
-- **FP8↔FP4 converts:** `VCVTBF82BF4S`, `VCVTHF82BF4S`, `VCVTBF42HF8`
-- **FP8↔FP6 converts:** `VCVTBF82BF6S`, `VCVTHF82HF6S`, `VCVTBF62HF8`, `VCVTHF62HF8`
-- **Utility:** `VPMOVSSDB`, `VUNPACKB`
+**Group 3 currently ships oracle-only (OQ-5):** none of the group-3 intrinsics
+(`_mm512_cvtps_bf8`, `_mm512_cvtbf8_ps`, `_mm512_cvtf8_bf4s`, `_mm512_cvtbf4_hf8`,
+`_mm512_cvtf8_bf6s`, `_mm512_cvtf6_hf8`, `_mm512_cvtssepi32_epi8`, `_mm512_unpackb`, …)
+compile under `-mavx10.2` in current GCC/Clang headers, so there is no native C shim yet.
+The differential tests are wired to go live the moment an intrinsic lands.
+
+| Mnemonic | Rust function(s) |
+|----------|------------------|
+| `VCVTPS2BF8` / `VCVTPS2BF8S` | `cvtps_bf8` / `cvtpss_bf8` |
+| `VCVTPS2HF8` / `VCVTPS2HF8S` | `cvtps_hf8` / `cvtpss_hf8` |
+| `VCVTROPS2HF8` / `VCVTROPS2HF8S` | `cvtrops_hf8` / `cvtropss_hf8` (RTO is E4M3-only — no `cvtrops_bf8`) |
+| `VCVTBIASPS2BF8` / `VCVTBIASPS2BF8S` | `cvtbiasps_bf8` / `cvtbiaspss_bf8` |
+| `VCVTBIASPS2HF8` / `VCVTBIASPS2HF8S` | `cvtbiasps_hf8` / `cvtbiaspss_hf8` |
+| `VCVTBF82PS` / `VCVTHF82PS` | `cvtbf8_ps` / `cvthf8_ps` |
+| `VCVTBF82BF4S` / `VCVTHF82BF4S` | `cvtf8_bf4s_e5m2` / `cvtf8_bf4s_e4m3` |
+| `VCVTBF42HF8` | `cvtbf4_hf8` |
+| `VCVTBF82BF6S` / `VCVTHF82HF6S` | `cvtf8_bf6s` / `cvtf8_hf6s` |
+| `VCVTBF62HF8` / `VCVTHF62HF8` | `cvtf6_hf8_e3m2` / `cvtf6_hf8_e2m3` |
+| `VPMOVSSDB` | `cvtssepi32_epi8` (symmetric saturation to `[-127, +127]`) |
+| `VUNPACKB` | `unpackb` (build `imm8` with `ACE_UNPACKB_SIZE` / `ACE_UNPACKB_START` / `ACE_UNPACKB_SEXT`) |
+
+Where two converts share a target format, the Rust name carries a source-format suffix
+(`_e5m2` / `_e4m3` / `_e3m2` / `_e2m3`) to disambiguate. Every dispatcher has a public
+`*_scalar` oracle twin (e.g. `cvtps_bf8_scalar`). FP4 results are nibble-packed
+(`[u8; 32]` for 64 lanes) and FP6 results 6-bit-packed (`[u8; 48]`); `unpackb` is the
+read-back complement of those packed layouts.
 
 ### 4.4 — ACE Tile Instructions (ACE v1) ⬜ todo
 
@@ -161,7 +184,7 @@ cargo test --target x86_64-unknown-linux-gnu
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 
 - **`test`** (x86_64 Linux) — `fmt --check`, `clippy -D warnings`, `build`, `test`. Always runs; gates merges. Scalar-only on the runner; native execution is proven by `native-sde`.
-- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
+- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. It also builds with `--features native`, which compiles the `AVX10_V1_AUX` C shims and exercises the group-2 (families A–G) native-vs-oracle differentials under SDE; the group-3 differentials discard for now because group 3 is oracle-only (OQ-5, no C shims exist). Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
 
 ### Resolved open questions
 
@@ -169,6 +192,7 @@ cargo test --target x86_64-unknown-linux-gnu
 - **OQ-2 (SDE arch flag):** the `native-sde` job uses `sde64 -future --` as the default arch flag to enable runtime detection of both feature families. *This must be confirmed by an actual CI run.* If a run shows `avxvnniint16` undetected, the dual-feature guard fails **loudly** (red), not silently green — switch the flag to `-gnr` (Granite Rapids) or `-srf` (Sierra Forest), whichever an empirical run confirms enables both features. See the workflow comments.
 - **OQ-3 (saturation boundary):** the `...DS` clamp is a **single** `SIGNED_DWORD_SATURATE` of the full-precision `src + Σ products`, with products folded in `i64` — verified against the Intel SDM / Felix Cloutier pseudocode, *not* a two-stage clamp. The native intrinsic is the differential tiebreaker.
 - **OQ-4 (test summary):** the suite asserts on the stable substring `passed; 0 failed` plus exit code 0 and on the exact panic/assert message strings, not a verbatim toolchain-formatted summary line.
+- **OQ-5 (group-3 native availability):** a group-3 family whose `-mavx10.2` intrinsic does not compile in the current GCC/Clang headers ships **oracle-only** — scalar oracle as the sole path, with the native differential wired to go live (never vacuously green) the moment the intrinsic lands. Today that is *every* group-3 family.
 
 ## Roadmap
 
@@ -176,7 +200,7 @@ cargo test --target x86_64-unknown-linux-gnu
 |--------|-----------|-------|
 | 0 ✅ | `dpbssd` + `dpbssds`/`dpbsud`/`dpbsuds`/`dpbuud`/`dpbuuds` (AVX-VNNI-INT8) and `dpwsud`/`dpwsuds`/`dpwusd`/`dpwusds`/`dpwuud`/`dpwuuds` (AVX-VNNI-INT16) | 4.1 (AVX-VNNI-INT8/16) |
 | 1 ✅ | FP16↔FP8 converts + EVEX VNNI (26 `AVX10_V1_AUX` primitives) | 4.2 (AVX10.2 subset, `AVX10_V1_AUX`) |
-| 2 | `VCVTPS2HF8` (FP32→FP8) | 4.3 (OCP conversions, `AVX10_V2_AUX`) |
+| 2 ✅ | OCP format converts (21 `AVX10_V2_AUX` primitives, oracle-only per OQ-5) | 4.3 (OCP conversions, `AVX10_V2_AUX`) |
 | 3 | `TOP2BF16PS` (BF16 rank-2 outer product) | 4.4 (ACE tile) — gated, see design §7 |
 
 ## Contributing

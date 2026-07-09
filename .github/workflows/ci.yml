@@ -31,8 +31,9 @@ jobs:
       - run: cargo test --verbose
 
   # Native-path verification: executes the real group-1 multiply-accumulate
-  # instructions (the avxvnniint8 byte ops AND the avxvnniint16 word ops) under
-  # Intel SDE and asserts each matches its scalar oracle (see `hw_matches_scalar`).
+  # instructions (the avxvnniint8 byte ops AND the avxvnniint16 word ops) and,
+  # via `--features native`, the group-2 AVX10_V1_AUX C-shim families under
+  # Intel SDE, asserting each matches its scalar oracle (see `hw_matches_scalar`).
   # The `ACE_REQUIRE_NATIVE=1` guard (`native_runs_when_required`) makes the job
   # fail if a native branch did NOT run, so this can never be a false green.
   #
@@ -98,6 +99,8 @@ jobs:
       - name: Ensure an AVX10.2-capable C compiler (for the `native` feature)
         # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` with
         # `-mavx10.2` (design decision D7), which the `cc` crate drives via $CC.
+        # (No group-3 TU exists yet — the AVX10_V2_AUX intrinsics are absent
+        # from compiler headers, OQ-5.)
         # AVX10.2 intrinsics require GCC >= 15 or Clang >= 20. Probe the runner's
         # default toolchains; fall back to an explicit gcc-15 install. Fail fast
         # with an actionable message if none is available, rather than emitting a
@@ -118,15 +121,20 @@ jobs:
           ACE_REQUIRE_NATIVE: "1"
           # Make cargo run each test binary under SDE emulating a CPU that has
           # the full group-1 VNNI surface (AVX-VNNI-INT8 *and* AVX-VNNI-INT16)
-          # plus AVX10_V1_AUX (group 2, families A-G). `-future` selects the
-          # newest model and is our default (OQ-2, see the block above), which
-          # exposes all three; `-gnr` / `-srf` (Granite Rapids / Sierra Forest)
-          # have AVX-VNNI-INT8 but not necessarily AVX-VNNI-INT16 or AVX10.2 and
-          # are the documented fallbacks. The dual-feature guard makes any wrong
-          # flag fail LOUDLY rather than go silently green.
+          # plus AVX10_V1_AUX (group 2, families A-G) and AVX10_V2_AUX (group 3,
+          # families A-I). `-future` selects the newest model and is our default
+          # (OQ-2, see the block above), which exposes all of them; `-gnr` /
+          # `-srf` (Granite Rapids / Sierra Forest) have AVX-VNNI-INT8 but not
+          # necessarily AVX-VNNI-INT16 or AVX10.2 and are the documented
+          # fallbacks. The dual-feature guard makes any wrong flag fail LOUDLY
+          # rather than go silently green.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -future --"
-        # `--features native` compiles the AVX10_V1_AUX C shims and exercises the
-        # families-A-G native-vs-oracle differential under SDE (group-1 `dpbssd`
-        # uses the always-available stdlib intrinsic, so it runs either way). The
-        # core `test` gate above still covers the default oracle-only build.
+        # `--features native` compiles the AVX10_V1_AUX and AVX10_V2_AUX C shims
+        # and exercises the group-2 families-A-G native-vs-oracle differential
+        # under SDE (group-1 `dpbssd` uses the always-available stdlib intrinsic,
+        # so it runs either way). The group-3 (AVX10_V2_AUX) differentials
+        # DISCARD for now: those families ship oracle-only because their
+        # intrinsics are absent from current GCC/Clang headers (OQ-5) — they go
+        # live automatically once a toolchain supplies the intrinsics. The core
+        # `test` gate above still covers the default oracle-only build.
         run: cargo test --features native --target x86_64-unknown-linux-gnu --verbose

@@ -175,8 +175,8 @@ For the group-1 family the differential property (`prop_hw_matches_scalar`) is t
 | Bullet | Primitive | New axis introduced |
 |--------|-----------|---------------------|
 | 0 ✅ | **group 1 complete** — `dpbssd` + the 11 remaining VEX integer multiply-accumulate ops (group 1: `avxvnniint8` byte `VPDPB*` + `avxvnniint16` word `VPDPW*`) | dispatch + oracle + differential-test skeleton (D9), generalised once via the declarative `define_dp!` macro (D11/B1) over typed-per-signedness operands (D10/A1); second CPUID feature family (`avxvnniint16`); dual-feature native-coverage guard |
-| 1 | AVX10.2 Subset / `AVX10_V1_AUX` (group 2): FP16↔FP8 converts + EVEX VNNI | `AVX10_V1_AUX` gating, FP8 format + RTNE/bias rounding oracle, first SDE-only tests; EVEX-generalizes the group-1 dot product. See `ticket.md`. |
-| 2 | `VCVTPS2HF8` FP32→FP8 (group 3) | FP32→FP8 convert + round-to-odd oracle (reuses the FP8 format oracle from bullet 1) |
+| 1 ✅ | AVX10.2 Subset / `AVX10_V1_AUX` (group 2): FP16↔FP8 converts + EVEX VNNI — **26 primitives implemented** | `AVX10_V1_AUX` gating, FP8 format + RTNE/bias rounding oracle, first SDE-only tests; EVEX-generalizes the group-1 dot product. |
+| 2 ✅ | OCP Format Conversions / `AVX10_V2_AUX` (group 3): FP32↔FP8, FP8↔FP4/FP6, `VPMOVSSDB`, `VUNPACKB` — **21 primitives implemented, oracle-only (OQ-5)** | `AVX10_V2_AUX` gating (incl. `XCR0` vector-state check), round-to-odd + bias-rounding FP32→FP8 oracles, FP4/FP6 sub-byte packed formats, symmetric INT32→INT8 saturation, `imm8`-driven unpack. No native path yet: the group-3 intrinsics are absent from current GCC/Clang `-mavx10.2` headers (OQ-5), so every family ships the scalar oracle with the native differential wired to go live when an intrinsic lands. |
 | 3 | `TOP2BF16PS` BF16 rank-2 outer product (group 4) | stateful RAII tile guard (D8), palette 2, the real engine — **`ACE`-gated; not in binutils 2.44 / likely not SDE 10.8 (§7): `.byte` encoding + layers 1–2 only until tooling lands** |
 
 ---
@@ -201,7 +201,7 @@ binutils 2.44 `gas/NEWS` ("Changes in 2.44") lists Diamond Rapids support under 
 1. The ACE value-add — the outer-product engine (`TOP*`) and block-scale registers (`BSR*`) — is gated by the **`ACE` flag alone**, which binutils 2.44 does not know. Intel's `AMX-FP8` in 2.44 is the *dot-product* AMX under palette 1 (TMUL) — a **different instruction family** from ACE's *outer-product* `TOP4MX*F8PS` under palette 2 (ACE). Group 4's compute therefore needs `.byte` raw encoding (D7) or a later binutils.
 2. **SDE 10.8 (15 Mar 2026) predates the ACE v1.15 spec (May 2026)** by two months, so it almost certainly does not emulate the `ACE`-gated `TOP*`/`BSR*`. Treat ACE-exclusive emulation as unavailable until proven on a machine: `sde64 -help | grep -i ace` (knob present?) or run a one-instruction `TOP4MX` test and check for `#UD`. (intel.com blocks scripted access to the release notes, so this could not be confirmed remotely.)
 
-**Net:** bullets 0–1 (groups 1–3) are fully buildable + testable today. **Bullet 2 (group-4 `TOP*`/`BSR*`) is blocked on layer-3 testing** — implement via `.byte` (D7), verify via layers 1–2 (oracle + encoding, §5), and add SDE execution only once a build proves ACE emulation exists. Re-verify when binutils >2.44 and SDE >10.8 ship.
+**Net:** bullets 0–2 (groups 1–3) are fully buildable + oracle-testable today, and groups 1–2 are natively testable (SDE for group 2). **Caveat discovered during bullet-2 implementation (OQ-5, §9):** assembler (binutils) and emulator (SDE) support for the group-3 converts does *not* imply **compiler intrinsic** support — the `_mm512_cvtps_bf8`/`cvtbf8_ps`/FP4/FP6/`cvtssepi32_epi8`/`unpackb` intrinsics are absent from the GCC/Clang `-mavx10.2` headers as of GCC 16.x, so group 3 currently has **no native C-shim path** (D7 is inapplicable until the headers catch up) and is verified by layer 1 (oracle) only. **Bullet 3 (group-4 `TOP*`/`BSR*`) is blocked on layer-3 testing** — implement via `.byte` (D7), verify via layers 1–2 (oracle + encoding, §5), and add SDE execution only once a build proves ACE emulation exists. Re-verify when binutils >2.44 and SDE >10.8 ship.
 
 ---
 
@@ -226,7 +226,9 @@ binutils 2.44 `gas/NEWS` ("Changes in 2.44") lists Diamond Rapids support under 
 
 ---
 
-## 9. Open questions (group-1 family) — resolved / assumed
+## 9. Open questions — resolved / assumed
+
+### Group-1 family
 
 These were carried from the design/structure stages for the group-1 extension; their resolution is recorded here (and surfaced for callers in `README.md`):
 
@@ -234,3 +236,8 @@ These were carried from the design/structure stages for the group-1 extension; t
 - **OQ-2 — SDE arch flag (assumed; CI-verified):** the `native-sde` job uses `sde64 -future --` to enable runtime detection of *both* feature families. Whether `-future` makes `is_x86_feature_detected!("avxvnniint16")` return `true` inside the emulated process can only be confirmed by an actual SDE run; the dual-feature guard turns a wrong flag into a **loud red** (the `avxvnniint16` assert fails) rather than a silently-vacuous green. Documented fallbacks: `-gnr` (Granite Rapids) / `-srf` (Sierra Forest). Must be confirmed in CI before declaring INT16 coverage done.
 - **OQ-3 — saturation / accumulation width (resolved):** the `...DS` variants apply a **single** `SIGNED_DWORD_SATURATE` to the full-precision lane total `src[i] + Σ products`, with the products folded in `i64` (wide enough that a `u16×u16` product cannot overflow before the clamp). This matches the Intel SDM / Felix Cloutier pseudocode for `VPDPB*DS` / `VPDPW*DS` — it is **not** a two-stage "clamp the product sum, then saturating-add `src`" (which diverges from hardware when `src` and the product sum have opposite signs and the product sum exceeds the i32 range). The native intrinsic is the differential tiebreaker, and the per-variant `prop_output_saturates` + opposite-sign known-value lanes lock the model (SCALAR_ORACLE.1-4).
 - **OQ-4 — test summary wording (resolved):** the suite asserts on the stable substring `passed; 0 failed` plus exit code 0, and on the exact panic/assert message strings (`native path disagrees with oracle`, the guard messages), rather than a verbatim toolchain-formatted summary line or a hardcoded per-variant test count.
+
+### Group-3 open questions — resolved
+
+- **OQ-5 — group-3 native availability (resolved for now):** none of the group-3 `AVX10_V2_AUX` intrinsics (`_mm512_cvtps_bf8`, `_mm512_cvtbf8_ps`, `_mm512_cvtf8_bf4s`, `_mm512_cvtbf4_hf8`, `_mm512_cvtf8_bf6s`, `_mm512_cvtf6_hf8`, `_mm512_cvtssepi32_epi8`, `_mm512_unpackb`, and variants) compile under `-mavx10.2` in current GCC/Clang headers, even though binutils 2.44 assembles and SDE 10.8 emulates the instructions (§7). Policy: a family whose intrinsic does not compile ships **oracle-only** — the scalar oracle is the sole path, `src/native.rs` documents the probe results (there is deliberately no group-3 C translation unit until a shim exists to put in it), and each family's `prop_native_matches_oracle` differential is gated on `feature="native"` + `detect::has_avx10_v2_aux()` and discards (never passes vacuously), so it becomes live the moment a header update supplies the intrinsic. Re-probe on every toolchain bump.
+- *Numbering note:* the group-3 code comments in `src/lib.rs` reference an "OQ-3" of the group-3 question set (source-format suffix disambiguation for converts sharing a target format — resolved as the `_e5m2`/`_e4m3`/`_e3m2`/`_e2m3` suffixes). That is a different question from group-1 OQ-3 above (saturation boundary); the two OQ namespaces are per-iteration.

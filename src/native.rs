@@ -1,13 +1,35 @@
-//! `extern "C"` declarations for the opt-in native AVX10_V1_AUX backend (design decision D7).
+//! `extern "C"` declarations for the opt-in native AVX10_V1_AUX backend (design decision
+//! D7).
 //!
 //! These resolve to the shims in `src/native/avx10_v1_aux.c`, compiled with `-mavx10.2` by
-//! `build.rs` only when the `native` feature is enabled on an x86_64 target. The whole module
-//! is gated on `#[cfg(all(target_arch = "x86_64", feature = "native"))]` (see `lib.rs`), so
-//! the default build never references it.
+//! `build.rs` only when the `native` feature is enabled on an x86_64 target. The whole
+//! module is gated on `#[cfg(all(target_arch = "x86_64", feature = "native"))]` (see
+//! `lib.rs`), so the default build never references it.
 //!
-//! Each shim takes plain pointers; the per-family `_hw` wrappers in the convert / VNNI modules
-//! marshal the fixed-size lane arrays into and out of these calls. Every `_hw` wrapper is
-//! `unsafe` and may only be called once `detect::has_avx10_v1_aux()` has confirmed the running
+//! # No AVX10_V2_AUX (group-3) shims — OQ-5
+//!
+//! Every group-3 OCP-convert intrinsic is ABSENT from the current GCC/Clang `-mavx10.2`
+//! headers (verified by compile probes against GCC 16.1.1; each convert module's docs record
+//! its probe): `_mm512_cvtps_bf8`/`_mm512_cvts_ps_bf8`/`_mm512_cvtps_hf8`/
+//! `_mm512_cvtroundps_hf8` (family A), `_mm512_cvtbiasps_bf8` and siblings (family B — only
+//! the FP16-source `_mm512_cvtbiasph_*` forms exist), `_mm512_cvtbf8_ps`/`_mm512_cvthf8_ps`
+//! (family C — only the FP8->FP16 siblings exist), `_mm512_cvtbf8_bf4s`/`_mm512_cvthf8_bf4s`
+//! (family D), `_mm512_cvtbf4_hf8` (family E), `_mm512_cvtf8_bf6s`/`_mm512_cvtf8_hf6s`
+//! (family F), the `_mm512_cvtf6_hf8` family (family G), `_mm512_cvtssepi32_epi8` (family H
+//! — only the ordinary asymmetric `_mm512_cvtsepi32_epi8` exists), and `_mm512_unpackb`
+//! (family I, which would additionally need a compile-time-constant `imm8` dispatch).
+//!
+//! Per OQ-5 every group-3 family therefore ships **oracle-only**: no C TU, no `extern "C"`
+//! declaration, no `_hw` path — the always-correct scalar oracle is the sole path, and each
+//! family's `prop_native_matches_oracle` differential discards (never passes vacuously)
+//! until a toolchain supplies the intrinsic. When one lands, add
+//! `src/native/avx10_v2_aux.c`, wire it in `build.rs`, and declare its shims here.
+//! Re-probe on every toolchain bump.
+//!
+//! Each shim takes plain pointers; the per-family `_hw` wrappers in the convert / VNNI
+//! modules marshal the fixed-size lane arrays into and out of these calls. Every `_hw`
+//! wrapper is `unsafe` and may only be called once the matching capability check
+//! (`detect::has_avx10_v1_aux()` / `detect::has_avx10_v2_aux()`) has confirmed the running
 //! CPU supports the EVEX forms — otherwise the EVEX-encoded instruction would fault (#UD).
 
 extern "C" {
