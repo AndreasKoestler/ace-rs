@@ -36,15 +36,15 @@
 //! (E4M3). This is **add-then-truncate** with NO separate round step, so a **zero bias term
 //! reduces to the pseudocode's truncate-toward-zero behaviour**. The same section-9.2.1
 //! overflow/NaN/signed-zero table applies, with bias replacing RTNE/RTO. This is implemented by
-//! [`crate::fp8::fp32_to_fp8_e5m2_biased`] / [`crate::fp8::fp32_to_fp8_e4m3_biased`] under
-//! [`Fp8RoundMode::Bias`].
+//! `crate::fp8::fp32_to_fp8_e5m2_biased` / `crate::fp8::fp32_to_fp8_e4m3_biased` under
+//! `Fp8RoundMode::Bias`.
 //! `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.1]`
 //! `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.2]`
 //! `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.3]`
 //! `[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`
 //!
 //! Overflow / NaN / signed-zero behaviour follows the section-9.2.1 table, encoded in the
-//! [`crate::fp8`] front-end: E5M2 non-saturating overflow -> the BF8 Inf/overflow-coded
+//! `crate::fp8` front-end: E5M2 non-saturating overflow -> the BF8 Inf/overflow-coded
 //! `S.11111.00`, saturating -> `±max_E5M2 = ±57344`; E4M3 non-saturating overflow -> the
 //! sole HF8 NaN `S.1111.111`, saturating -> `±max_E4M3 = ±448`. A NaN input maps to a NaN
 //! FP8 result; a signed zero maps to the same-signed FP8 zero. MXCSR is neither consulted
@@ -57,8 +57,10 @@
 //! `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.8]` `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.9]`
 //! `[avx10-v2-aux-ocp-conversions.CVT_PS_FP8.10]`
 //!
-//! Each public fn is a safe dispatcher that consults [`detect::has_avx10_v2_aux`] and falls
-//! through to its `_scalar` oracle, the primary always-correct path on every target
+//! Each public fn is a safe dispatcher; with no native group-3 intrinsic available in
+//! current toolchains it always takes its `_scalar` oracle (see the OQ-5 note below), with
+//! `detect::has_avx10_v2_aux` marking where the native gate goes live. The `_scalar`
+//! oracle is the primary always-correct path on every target
 //! (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`,
 //! `[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The names mirror the eventual stdarch
@@ -76,7 +78,7 @@
 //! its `_scalar` sibling on every target. The differential test that would otherwise tie the
 //! native path to the oracle is discarded (no native path exists), so the oracle's correctness
 //! is grounded against the spec section-16.1 pseudocode, transcribed bit-for-bit in
-//! [`crate::fp8`]. The capability check is never consulted — the dispatchers only
+//! `crate::fp8`. The capability check is never consulted — the dispatchers only
 //! reference the detector to mark the gate site for the shim once the intrinsics land.
 
 use crate::detect;
@@ -702,7 +704,11 @@ mod tests {
         let zero = [0i32; 16];
 
         let out = cvtbiasps_hf8(a, zero);
-        assert_eq!(out[0], hf8(0, 0b0000, 0b000), "+2^-7 -> +0 (no subnormal block)");
+        assert_eq!(
+            out[0],
+            hf8(0, 0b0000, 0b000),
+            "+2^-7 -> +0 (no subnormal block)"
+        );
         assert_eq!(out[1], hf8(1, 0b0000, 0b000), "-2^-7 -> -0 (sign kept)");
         assert_eq!(out[2], hf8(0, 0b0000, 0b000), "+3*2^-9 -> +0");
         assert_eq!(out[3], hf8(0, 0b0000, 0b000), "+2^-10 -> +0");
@@ -727,9 +733,21 @@ mod tests {
         let zero = [0i32; 16];
 
         let sat = cvtbiaspss_hf8(a, zero);
-        assert_eq!(sat[0], hf8(0, 0b1111, 0b111), "sat +480 -> NaN-coded (no clamp)");
-        assert_eq!(sat[1], hf8(1, 0b1111, 0b111), "sat -480 -> NaN-coded (no clamp)");
-        assert_eq!(sat[2], hf8(0, 0b1111, 0b111), "sat +500 -> NaN-coded (no clamp)");
+        assert_eq!(
+            sat[0],
+            hf8(0, 0b1111, 0b111),
+            "sat +480 -> NaN-coded (no clamp)"
+        );
+        assert_eq!(
+            sat[1],
+            hf8(1, 0b1111, 0b111),
+            "sat -480 -> NaN-coded (no clamp)"
+        );
+        assert_eq!(
+            sat[2],
+            hf8(0, 0b1111, 0b111),
+            "sat +500 -> NaN-coded (no clamp)"
+        );
 
         let nsat = cvtbiasps_hf8(a, zero);
         assert_eq!(nsat[0], hf8(0, 0b1111, 0b111), "nsat +480 -> NaN-coded");

@@ -51,7 +51,7 @@
 //!
 //! Each op is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
 //! correct on every target). All `TOP*` forms are ACE-only and gate on full `ACE`
-//! ([`detect::has_ace`], `[ace-tile-instructions.DETECT.1-3]`,
+//! (`detect::has_ace`, `[ace-tile-instructions.DETECT.1-3]`,
 //! `[ace-tile-instructions.DISPATCH.1]`).
 
 use crate::detect;
@@ -164,7 +164,11 @@ fn convert_fixpoint128_scaled_to_fp32_ftz_rne(x: i128, adjust: i32) -> u32 {
     }
 
     // Fixed extraction positions: L at 103, G at 102, sticky = OR(101:0).
-    let sticky: u128 = if magnitude & ((1u128 << 102) - 1) != 0 { 1 } else { 0 };
+    let sticky: u128 = if magnitude & ((1u128 << 102) - 1) != 0 {
+        1
+    } else {
+        0
+    };
     let gbit = (magnitude >> 102) & 1;
     let lbit = (magnitude >> 103) & 1;
     let rnd_add = gbit & (lbit | sticky); // RNE: round up iff G=1 and (L|S)=1
@@ -378,7 +382,13 @@ define_top4mxf8!(
 /// byte products accumulate exactly in 32-bit integer; `exp_adjust = -12 + src1_scale +
 /// src2_scale - 254` carries the combined `2^-12` MX INT8 implicit product bias (each MX
 /// INT8 term has an implicit scale of `2^-6`) plus both E8M0 block scales.
-fn op4mxb_subtile(srcdest: f32, src1_quad: [u8; 4], src1_scale: u8, src2_quad: [u8; 4], src2_scale: u8) -> f32 {
+fn op4mxb_subtile(
+    srcdest: f32,
+    src1_quad: [u8; 4],
+    src1_scale: u8,
+    src2_quad: [u8; 4],
+    src2_scale: u8,
+) -> f32 {
     if src1_scale == 0xFF || src2_scale == 0xFF {
         return f32::from_bits(QNAN_INDEFINITE); // E8M0 NaN -> propagate QNaN
     }
@@ -403,7 +413,13 @@ fn op4mxb_subtile(srcdest: f32, src1_quad: [u8; 4], src1_scale: u8, src2_quad: [
 /// B = MX INT8 signed, OCP MX block scaling via the implicit BSR (`imm8` selects the scale
 /// groups exactly as the MX FP8 forms do), FP32 accumulate
 /// (`[ace-tile-instructions.MX_TOP.5]`).
-pub fn _tile_top4mxbssps(scope: &mut TileScope, dst: TileId, src1: [u8; 64], src2: [u8; 64], imm8: u8) {
+pub fn _tile_top4mxbssps(
+    scope: &mut TileScope,
+    dst: TileId,
+    src1: [u8; 64],
+    src2: [u8; 64],
+    imm8: u8,
+) {
     let _ = detect::has_ace; // ACE-only [DETECT.1-3]
     _tile_top4mxbssps_scalar(scope, dst, src1, src2, imm8);
 }
@@ -543,7 +559,7 @@ define_top4b!(
 mod tests {
     use super::*;
     use crate::bsr::{_bsrinit, _bsrmovf};
-    use crate::tile::{TileConfig, _tile_loadconfig};
+    use crate::tile::{_tile_loadconfig, TileConfig};
 
     fn scope() -> (TileScope, TileId) {
         let s = _tile_loadconfig(&TileConfig::ace()).unwrap();
@@ -581,9 +597,15 @@ mod tests {
     #[test]
     fn fixpoint_to_fp32() {
         // 3 * 2^0: adjust 0 -> 3.0.
-        assert_eq!(f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(3, 0)), 3.0);
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(3, 0)),
+            3.0
+        );
         // Negative.
-        assert_eq!(f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(-3, 0)), -3.0);
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(-3, 0)),
+            -3.0
+        );
         // 2^24 + 1 needs rounding: RNE to even -> 16777216.0.
         assert_eq!(
             f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne((1 << 24) + 1, 0)),
@@ -664,7 +686,11 @@ mod tests {
         _tile_top4buud(&mut s, id, src1, src2);
         // 1*5 + 2*6 + 3*7 + 4*8 = 70.
         assert_eq!(tile_dword(&s, id, 2, 5), 70, "C[2][5] = A[2]·B[5]");
-        assert_eq!(tile_dword(&s, id, 5, 2), 0, "C[5][2] untouched (A row 5 = 0)");
+        assert_eq!(
+            tile_dword(&s, id, 5, 2),
+            0,
+            "C[5][2] untouched (A row 5 = 0)"
+        );
     }
 
     // ---- family F (BF16) ----
@@ -704,7 +730,11 @@ mod tests {
         src2[0] = 0x3F80; // 1.0
         let (mut s, id) = scope();
         _tile_top2bf16ps(&mut s, id, src1, src2);
-        assert_eq!(read_f32(&s, id, 0, 0), 0.0, "denormal input flushed (DAZ=1)");
+        assert_eq!(
+            read_f32(&s, id, 0, 0),
+            0.0,
+            "denormal input flushed (DAZ=1)"
+        );
 
         // Inf x 0 -> QNaN_Indefinite poisons only the affected element.
         let mut src1 = [0u16; 32];
@@ -767,7 +797,11 @@ mod tests {
 
         // Group (a=1, b=0): A scale 2^1 -> adds 2.0 (accumulates onto the 1.0).
         _tile_top4mxbf8ps(&mut s, id, src1, src2, ace_scale_a(1) | ace_scale_b(0));
-        assert_eq!(read_f32(&s, id, 0, 0), 3.0, "scale 0x80 = 2^1 doubles the product");
+        assert_eq!(
+            read_f32(&s, id, 0, 0),
+            3.0,
+            "scale 0x80 = 2^1 doubles the product"
+        );
     }
 
     /// The A-scale is associated with the output ROW, the B-scale with the output COLUMN —

@@ -36,8 +36,10 @@
 //! `dest.byte[i] = fp6_to_fp8_e4m3(src[6*i+5 : 6*i])` (spec section 9.7.5, KL = VL/8 = 64
 //! lanes, 48 input bytes = 64*6/8, `[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.1]`).
 //!
-//! Each public dispatcher is a safe fn that selects the scalar oracle whenever the running
-//! CPU lacks `AVX10_V2_AUX` (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
+//! Each public dispatcher is a safe fn; with no native group-3 intrinsic available in
+//! current toolchains it always takes the scalar oracle (see the OQ-5 note below), with
+//! `detect::has_avx10_v2_aux` marking where the native gate goes live
+//! (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
 //! oracle is the primary, always-correct path on every target including non-x86
 //! (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`); it carries no cfg gate, reads no global
@@ -57,19 +59,20 @@
 //! of function ... did you mean '_mm512_cvtph_hf8'?`). Per OQ-5 there is therefore no native C
 //! shim and no `extern "C"` declaration for any of them, and each dispatcher resolves to its
 //! `_scalar` sibling on every target. The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! `crate::detect::has_avx10_v2_aux` is never consulted — with no native path there is
 //! nothing to gate; each dispatcher only references the detector to mark the future gate
 //! site. A native path is added once the intrinsics land in the toolchain. The differential
 //! test that would otherwise tie a native path to the
 //! oracle DISCARDS (no native path exists), so correctness is grounded against the
-//! section-9.6.5 / section-9.7.5 / section-16.3 pseudocode transcribed in [`crate::fp6`].
+//! section-9.6.5 / section-9.7.5 / section-16.3 (FP8->FP6) / section-16.4 (FP6->FP8)
+//! pseudocode transcribed in `crate::fp6`.
 
 use crate::detect;
 use crate::fp6;
 
 /// BF8 (FP8 E5M2) -> FP6 E3M2 saturating-RTNE convert, 6-bit packed (64 lanes -> 48 bytes).
 ///
-/// Per BF8 lane: convert `a[i]` to its FP6 E3M2 code via [`fp6::fp8_e5m2_to_fp6_e3m2`]
+/// Per BF8 lane: convert `a[i]` to its FP6 E3M2 code via `fp6::fp8_e5m2_to_fp6_e3m2`
 /// (always-saturating, RTNE, matched mantissa width), then 6-bit-pack into `[u8; 48]` at bit
 /// offset `6 * i` (spec section 9.6.5). Always saturating: magnitudes above `+/-28.0`, and BF8
 /// +/-Inf/NaN, clamp to the same-signed FP6 E3M2 max normal `S.111.11`
@@ -77,7 +80,7 @@ use crate::fp6;
 /// zero (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.3]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_bf6s_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf8_bf6s_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_bf6s(a: [u8; 64]) -> [u8; 48] {
@@ -91,8 +94,8 @@ pub fn cvtf8_bf6s(a: [u8; 64]) -> [u8; 48] {
 
 /// Portable reference oracle for [`cvtf8_bf6s`] — the primary always-correct path.
 ///
-/// Maps each BF8 lane through [`fp6::fp8_e5m2_to_fp6_e3m2`] (the saturating-RTNE section-16.3
-/// helper), then 6-bit-packs all 64 results into 48 bytes via [`fp6::pack`] (every lane
+/// Maps each BF8 lane through `fp6::fp8_e5m2_to_fp6_e3m2` (the saturating-RTNE section-16.3
+/// helper), then 6-bit-packs all 64 results into 48 bytes via `fp6::pack` (every lane
 /// written, no masking). Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.4]`
@@ -105,7 +108,7 @@ pub fn cvtf8_bf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 
 /// HF8 (FP8 E4M3) -> FP6 E2M3 saturating-RTNE convert, 6-bit packed (64 lanes -> 48 bytes).
 ///
-/// Per HF8 lane: convert `a[i]` to its FP6 E2M3 code via [`fp6::fp8_e4m3_to_fp6_e2m3`]
+/// Per HF8 lane: convert `a[i]` to its FP6 E2M3 code via `fp6::fp8_e4m3_to_fp6_e2m3`
 /// (always-saturating, RTNE, matched mantissa width), then 6-bit-pack into `[u8; 48]` at bit
 /// offset `6 * i` (spec section 9.6.5). Always saturating: magnitudes above `+/-7.5`, and the
 /// HF8 NaN/max-exponent binade, clamp to the same-signed FP6 E2M3 max normal `S.11.111`
@@ -113,7 +116,7 @@ pub fn cvtf8_bf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 /// zero (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.3]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_hf6s_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf8_hf6s_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_hf6s(a: [u8; 64]) -> [u8; 48] {
@@ -124,8 +127,8 @@ pub fn cvtf8_hf6s(a: [u8; 64]) -> [u8; 48] {
 
 /// Portable reference oracle for [`cvtf8_hf6s`] — the primary always-correct path.
 ///
-/// Maps each HF8 lane through [`fp6::fp8_e4m3_to_fp6_e2m3`] (the saturating-RTNE section-16.3
-/// helper), then 6-bit-packs all 64 results into 48 bytes via [`fp6::pack`] (every lane
+/// Maps each HF8 lane through `fp6::fp8_e4m3_to_fp6_e2m3` (the saturating-RTNE section-16.3
+/// helper), then 6-bit-packs all 64 results into 48 bytes via `fp6::pack` (every lane
 /// written, no masking). Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP6.4]`
@@ -139,7 +142,7 @@ pub fn cvtf8_hf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 /// FP6 E3M2 (BF6) -> FP8 E4M3 (HF8) exact convert, 6-bit-unpacked (64 lanes -> 64 bytes).
 ///
 /// Per FP6 lane: read the 6-bit slice at bit offset `6 * i` from the 6-bit-packed input and
-/// map it to its exact FP8 E4M3 byte via [`fp6::fp6_e3m2_to_fp8_e4m3`] (the section-9.7.5
+/// map it to its exact FP8 E4M3 byte via `fp6::fp6_e3m2_to_fp8_e4m3` (the section-9.7.5
 /// rebias/mantissa-shift decode). The conversion is **exact** — every one of the 64 FP6 E3M2
 /// encodings maps to exactly one FP8 E4M3 encoding, no rounding/approximation
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.1]`,
@@ -148,7 +151,7 @@ pub fn cvtf8_hf6s_scalar(a: [u8; 64]) -> [u8; 48] {
 /// input read from bit 0 (spec section 9.7.5).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf6_hf8_e3m2_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf6_hf8_e3m2_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf6_hf8_e3m2(a: [u8; 48]) -> [u8; 64] {
@@ -162,8 +165,8 @@ pub fn cvtf6_hf8_e3m2(a: [u8; 48]) -> [u8; 64] {
 
 /// Portable reference oracle for [`cvtf6_hf8_e3m2`] — the primary always-correct path.
 ///
-/// Unpacks each 6-bit FP6 E3M2 lane via [`fp6::unpack`] (right-aligning the lane's 6 bits) and
-/// maps it through the exact section-9.7.5 decode [`fp6::fp6_e3m2_to_fp8_e4m3`], widening 48
+/// Unpacks each 6-bit FP6 E3M2 lane via `fp6::unpack` (right-aligning the lane's 6 bits) and
+/// maps it through the exact section-9.7.5 decode `fp6::fp6_e3m2_to_fp8_e4m3`, widening 48
 /// packed input bytes into 64 FP8 E4M3 output bytes. Carries no cfg gate and reads no global
 /// state. `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]` `[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.1]`
@@ -176,7 +179,7 @@ pub fn cvtf6_hf8_e3m2_scalar(a: [u8; 48]) -> [u8; 64] {
 /// FP6 E2M3 (HF6) -> FP8 E4M3 (HF8) exact convert, 6-bit-unpacked (64 lanes -> 64 bytes).
 ///
 /// Per FP6 lane: read the 6-bit slice at bit offset `6 * i` from the 6-bit-packed input and
-/// map it to its exact FP8 E4M3 byte via [`fp6::fp6_e2m3_to_fp8_e4m3`] (the section-9.7.5
+/// map it to its exact FP8 E4M3 byte via `fp6::fp6_e2m3_to_fp8_e4m3` (the section-9.7.5
 /// rebias/mantissa-shift decode). The conversion is **exact** — every one of the 64 FP6 E2M3
 /// encodings maps to exactly one FP8 E4M3 encoding, no rounding/approximation
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.1]`,
@@ -185,7 +188,7 @@ pub fn cvtf6_hf8_e3m2_scalar(a: [u8; 48]) -> [u8; 64] {
 /// input read from bit 0 (spec section 9.7.5).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf6_hf8_e2m3_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf6_hf8_e2m3_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf6_hf8_e2m3(a: [u8; 48]) -> [u8; 64] {
@@ -197,8 +200,8 @@ pub fn cvtf6_hf8_e2m3(a: [u8; 48]) -> [u8; 64] {
 
 /// Portable reference oracle for [`cvtf6_hf8_e2m3`] — the primary always-correct path.
 ///
-/// Unpacks each 6-bit FP6 E2M3 lane via [`fp6::unpack`] (right-aligning the lane's 6 bits) and
-/// maps it through the exact section-9.7.5 decode [`fp6::fp6_e2m3_to_fp8_e4m3`], widening 48
+/// Unpacks each 6-bit FP6 E2M3 lane via `fp6::unpack` (right-aligning the lane's 6 bits) and
+/// maps it through the exact section-9.7.5 decode `fp6::fp6_e2m3_to_fp8_e4m3`, widening 48
 /// packed input bytes into 64 FP8 E4M3 output bytes. Carries no cfg gate and reads no global
 /// state. `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]` `[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.1]`

@@ -707,7 +707,7 @@ pub(crate) fn fp32_to_bf16_rne(f: f32) -> u16 {
 /// BF16 is exactly the high 16 bits of FP32 with a zero low half, so the decode is a pure
 /// left shift — no rounding, no saturation, no exceptions. Every BF16 encoding (zeros,
 /// subnormals, normals, +/-Inf, NaN) maps to the single FP32 value whose top 16 bits are
-/// `bits` and whose low 16 bits are zero. This is the exact inverse of [`fp32_to_bf16_rne`]
+/// `bits` and whose low 16 bits are zero. This is the exact inverse of `fp32_to_bf16_rne`
 /// on any FP32 already representable in BF16 (low 16 mantissa bits zero).
 pub(crate) fn bf16_to_fp32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
@@ -846,7 +846,7 @@ pub(crate) fn fp8_e4m3_to_fp32(byte: u8) -> f32 {
 }
 
 /// `mask(n)` from the section-16.1 pseudocode: the low-`n`-bit mask, with `mask(0) == 0`.
-/// Shared with the FP4/FP6 rounders in [`crate::fp4`] / [`crate::fp6`].
+/// Shared with the FP4/FP6 rounders in `crate::fp4` / `crate::fp6`.
 #[inline]
 pub(crate) fn mask(n: i32) -> u32 {
     if n <= 0 {

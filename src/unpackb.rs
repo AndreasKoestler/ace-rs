@@ -33,7 +33,7 @@
 //!
 //! Per lane `i` the size-bit field at bit offset `j = (start*KL + i)*size` is read from the
 //! packed buffer (LSB-from-bit-0, straddling byte boundaries) via
-//! [`crate::fp4::extract_field`] — the same size-parameterized reader the FP4/FP6 unpackers
+//! `crate::fp4::extract_field` — the same size-parameterized reader the FP4/FP6 unpackers
 //! use, so the extraction is not reimplemented divergently
 //! (`[avx10-v2-aux-ocp-conversions.UNPACKB.5]`). The field is then widened to 8 bits: zero-
 //! extension clears bits `[7:size]` (`[avx10-v2-aux-ocp-conversions.UNPACKB.6]`),
@@ -42,8 +42,9 @@
 //!
 //! After the section-9.9.4 conditioning the spec constraint `(start+1)*KL*size <= VL` always
 //! holds (with `KL=64`, `VL=512` it reduces to `(start+1)*size <= 8`, satisfied by every
-//! conditioned `(size, start)` pair), so the maximum bit offset read is `(start+1)*64*size
-//! - 1 <= 511` — always inside the 512-bit (`[u8; 64]`) input. The function is therefore
+//! conditioned `(size, start)` pair), so the maximum bit offset read is
+//! `(start+1)*64*size - 1 <= 511` — always inside the 512-bit (`[u8; 64]`) input. The
+//! function is therefore
 //! **total** over `([u8; 64], u8)`: every `imm8` — including the reserved bits `imm8[7:6]`
 //! (SBZ, no `#UD`/`#GP`, spec section 9.9.1) and the reserved size encodings 0/1 clamped to
 //! 2 — returns a defined `[u8; 64]` and never panics or faults
@@ -57,8 +58,10 @@
 //! (NOT a mask). The pseudocode's per-lane `if k1[i] or no_writemask` therefore always takes
 //! the `no_writemask` branch.
 //!
-//! The public dispatcher [`unpackb`] is a safe fn that selects the scalar oracle whenever the
-//! running CPU lacks `AVX10_V2_AUX` (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The
+//! The public dispatcher [`unpackb`] is a safe fn; with no native group-3 intrinsic
+//! available in current toolchains it always takes the scalar oracle (see the OQ-5 note
+//! below), with `detect::has_avx10_v2_aux` marking where the native gate goes live
+//! (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The
 //! `_scalar` oracle [`unpackb_scalar`] is the primary, always-correct path on every target
 //! including non-x86 (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`); it carries no cfg gate, reads no global
@@ -74,7 +77,7 @@
 //! (the unrelated *mask*-unpack), confirming `_mm512_unpackb` does not yet exist in the
 //! toolchain. Per OQ-5 there is therefore no native C shim, no `extern "C"` declaration, and
 //! no `_hw` path; the dispatcher resolves to its `_scalar` sibling on every target. The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! `crate::detect::has_avx10_v2_aux` is never consulted — with no native path there is
 //! nothing to gate; the dispatcher only references the detector to mark the future gate
 //! site. A native path is added once the intrinsic lands in the toolchain. The differential test
 //! that would otherwise tie a native path to the oracle DISCARDS (no native path exists), so
@@ -132,7 +135,7 @@ pub const fn ACE_UNPACKB_START(s: u8) -> u8 {
 ///
 /// Transcribes the spec section-9.9.4 `VUNPACKB` pseudocode bit-exactly: decode `size`,
 /// `sign_ex` and `start` from `imm8`, then for each of the `KL = 64` output lanes extract the
-/// `size`-bit field at bit offset `(start*KL + i)*size` via [`crate::fp4::extract_field`] and
+/// `size`-bit field at bit offset `(start*KL + i)*size` via `crate::fp4::extract_field` and
 /// zero- or sign-extend it to a full byte. Defined for every `imm8` (incl. reserved
 /// `imm8[7:6]` and the reserved size encodings 0/1 clamped to 2); never panics or faults.
 /// Carries no cfg gate and reads no global state.
@@ -194,7 +197,7 @@ pub fn unpackb_scalar(a: [u8; 64], imm8: u8) -> [u8; 64] {
 /// only the `no_writemask` path, so every lane is written and `imm8` is the sole control input
 /// (`[avx10-v2-aux-ocp-conversions.UNPACKB.9]`). The output is the full 512-bit `[u8; 64]`.
 ///
-/// No native path is wired, so [`detect::has_avx10_v2_aux`] is never consulted (OQ-5, see
+/// No native path is wired, so `detect::has_avx10_v2_aux` is never consulted (OQ-5, see
 /// the module docs — `_mm512_unpackb` is absent from the `-mavx10.2` toolchain); the
 /// dispatcher resolves to [`unpackb_scalar`] on every target, returning the spec-defined
 /// value (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`).
@@ -216,7 +219,7 @@ mod tests {
     /// Pack `lanes` little-endian (LSB-from-bit-0) into a `[u8; 64]` at `size` bits per lane,
     /// the inverse of the size-`size` extraction `unpackb` performs at start 0. Used by the
     /// known-value and round-trip tests to build a packed input with known field contents.
-    /// Delegates to the shared production packer [`crate::fp4::pack_fields`] (bytes past the
+    /// Delegates to the shared production packer `crate::fp4::pack_fields` (bytes past the
     /// last lane stay zero).
     fn pack_fields(lanes: &[u8], size: usize) -> [u8; 64] {
         let mut buf = [0u8; 64];

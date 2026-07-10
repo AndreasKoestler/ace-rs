@@ -37,7 +37,7 @@
 //!
 //! Each op is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
 //! correct on every target). Family D is `ACE`-only and gates on full `ACE`
-//! ([`detect::has_ace`], `[ace-tile-instructions.DETECT.1-3]`,
+//! (`detect::has_ace`, `[ace-tile-instructions.DETECT.1-3]`,
 //! `[ace-tile-instructions.DISPATCH.1]`). The dispatchers reference the detector to mark the
 //! gate site and take the scalar oracle on every target.
 
@@ -107,7 +107,11 @@ pub fn _bsrinit_scalar(scope: &mut TileScope) {
 /// `BSRMOVF`: write the full BSR from two 512-bit sources — `a_scales` (the first source
 /// operand, zmm1) becomes `BSR[1023:512]`, `b_scales` (the second source operand,
 /// zmm2/m512) becomes `BSR[511:0]` (spec section 13.2) (`[ace-tile-instructions.BSR.2]`).
-pub fn _bsrmovf(scope: &mut TileScope, a_scales: [u8; BSR_HALF_BYTES], b_scales: [u8; BSR_HALF_BYTES]) {
+pub fn _bsrmovf(
+    scope: &mut TileScope,
+    a_scales: [u8; BSR_HALF_BYTES],
+    b_scales: [u8; BSR_HALF_BYTES],
+) {
     let _ = detect::has_ace; // family D gate site [DETECT.1-3]
     _bsrmovf_scalar(scope, a_scales, b_scales);
 }
@@ -180,7 +184,7 @@ pub fn _bsrmovl_read_scalar(scope: &TileScope) -> [u8; BSR_HALF_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::{TileConfig, _tile_loadconfig};
+    use crate::tile::{_tile_loadconfig, TileConfig};
 
     fn scope() -> TileScope {
         _tile_loadconfig(&TileConfig::ace()).expect("valid ACE descriptor")
@@ -215,7 +219,11 @@ mod tests {
         let a: [u8; 64] = core::array::from_fn(|i| 0x80 + i as u8);
         let b: [u8; 64] = core::array::from_fn(|i| i as u8);
         _bsrmovf(&mut s, a, b);
-        assert_eq!(&s.bsr().bytes()[64..], &a, "src1 -> BSR[1023:512] (A scales)");
+        assert_eq!(
+            &s.bsr().bytes()[64..],
+            &a,
+            "src1 -> BSR[1023:512] (A scales)"
+        );
         assert_eq!(&s.bsr().bytes()[..64], &b, "src2 -> BSR[511:0] (B scales)");
     }
 

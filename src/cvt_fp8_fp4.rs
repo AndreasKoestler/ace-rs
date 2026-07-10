@@ -23,8 +23,10 @@
 //! `dest.byte[i] = fp4_to_fp8_e4m3(src[4*i+3 : 4*i])` (spec section 9.5.5,
 //! `[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.3]`).
 //!
-//! Each public dispatcher is a safe fn that selects the scalar oracle whenever the running
-//! CPU lacks `AVX10_V2_AUX` (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
+//! Each public dispatcher is a safe fn; with no native group-3 intrinsic available in
+//! current toolchains it always takes the scalar oracle (see the OQ-5 note below), with
+//! `detect::has_avx10_v2_aux` marking where the native gate goes live
+//! (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
 //! oracle is the primary, always-correct path on every target including non-x86
 //! (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`); it carries no cfg gate, reads no global
@@ -42,25 +44,26 @@
 //! declaration of function ... did you mean '_mm512_cvtph_hf8'?`). Per OQ-5 there is therefore
 //! no native C shim and no `extern "C"` declaration for any of them, and each dispatcher
 //! resolves to its `_scalar` sibling on every target. The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! `crate::detect::has_avx10_v2_aux` is never consulted — with no native path there is
 //! nothing to gate; each dispatcher only references the detector to mark the future gate
 //! site. A native path is added once the intrinsics land in the toolchain. The differential
 //! test that would otherwise tie a native path to the
 //! oracle DISCARDS (no native path exists), so correctness is grounded against the
-//! section-9.4.5 / section-9.5.5 / section-16.3 pseudocode transcribed in [`crate::fp4`].
+//! section-9.4.5 / section-9.5.5 / section-16.3 (the FP8->FP4 helpers) pseudocode
+//! transcribed in `crate::fp4`.
 
 use crate::detect;
 use crate::fp4;
 
 /// BF8 (FP8 E5M2) -> FP4 E2M1 saturating-RTNE convert, nibble-packed (64 lanes -> 32 bytes).
 ///
-/// Per BF8 lane: convert `a[i]` to its FP4 nibble via [`fp4::fp8_e5m2_to_fp4_e2m1`]
+/// Per BF8 lane: convert `a[i]` to its FP4 nibble via `fp4::fp8_e5m2_to_fp4_e2m1`
 /// (always-saturating, RTNE), then nibble-pack into `[u8; 32]` at bit offset `4 * i` (spec
 /// section 9.4.5). Always saturating: magnitudes above `+/-6.0`, and BF8 +/-Inf/NaN, clamp
 /// to the same-signed FP4 max normal (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.2]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_bf4s_e5m2_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf8_bf4s_e5m2_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_bf4s_e5m2(a: [u8; 64]) -> [u8; 32] {
@@ -74,8 +77,8 @@ pub fn cvtf8_bf4s_e5m2(a: [u8; 64]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtf8_bf4s_e5m2`] — the primary always-correct path.
 ///
-/// Maps each BF8 lane through [`fp4::fp8_e5m2_to_fp4_e2m1`] (the saturating-RTNE section-16.3
-/// helper), then nibble-packs all 64 results into 32 bytes via [`fp4::pack_nibbles`] (every
+/// Maps each BF8 lane through `fp4::fp8_e5m2_to_fp4_e2m1` (the saturating-RTNE section-16.3
+/// helper), then nibble-packs all 64 results into 32 bytes via `fp4::pack_nibbles` (every
 /// nibble written, no masking). Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.3]` `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.4]`
@@ -88,14 +91,14 @@ pub fn cvtf8_bf4s_e5m2_scalar(a: [u8; 64]) -> [u8; 32] {
 
 /// HF8 (FP8 E4M3) -> FP4 E2M1 saturating-RTNE convert, nibble-packed (64 lanes -> 32 bytes).
 ///
-/// Per HF8 lane: convert `a[i]` to its FP4 nibble via [`fp4::fp8_e4m3_to_fp4_e2m1`]
+/// Per HF8 lane: convert `a[i]` to its FP4 nibble via `fp4::fp8_e4m3_to_fp4_e2m1`
 /// (always-saturating, RTNE), then nibble-pack into `[u8; 32]` at bit offset `4 * i` (spec
 /// section 9.4.5). Always saturating: magnitudes above `+/-6.0`, and the sole HF8 NaN
 /// `S.1111.111`, clamp to the same-signed FP4 max normal
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.2]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtf8_bf4s_e4m3_scalar`]
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtf8_bf4s_e4m3_scalar`]
 /// on every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtf8_bf4s_e4m3(a: [u8; 64]) -> [u8; 32] {
@@ -106,8 +109,8 @@ pub fn cvtf8_bf4s_e4m3(a: [u8; 64]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtf8_bf4s_e4m3`] — the primary always-correct path.
 ///
-/// Maps each HF8 lane through [`fp4::fp8_e4m3_to_fp4_e2m1`] (the saturating-RTNE section-16.3
-/// helper), then nibble-packs all 64 results into 32 bytes via [`fp4::pack_nibbles`] (every
+/// Maps each HF8 lane through `fp4::fp8_e4m3_to_fp4_e2m1` (the saturating-RTNE section-16.3
+/// helper), then nibble-packs all 64 results into 32 bytes via `fp4::pack_nibbles` (every
 /// nibble written, no masking). Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.3]` `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.4]`
@@ -121,7 +124,7 @@ pub fn cvtf8_bf4s_e4m3_scalar(a: [u8; 64]) -> [u8; 32] {
 /// FP4 E2M1 (BF4) -> FP8 E4M3 (HF8) exact convert, nibble-unpacked (64 lanes -> 64 bytes).
 ///
 /// Per FP4 lane: read the nibble at bit offset `4 * i` from the nibble-packed input and map
-/// it to its exact FP8 E4M3 byte via [`fp4::fp4_e2m1_to_fp8_e4m3`] (the section-9.5.5 LUT).
+/// it to its exact FP8 E4M3 byte via `fp4::fp4_e2m1_to_fp8_e4m3` (the section-9.5.5 LUT).
 /// The conversion is **exact** — every FP4 encoding maps to exactly one FP8 E4M3 encoding,
 /// no rounding/approximation (`[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.1]`,
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.2]`). The output (`[u8; 64]`) is twice the
@@ -129,7 +132,7 @@ pub fn cvtf8_bf4s_e4m3_scalar(a: [u8; 64]) -> [u8; 32] {
 /// section 9.5.5, `[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.3]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtbf4_hf8_scalar`] on
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtbf4_hf8_scalar`] on
 /// every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbf4_hf8(a: [u8; 32]) -> [u8; 64] {
@@ -144,8 +147,8 @@ pub fn cvtbf4_hf8(a: [u8; 32]) -> [u8; 64] {
 /// Portable reference oracle for [`cvtbf4_hf8`] — the primary always-correct path.
 ///
 /// Reads each nibble-packed FP4 lane and maps it through the exact section-9.5.5 LUT
-/// [`fp4::fp4_e2m1_to_fp8_e4m3`], widening 32 packed input bytes into 64 FP8 E4M3 output
-/// bytes via [`fp4::unpack_nibbles_to_fp8_e4m3`]. Carries no cfg gate and reads no global
+/// `fp4::fp4_e2m1_to_fp8_e4m3`, widening 32 packed input bytes into 64 FP8 E4M3 output
+/// bytes via `fp4::unpack_nibbles_to_fp8_e4m3`. Carries no cfg gate and reads no global
 /// state. `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]` `[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.3]`
 pub fn cvtbf4_hf8_scalar(a: [u8; 32]) -> [u8; 64] {

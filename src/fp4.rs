@@ -36,7 +36,7 @@
 /// of the buffer is bit `b & 7` of `buf[b >> 3]`. A field may straddle a byte boundary
 /// (e.g. a size-6 field at bit offset 4 spans the top 4 bits of byte 0 and the low 2 bits
 /// of byte 1). `size` must be in `1..=8`; the caller guarantees `bit_offset + size` fits in
-/// the buffer. This is the inverse of the packers in this module and in [`crate::fp6`], and
+/// the buffer. This is the inverse of the packers in this module and in `crate::fp6`, and
 /// the field-read primitive the section-9.9.4 `vunpackb` decode is defined in terms of.
 pub(crate) fn extract_field(buf: &[u8], bit_offset: usize, size: usize) -> u8 {
     assert!((1..=8).contains(&size));
@@ -236,7 +236,7 @@ pub(crate) fn fp4_e2m1_to_fp8_e4m3(nibble: u8) -> u8 {
 /// Lane `i` (low `size` bits of `values[i]`) is written at bit offset `size * i`,
 /// contiguously from bit 0, straddling a byte boundary when needed. This is the single
 /// generic packer behind the FP4 nibble pack ([`pack_nibbles`], `size = 4`), the FP6 6-bit
-/// pack ([`crate::fp6::pack`], `size = 6`), and the `unpackb` test inputs (sizes 2–7).
+/// pack (`crate::fp6::pack`, `size = 6`), and the `unpackb` test inputs (sizes 2–7).
 /// `out` must hold at least `values.len() * size` bits; it is zeroed first, so bits past the
 /// last lane stay zero.
 pub(crate) fn pack_fields(values: &[u8], size: usize, out: &mut [u8]) {

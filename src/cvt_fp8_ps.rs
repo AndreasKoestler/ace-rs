@@ -10,8 +10,10 @@
 //! section 9.3.1). The output is 4x wider than the input (16 bytes -> 16 dwords, spec
 //! section 9.3.5).
 //!
-//! The public dispatcher is a safe fn that selects the scalar oracle whenever the running
-//! CPU lacks `AVX10_V2_AUX` (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
+//! The public dispatcher is a safe fn; with no native group-3 intrinsic available in
+//! current toolchains it always takes the scalar oracle (see the OQ-5 note below), with
+//! `detect::has_avx10_v2_aux` marking where the native gate goes live
+//! (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
 //! oracle is the primary, always-correct path on every target including non-x86
 //! (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`); it carries no cfg gate, reads no global
@@ -26,7 +28,7 @@
 //! so per OQ-5 family C ships **oracle-only**: there is no native C shim or `_hw` path for
 //! either converter, and each dispatcher resolves to its `_scalar` sibling on every target.
 //! The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! `crate::detect::has_avx10_v2_aux` is never consulted — with no native path there is
 //! nothing to gate; each dispatcher only references the detector to mark the future gate
 //! site. A native path is added once the intrinsics land in the toolchain.
 
@@ -36,12 +38,12 @@ use crate::fp8;
 /// BF8 (FP8 E5M2) -> FP32 exact convert (16 lanes).
 ///
 /// Per BF8 lane: decode the E5M2 byte to its exact FP32 value via
-/// [`fp8::fp8_e5m2_to_fp32`]. The conversion is lossless — no rounding, no saturation, no
+/// `fp8::fp8_e5m2_to_fp32`. The conversion is lossless — no rounding, no saturation, no
 /// exceptions — because every BF8 value (subnormals, signed zeros, +/-Inf, and the BF8
 /// NaNs) is representable in FP32 (`[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.1]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvtbf8_ps_scalar`] on
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvtbf8_ps_scalar`] on
 /// every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvtbf8_ps(a: [u8; 16]) -> [f32; 16] {
@@ -55,7 +57,7 @@ pub fn cvtbf8_ps(a: [u8; 16]) -> [f32; 16] {
 
 /// Portable reference oracle for [`cvtbf8_ps`] — the primary always-correct path.
 ///
-/// Maps each BF8 lane through [`fp8::fp8_e5m2_to_fp32`], the exact E5M2->FP32 decode.
+/// Maps each BF8 lane through `fp8::fp8_e5m2_to_fp32`, the exact E5M2->FP32 decode.
 /// Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 pub fn cvtbf8_ps_scalar(a: [u8; 16]) -> [f32; 16] {
@@ -65,14 +67,14 @@ pub fn cvtbf8_ps_scalar(a: [u8; 16]) -> [f32; 16] {
 /// HF8 (FP8 E4M3) -> FP32 exact convert (16 lanes).
 ///
 /// Per HF8 lane: decode the E4M3 byte to its exact FP32 value via
-/// [`fp8::fp8_e4m3_to_fp32`]. The conversion is lossless — no rounding, no saturation, no
+/// `fp8::fp8_e4m3_to_fp32`. The conversion is lossless — no rounding, no saturation, no
 /// exceptions — because every HF8 value (subnormals, signed zeros, and the sole HF8 NaN
 /// `S.1111.111`; E4M3 has no infinity) is representable in FP32
 /// (`[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.2]`,
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP8_PS.3]`).
 ///
 /// No native path is wired yet (OQ-5, see the module docs), so
-/// [`detect::has_avx10_v2_aux`] is never consulted; the dispatcher resolves to [`cvthf8_ps_scalar`] on
+/// `detect::has_avx10_v2_aux` is never consulted; the dispatcher resolves to [`cvthf8_ps_scalar`] on
 /// every target, returning the spec-defined value.
 /// `[avx10-v2-aux-ocp-conversions.DETECTION.2]`
 pub fn cvthf8_ps(a: [u8; 16]) -> [f32; 16] {
@@ -86,7 +88,7 @@ pub fn cvthf8_ps(a: [u8; 16]) -> [f32; 16] {
 
 /// Portable reference oracle for [`cvthf8_ps`] — the primary always-correct path.
 ///
-/// Maps each HF8 lane through [`fp8::fp8_e4m3_to_fp32`], the exact E4M3->FP32 decode.
+/// Maps each HF8 lane through `fp8::fp8_e4m3_to_fp32`, the exact E4M3->FP32 decode.
 /// Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 pub fn cvthf8_ps_scalar(a: [u8; 16]) -> [f32; 16] {

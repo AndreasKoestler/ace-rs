@@ -30,9 +30,9 @@
 //!
 //! Each op is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
 //! correct on every target). Per the section-15.3 feature enumeration, the `TILEMOVROW`
-//! read form gates on `AMX-AVX512 || ACE_VSN >= 1` ([`detect::has_amx_avx512`],
+//! read form gates on `AMX-AVX512 || ACE_VSN >= 1` (`detect::has_amx_avx512`,
 //! `[ace-tile-instructions.DETECT.1-2]`) and the write forms (`TILEMOVROW` write,
-//! `TILEMOVCOL`) are ACE-only ([`detect::has_ace`],
+//! `TILEMOVCOL`) are ACE-only (`detect::has_ace`,
 //! `[ace-tile-instructions.DETECT.1-3]`). The register model lives in Rust, so the
 //! dispatchers reference the detectors to mark the gate sites and take the scalar oracle
 //! (`[ace-tile-instructions.DISPATCH.1]`).
@@ -106,7 +106,7 @@ pub fn _tile_setcol_scalar(scope: &mut TileScope, dst: TileId, col: u32, src: [u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::{TileConfig, _tile_loadconfig};
+    use crate::tile::{_tile_loadconfig, TileConfig};
 
     fn scope_with_pattern() -> (TileScope, TileId) {
         let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
@@ -158,7 +158,11 @@ mod tests {
         _tile_setrow(&mut scope, id, 21, marker); // 21 & 0xF = 5
         assert_eq!(_tile_movrow(&scope, id, 5), marker);
         _tile_setcol(&mut scope, id, 19, [0x42; 64]); // 19 & 0xF = 3
-        assert_eq!(scope.tile_bytes_ref(id)[3], 0x42, "row 0, byte-column 3 written");
+        assert_eq!(
+            scope.tile_bytes_ref(id)[3],
+            0x42,
+            "row 0, byte-column 3 written"
+        );
     }
 
     /// TILEMOVCOL writes one byte per row from the low 16 source bytes into byte-column

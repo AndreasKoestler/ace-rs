@@ -213,7 +213,7 @@ pub struct TileScope {
     /// The single ACE Block Scale register (SCALEDATA), owned by the guard so BSR writes
     /// and the MX products' reads share one register model (INV-5).
     bsr: BsrReg,
-    /// Set once by [`TileScope::release`] so the release logic is idempotent.
+    /// Set once by `TileScope::release` so the release logic is idempotent.
     released: bool,
     /// Release ledger: when attached, `Drop` increments it exactly once, letting a caller
     /// confirm the RAII `TILERELEASE` fired — including across a panic unwind, where the
@@ -304,7 +304,7 @@ impl Drop for TileScope {
     /// `TILERELEASE` on scope exit — normal return, early return, or panic unwind — so tile
     /// configuration can never leak (INV-1, `[ace-tile-instructions.TILE_LIFECYCLE.4]`,
     /// `[ace-tile-instructions.TILE_LIFECYCLE.5]`). Runs exactly once (Rust ownership +
-    /// [`TileScope::release`]'s idempotence guard).
+    /// `TileScope::release`'s idempotence guard).
     fn drop(&mut self) {
         self.release();
     }
@@ -447,7 +447,10 @@ mod tests {
         assert_eq!(stored, TileConfig::ace());
         let raw = stored.to_bytes();
         assert_eq!(raw[0], 2);
-        assert!(raw[1..].iter().all(|&b| b == 0), "bytes 1-63 stored as zero");
+        assert!(
+            raw[1..].iter().all(|&b| b == 0),
+            "bytes 1-63 stored as zero"
+        );
 
         // INIT palette: TILES_CONFIGURED == 0 -> all-zero descriptor.
         let init_scope = _tile_loadconfig(&TileConfig::init()).unwrap();

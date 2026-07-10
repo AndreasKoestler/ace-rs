@@ -8,14 +8,16 @@
 //!
 //! with a differential test asserting the native path agrees with the scalar oracle.
 //!
-//! This is **iteration 0** (the tracer bullet, design §6 / D9): one primitive — [`dpbssd`] —
-//! wired end to end on stable Rust: build → runtime detect → intrinsic → fallback → test.
+//! **Iterations 0–3 are complete** — all four ACE feature groups (spec §4) are implemented.
+//!
+//! **Iteration 0** (the tracer bullet, design §6 / D9) wired one primitive — [`dpbssd`] —
+//! end to end on stable Rust: build → runtime detect → intrinsic → fallback → test.
 //! It is the only ACE primitive already present in stable `core::arch`, so it needs no
 //! emulator and runs natively on AVX-VNNI-INT8 hardware.
 //!
-//! **Iteration 1** (in progress) adds the `AVX10_V1_AUX` family of FP16↔FP8 / FP32→FP16
+//! **Iteration 1** added the `AVX10_V1_AUX` family of FP16↔FP8 / FP32→FP16
 //! converts and the EVEX byte/word VNNI matrix, each behind a crate-owned capability check
-//! ([`detect`]) over the shared FP8/FP16 conversion oracle ([`fp8`]). The scalar oracle is
+//! (`detect`) over the shared FP8/FP16 conversion oracle (`fp8`). The scalar oracle is
 //! the primary, always-present path; an **opt-in native path** (the `native` cargo feature)
 //! routes each primitive to a hand-written C shim compiled with `-mavx10.2` — there is no
 //! stable `core::arch` EVEX intrinsic for these forms yet — taken only when
@@ -119,9 +121,9 @@
 //! A–G: the palette-2 tile lifecycle + [`TileScope`] RAII guard, tile↔ZMM moves, tile-row
 //! converts, block-scale [`BsrReg`] registers, and the `TOP*` outer products). **Group 4 is
 //! therefore no longer a non-goal** — its reachability is the positive assertion in
-//! [`iteration_surface::iteration_surface_includes_group4`]. The following remain deliberately
+//! `iteration_surface::iteration_surface_includes_group4`. The following remain deliberately
 //! **out of scope** and are NOT present in any public item or native path (verified by
-//! [`non_goal_guards::non_goals_absent`]):
+//! `non_goal_guards::non_goals_absent`):
 //!
 //! - **No palette-1 tile configuration and no AMX `TMUL` dot-product instructions** — the tile
 //!   surface is the palette-2 `ACE` group-4 engine only; the legacy AMX palette-1 configuration

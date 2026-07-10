@@ -243,7 +243,7 @@ pub(crate) fn encode_tilecfg(palette: u8) -> [u8; 64] {
 ///
 /// # Safety
 /// The CPU must support AMX-TILE with the tile XSAVE state enabled
-/// ([`crate::detect::has_amx_tile`]), otherwise the tile instructions fault (`#UD`).
+/// (`crate::detect::has_amx_tile`), otherwise the tile instructions fault (`#UD`).
 pub(crate) unsafe fn tile_cfg_roundtrip_hw(cfg: &[u8; 64]) -> [u8; 64] {
     let mut out = [0u8; 64];
     // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers; the
@@ -256,7 +256,7 @@ pub(crate) unsafe fn tile_cfg_roundtrip_hw(cfg: &[u8; 64]) -> [u8; 64] {
 ///
 /// # Safety
 /// The CPU must support AMX-TILE with the tile XSAVE state enabled
-/// ([`crate::detect::has_amx_tile`]), otherwise the tile instructions fault (`#UD`).
+/// (`crate::detect::has_amx_tile`), otherwise the tile instructions fault (`#UD`).
 pub(crate) unsafe fn tile_zero_hw(cfg: &[u8; 64], data: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
     let mut out = [0u8; ROW_BYTES];
     // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
@@ -268,7 +268,7 @@ pub(crate) unsafe fn tile_zero_hw(cfg: &[u8; 64], data: &[u8; ROW_BYTES]) -> [u8
 ///
 /// # Safety
 /// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
-/// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
+/// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
 pub(crate) unsafe fn tile_movrow_read_hw(
     cfg: &[u8; 64],
     data: &[u8; ROW_BYTES],
@@ -284,7 +284,7 @@ pub(crate) unsafe fn tile_movrow_read_hw(
 ///
 /// # Safety
 /// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
-/// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
+/// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
 pub(crate) unsafe fn tcvtrowd2ps_hw(cfg: &[u8; 64], data: &[u8; ROW_BYTES], row: u32) -> [f32; 16] {
     let mut out = [0f32; 16];
     // SAFETY (FFI): the 64-byte inputs and 16-lane f32 output match the shim's contract.
@@ -298,7 +298,7 @@ macro_rules! tcvtrow_word_hw {
         ///
         /// # Safety
         /// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
-        /// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
+        /// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
         pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; ROW_BYTES], row: u32) -> [u16; 32] {
             let mut out = [0u16; 32];
             // SAFETY (FFI): fixed-size borrows match the shim's documented buffer lengths.
@@ -318,7 +318,7 @@ macro_rules! move_write_hw {
         ///
         /// # Safety
         /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-        /// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
         pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
             let mut out = [0u8; ROW_BYTES];
             // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
@@ -334,7 +334,7 @@ move_write_hw!(tile_movcol_write_hw, ace_tile_movcol_write);
 ///
 /// # Safety
 /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-/// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
 pub(crate) unsafe fn bsrinit_hw(cfg: &[u8; 64]) -> ([u8; ROW_BYTES], [u8; ROW_BYTES]) {
     let mut a = [0u8; ROW_BYTES];
     let mut b = [0u8; ROW_BYTES];
@@ -347,7 +347,7 @@ pub(crate) unsafe fn bsrinit_hw(cfg: &[u8; 64]) -> ([u8; ROW_BYTES], [u8; ROW_BY
 ///
 /// # Safety
 /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-/// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
 pub(crate) unsafe fn bsrmovf_hw(
     cfg: &[u8; 64],
     a: &[u8; ROW_BYTES],
@@ -356,7 +356,13 @@ pub(crate) unsafe fn bsrmovf_hw(
     let mut oa = [0u8; ROW_BYTES];
     let mut ob = [0u8; ROW_BYTES];
     // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
-    ace_bsrmovf_read(a.as_ptr(), b.as_ptr(), cfg.as_ptr(), oa.as_mut_ptr(), ob.as_mut_ptr());
+    ace_bsrmovf_read(
+        a.as_ptr(),
+        b.as_ptr(),
+        cfg.as_ptr(),
+        oa.as_mut_ptr(),
+        ob.as_mut_ptr(),
+    );
     (oa, ob)
 }
 
@@ -364,7 +370,7 @@ pub(crate) unsafe fn bsrmovf_hw(
 ///
 /// # Safety
 /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-/// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
 pub(crate) unsafe fn bsrmovh_hw(cfg: &[u8; 64], a: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
     let mut out = [0u8; ROW_BYTES];
     // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
@@ -376,7 +382,7 @@ pub(crate) unsafe fn bsrmovh_hw(cfg: &[u8; 64], a: &[u8; ROW_BYTES]) -> [u8; ROW
 ///
 /// # Safety
 /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-/// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
 pub(crate) unsafe fn bsrmovl_hw(cfg: &[u8; 64], b: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
     let mut out = [0u8; ROW_BYTES];
     // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
@@ -391,7 +397,7 @@ macro_rules! top_hw {
         ///
         /// # Safety
         /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-        /// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
             c: &[u8; ROW_BYTES],
@@ -424,7 +430,7 @@ macro_rules! mx_top_hw {
         ///
         /// # Safety
         /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
-        /// ([`crate::detect::has_ace`]), otherwise the encoded instruction faults (`#UD`).
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
             c: &[u8; ROW_BYTES],
@@ -464,7 +470,7 @@ mx_top_hw!(top4mxbssps_hw, ace_tile_top4mxbssps);
 mod differential {
     use super::*;
     use crate::detect;
-    use crate::tile::{TileConfig, _tile_loadconfig};
+    use crate::tile::{_tile_loadconfig, TileConfig};
     use quickcheck::{quickcheck, TestResult};
 
     quickcheck! {

@@ -10,13 +10,13 @@
 //!
 //! FP6 lanes are **6-bit-packed** — 6 bits per lane, packed contiguously from bit 0, so a
 //! length-`N` lane vector occupies `N * 6 / 8` bytes and lanes straddle byte boundaries
-//! (spec section 9.6.5 / 9.7.5). The packer/unpacker here reuse [`crate::fp4::extract_field`]
+//! (spec section 9.6.5 / 9.7.5). The packer/unpacker here reuse `crate::fp4::extract_field`
 //! for the size-6 read.
 //!
 //! This module also owns the FP8->FP6 saturating-RTNE conversion helpers
 //! ([`fp8_e5m2_to_fp6_e3m2`] / [`fp8_e4m3_to_fp6_e2m3`], spec section 16.3, consumed by
 //! family F) and the exact FP6->FP8 E4M3 decode helpers
-//! ([`fp6_e3m2_to_fp8_e4m3`] / [`fp6_e2m3_to_fp8_e4m3`], spec section 16.3, consumed by
+//! ([`fp6_e3m2_to_fp8_e4m3`] / [`fp6_e2m3_to_fp8_e4m3`], spec section 16.4, consumed by
 //! family G). The FP6->FP8 decodes are **exact**: every one of the 64 FP6 codes (per format)
 //! maps to exactly one FP8 E4M3 byte with no rounding/approximation (spec section 9.7.1).
 //!
@@ -44,7 +44,7 @@ use crate::fp4::extract_field;
 /// bit 0, straddling byte boundaries as needed (spec section 9.6.5). `values.len() * 6` must
 /// be a multiple of 8; the output is `values.len() * 6 / 8` bytes. Every lane is written
 /// (no masking/zeroing), the inverse of [`unpack`]. Thin `size = 6` wrapper over
-/// [`crate::fp4::pack_fields`].
+/// `crate::fp4::pack_fields`.
 pub(crate) fn pack(values: &[u8], out: &mut [u8]) {
     assert_eq!((values.len() * 6) % 8, 0);
     assert_eq!(out.len(), values.len() * 6 / 8);
@@ -53,7 +53,7 @@ pub(crate) fn pack(values: &[u8], out: &mut [u8]) {
 
 /// Unpack a 6-bit-packed byte buffer into one right-aligned 6-bit value per lane.
 ///
-/// Reads lane `i` from bit offset `6 * i` via [`crate::fp4::extract_field`] with `size = 6`,
+/// Reads lane `i` from bit offset `6 * i` via `crate::fp4::extract_field` with `size = 6`,
 /// the inverse of [`pack`]: `out[i]` holds the lane's 6 bits in `[5:0]`. `out.len() * 6`
 /// must equal `buf.len() * 8`.
 pub(crate) fn unpack(buf: &[u8], out: &mut [u8]) {
@@ -200,7 +200,7 @@ pub(crate) fn fp8_e4m3_to_fp6_e2m3(byte: u8) -> u8 {
 
 /// Convert one FP6 E3M2 (BF6) 6-bit code to its single exact FP8 E4M3 (HF8) byte.
 ///
-/// Transcribes the ACE v1 section-16.3 `fp6_e3m2_to_fp8_e4m3` helper VERBATIM (spec section
+/// Transcribes the ACE v1 section-16.4 `fp6_e3m2_to_fp8_e4m3` helper VERBATIM (spec section
 /// 9.7 `VCVTBF62HF8`, pseudocode reproduced below). The conversion is **lossless widening** —
 /// every one of the 64 FP6 E3M2 codes is representable in FP8 E4M3, so the map is **exact**:
 /// no rounding, no saturation, no approximation (spec section 9.7.1, `DAZ=0` — subnormals are
@@ -208,7 +208,7 @@ pub(crate) fn fp8_e4m3_to_fp6_e2m3(byte: u8) -> u8 {
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.2]`). The input `code` is read from bits `[5:0]`.
 ///
 /// FP6 E3M2: `sign[5]`, `exp[4:2]` (bias 3), `frac[1:0]`. FP8 E4M3: `sign[7]`, `exp[6:3]`
-/// (bias 7), `frac[2:0]`. Spec section-16.3 pseudocode (load-bearing, transcribed line by
+/// (bias 7), `frac[2:0]`. Spec section-16.4 pseudocode (load-bearing, transcribed line by
 /// line below):
 ///
 /// ```text
@@ -257,7 +257,7 @@ pub(crate) fn fp6_e3m2_to_fp8_e4m3(code: u8) -> u8 {
 
 /// Convert one FP6 E2M3 (HF6) 6-bit code to its single exact FP8 E4M3 (HF8) byte.
 ///
-/// Transcribes the ACE v1 section-16.3 `fp6_e2m3_to_fp8_e4m3` helper VERBATIM (spec section
+/// Transcribes the ACE v1 section-16.4 `fp6_e2m3_to_fp8_e4m3` helper VERBATIM (spec section
 /// 9.7 `VCVTHF62HF8`, pseudocode reproduced below). Lossless widening — every one of the 64
 /// FP6 E2M3 codes is representable in FP8 E4M3, so the map is **exact**: no rounding, no
 /// saturation, no approximation (spec section 9.7.1, `DAZ=0`;
@@ -265,7 +265,7 @@ pub(crate) fn fp6_e3m2_to_fp8_e4m3(code: u8) -> u8 {
 /// `[avx10-v2-aux-ocp-conversions.CVT_FP6_FP8.2]`). The input `code` is read from bits `[5:0]`.
 ///
 /// FP6 E2M3: `sign[5]`, `exp[4:3]` (bias 1), `frac[2:0]`. FP8 E4M3: `sign[7]`, `exp[6:3]`
-/// (bias 7), `frac[2:0]`. Spec section-16.3 pseudocode (load-bearing, transcribed line by
+/// (bias 7), `frac[2:0]`. Spec section-16.4 pseudocode (load-bearing, transcribed line by
 /// line below):
 ///
 /// ```text

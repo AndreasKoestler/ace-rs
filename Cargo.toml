@@ -16,12 +16,17 @@ name = "ace"
 cc = { version = "1", optional = true }
 
 [features]
-# Opt-in native backend (design decision D7): compile the AVX10_V1_AUX C shims with
-# `-mavx10.2` so the primitives can run on real EVEX instructions (under Intel SDE) and be
-# differentially compared to the scalar oracle. (No AVX10_V2_AUX TU exists yet — the
-# group-3 intrinsics are absent from GCC/Clang headers, OQ-5; see src/native.rs.) OFF by
-# default: the default build stays pure stable Rust with no build-script effect and no
-# compiled C — "compiles on stable Rust everywhere, correct on non-x86".
+# Opt-in native backend (design decision D7): compile the AVX10_V1_AUX C shims
+# (src/native/avx10_v1_aux.c, `-mavx10.2`) AND the ACE group-4 tile shims
+# (src/native/ace_tile.c, `-mavx10.2 -mamx-tile -mamx-avx512`) so the primitives can run on
+# real instructions (under Intel SDE) and be differentially compared to the scalar oracle.
+# build.rs probes the flags first and panics with a clear message if the toolchain rejects
+# any of them. Group-4 families A/B-read/C are intrinsic shims that execute under SDE; the
+# ACE-only families are `.byte` raw encodings verified by tests/encoding.rs. (No
+# AVX10_V2_AUX TU exists yet — the group-3 intrinsics are absent from GCC/Clang headers,
+# OQ-5; see src/native.rs.) OFF by default: the default build stays pure stable Rust with
+# no build-script effect and no compiled C — "compiles on stable Rust everywhere, correct
+# on non-x86".
 native = ["dep:cc"]
 
 [dev-dependencies]

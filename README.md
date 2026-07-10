@@ -19,7 +19,7 @@ Tracking the feature groups of the ACE v1 instruction summary (§4):
 | **4.1** | **AVX-VNNI-INT8 and AVX-VNNI-INT16** — VEX-encoded integer multiply-accumulate | ✅ implemented |
 | **4.2** | **AVX10.2 Subset (`AVX10_V1_AUX`)** — FP16↔FP8 conversions and EVEX VNNI forms | ✅ implemented |
 | **4.3** | **OCP Format Conversions (`AVX10_V2_AUX`)** — FP32↔FP8, FP8↔FP4/FP6, utility ops | ✅ implemented |
-| **4.4** | **ACE Tile Instructions (ACE v1)** — tile management, data movement, outer products | ⬜ todo |
+| **4.4** | **ACE Tile Instructions (ACE v1)** — tile management, data movement, outer products | ✅ implemented |
 
 ### 4.1 — AVX-VNNI-INT8 and AVX-VNNI-INT16 ✅
 
@@ -95,7 +95,9 @@ and the EVEX VNNI forms. The scalar oracle is the always-present primary path; a
 `native` cargo feature routes each primitive to a hand-written C shim compiled with
 `-mavx10.2` (there is no stable `core::arch` EVEX intrinsic for these forms yet), taken
 only when `detect::has_avx10_v1_aux()` confirms the running CPU, and differentially tested
-against the oracle under Intel SDE.
+against the oracle under Intel SDE. (The same `native` feature also compiles the group-4
+tile shims, `src/native/ace_tile.c`, which additionally need `-mamx-tile -mamx-avx512` —
+`build.rs` fails fast with a clear message if the toolchain rejects any of those flags.)
 
 - **FP16→FP8 converts:** `VCVTPH2BF8`, `VCVTPH2BF8S`, `VCVTPH2HF8`, `VCVTPH2HF8S`
 - **Two-source FP16→FP8 converts:** `VCVT2PH2BF8`, `VCVT2PH2BF8S`, `VCVT2PH2HF8`, `VCVT2PH2HF8S`
@@ -143,17 +145,40 @@ Where two converts share a target format, the Rust name carries a source-format 
 (`[u8; 32]` for 64 lanes) and FP6 results 6-bit-packed (`[u8; 48]`); `unpackb` is the
 read-back complement of those packed layouts.
 
-### 4.4 — ACE Tile Instructions (ACE v1) ⬜ todo
+### 4.4 — ACE Tile Instructions (ACE v1) ✅
 
-Not yet implemented. Tile management, data movement, and outer-product operations:
+All 25 group-4 tile instructions are implemented with the spec-conformant model: a fixed
+register file of **8 tiles × 16 rows × 64 bytes** (the palette-2 descriptor is byte 0 =
+palette plus 63 reserved-zero bytes), a **single 1024-bit Block Scale register**
+(`bsr0`/SCALEDATA, initialized to `0x7F`), row/column specifiers that mask to bits `[3:0]`
+and never fault, and `TILEMOVCOL` as a **write-only** instruction. Tile + BSR state lives
+in an RAII `TileScope` guard returned by `_tile_loadconfig`, which issues `TILERELEASE` on
+`Drop`. Every instruction ships a scalar oracle (the always-present primary path), a native
+shim behind the opt-in `native` feature (`src/native/ace_tile.c`), and — for the
+`ACE`-only families no assembler knows yet — `.byte` raw encodings golden-checked against
+the spec §6.3 tables by `tests/encoding.rs`.
 
-- **Tile management:** `TILEZERO`, `LDTILECFG`, `STTILECFG`, `TILERELEASE`
-- **Tile data movement:** `TILEMOVROW`, `TILEMOVCOL`
-- **Tile row converts:** `TCVTROWD2PS`, `TCVTROWPS2BF16H`, `TCVTROWPS2BF16L`, `TCVTROWPS2PHH`, `TCVTROWPS2PHL`
-- **Block-scale register ops:** `BSRINIT`, `BSRMOVF`, `BSRMOVH`, `BSRMOVL`
-- **MX outer products:** `TOP4MXBF8PS`, `TOP4MXBHF8PS`, `TOP4MXHBF8PS`, `TOP4MXHF8PS`, `TOP4MXBSSPS`
-- **BF16 outer product:** `TOP2BF16PS`
-- **Byte outer products:** `TOP4BSSD`, `TOP4BSUD`, `TOP4BUSD`, `TOP4BUUD`
+- **Tile management:** `_tile_loadconfig`, `_tile_storeconfig`, `_tile_zero` (plus
+  `TileConfig`, `TileScope`, `TileId`; `TILERELEASE` is `Drop`-only)
+- **Tile data movement:** `_tile_movrow` (read), `_tile_setrow`, `_tile_setcol`
+  (`TILEMOVCOL` is write-only — there is no column read)
+- **Tile row converts:** `_tile_cvtrowd2ps`, `_tile_cvtrowps2bf16h`/`_tile_cvtrowps2bf16l`,
+  `_tile_cvtrowps2phh`/`_tile_cvtrowps2phl`
+- **Block-scale register ops:** `_bsrinit`, `_bsrmovf`, `_bsrmovh`/`_bsrmovh_read`,
+  `_bsrmovl`/`_bsrmovl_read`
+- **MX outer products:** `_tile_top4mxbf8ps`, `_tile_top4mxbhf8ps`, `_tile_top4mxhbf8ps`,
+  `_tile_top4mxhf8ps`, `_tile_top4mxbssps` — each takes an `imm8` scale-group selector
+  (compose with `ace_scale_a`/`ace_scale_b`) and applies the combined E8M0 scale once in
+  the precise domain
+- **BF16 outer product:** `_tile_top2bf16ps`
+- **Byte outer products:** `_tile_top4bssd`, `_tile_top4bsud`, `_tile_top4busd`,
+  `_tile_top4buud`
+
+The public API takes fixed-size arrays (`[u8; 64]`, `[u16; 32]`, …), not `__m512`/`__tile`
+types. Families A / B-read / C (tile config, `TILEMOVROW` read, row converts) are
+intrinsic-reachable and execute under Intel SDE; the `ACE`-only `.byte` families are built
+and encoding-verified, with their SDE differentials wired to go live when SDE gains ACE
+emulation.
 
 ## Test
 
@@ -184,7 +209,7 @@ cargo test --target x86_64-unknown-linux-gnu
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 
 - **`test`** (x86_64 Linux) — `fmt --check`, `clippy -D warnings`, `build`, `test`. Always runs; gates merges. Scalar-only on the runner; native execution is proven by `native-sde`.
-- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. It also builds with `--features native`, which compiles the `AVX10_V1_AUX` C shims and exercises the group-2 (families A–G) native-vs-oracle differentials under SDE; the group-3 differentials discard for now because group 3 is oracle-only (OQ-5, no C shims exist). Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
+- **`native-sde`** — executes the real group-1 instructions (both the `VPDPB*` byte ops and the `VPDPW*` word ops) under Intel SDE with `ACE_REQUIRE_NATIVE=1`, so both feature families must fire natively or the job goes red. It also builds with `--features native`, which compiles the `AVX10_V1_AUX` C shims (`-mavx10.2`) **and** the ACE tile shims (`src/native/ace_tile.c`, `-mavx10.2 -mamx-tile -mamx-avx512` — `build.rs` fails fast if the toolchain rejects those flags) and exercises the group-2 (families A–G) native-vs-oracle differentials under SDE. Group-4 families A / B-read / C (tile config, `TILEMOVROW` read, row converts) execute natively under SDE too; the `ACE`-only `.byte` families build and are encoding-verified but their execution differentials discard until SDE gains ACE emulation. The group-3 differentials discard for now because group 3 is oracle-only (OQ-5, no C shims exist). Runs on push-to-main and `workflow_dispatch` (skipped on PRs). Skipped until the repo variable / `SDE_URL` (the SDE Linux tarball URL) is set, since SDE's download is version-rotated and license-gated; see the workflow comments.
 
 ### Resolved open questions
 
@@ -201,7 +226,7 @@ cargo test --target x86_64-unknown-linux-gnu
 | 0 ✅ | `dpbssd` + `dpbssds`/`dpbsud`/`dpbsuds`/`dpbuud`/`dpbuuds` (AVX-VNNI-INT8) and `dpwsud`/`dpwsuds`/`dpwusd`/`dpwusds`/`dpwuud`/`dpwuuds` (AVX-VNNI-INT16) | 4.1 (AVX-VNNI-INT8/16) |
 | 1 ✅ | FP16↔FP8 converts + EVEX VNNI (26 `AVX10_V1_AUX` primitives) | 4.2 (AVX10.2 subset, `AVX10_V1_AUX`) |
 | 2 ✅ | OCP format converts (21 `AVX10_V2_AUX` primitives, oracle-only per OQ-5) | 4.3 (OCP conversions, `AVX10_V2_AUX`) |
-| 3 | `TOP2BF16PS` (BF16 rank-2 outer product) | 4.4 (ACE tile) — gated, see design §7 |
+| 3 ✅ | ACE tile instructions — the whole group 4 (25 primitives): tile lifecycle + `TileScope` RAII guard, tile moves, row converts, Block Scale register ops, and all `TOP*` outer products, with §6.3-verified `.byte` encodings | 4.4 (ACE tile) |
 
 ## Contributing
 

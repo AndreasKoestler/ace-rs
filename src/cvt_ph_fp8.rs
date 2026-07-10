@@ -74,7 +74,7 @@ unsafe fn cvtph_bf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtph_bf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_bf8`] in non-saturating mode. Carries no
+/// Maps each FP16 lane through `fp8::fp16_to_bf8` in non-saturating mode. Carries no
 /// cfg gate and reads no global state. `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtph_bf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_bf8(a[i], false))
@@ -112,7 +112,7 @@ unsafe fn cvtphs_bf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtphs_bf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_bf8`] in saturating mode (overflow clamps
+/// Maps each FP16 lane through `fp8::fp16_to_bf8` in saturating mode (overflow clamps
 /// to +/-57344). `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtphs_bf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_bf8(a[i], true))
@@ -150,7 +150,7 @@ unsafe fn cvtph_hf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtph_hf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_hf8`] in non-saturating mode.
+/// Maps each FP16 lane through `fp8::fp16_to_hf8` in non-saturating mode.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtph_hf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_hf8(a[i], false))
@@ -188,7 +188,7 @@ unsafe fn cvtphs_hf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtphs_hf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_hf8`] in saturating mode (overflow clamps
+/// Maps each FP16 lane through `fp8::fp16_to_hf8` in saturating mode (overflow clamps
 /// to +/-448). `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtphs_hf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_hf8(a[i], true))

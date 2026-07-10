@@ -39,8 +39,11 @@ use crate::fp8;
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT2_PS2PHX.1-3]`).
 ///
 /// Dispatches to the native path under `AVX10_V1_AUX` (C shim, opt-in `native` feature) and otherwise to
-/// [`cvt2ps_phx_scalar`]; both return identical FP16 bit patterns.
-/// `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.1]`
+/// [`cvt2ps_phx_scalar`]. The two paths return identical FP16 bit patterns under the default
+/// MXCSR state (RNE rounding, DAZ=0) and up to NaN payloads — the spec does not fix the
+/// FP32→FP16 NaN payload, so a NaN input may quieten to a different payload natively than in
+/// the oracle (this file's differential proptest compares NaN lanes as "both NaN", not
+/// bit-for-bit). `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.1]`
 pub fn cvt2ps_phx(src1: [f32; 16], src2: [f32; 16]) -> [u16; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
@@ -55,9 +58,10 @@ pub fn cvt2ps_phx(src1: [f32; 16], src2: [f32; 16]) -> [u16; 32] {
 }
 
 /// Native path: EVEX `VCVT2PS2PHX` via the `ace_native_cvt2ps_phx` C shim (low=src2,
-/// high=src1). The shim uses `_MM_FROUND_CUR_DIRECTION`, i.e. the MXCSR rounding mode; the
-/// oracle fixes the canonical default RNE / DAZ=0 / FTZ=0 contract (OQ-6), which is the MXCSR
-/// state at process start, so the differential is well-defined without touching MXCSR.
+/// high=src1). The shim calls `_mm512_cvtx2ps_ph(a, b)` with no rounding argument, so the
+/// instruction rounds per the current MXCSR mode; the oracle fixes the canonical default
+/// RNE / DAZ=0 / FTZ=0 contract (OQ-6), which is the MXCSR state at process start, so the
+/// differential is well-defined without touching MXCSR.
 ///
 /// # Safety
 /// The CPU must support `AVX10_V1_AUX`; callers go through [`cvt2ps_phx`], which checks it.
@@ -71,7 +75,7 @@ unsafe fn cvt2ps_phx_hw(src1: [f32; 16], src2: [f32; 16]) -> [u16; 32] {
 /// Portable reference oracle for [`cvt2ps_phx`] — the primary always-correct path.
 ///
 /// Output lanes `[0..16)` convert the `src2` lanes and lanes `[16..32)` convert the `src1`
-/// lanes (low=src2 / high=src1, spec section 8.3.5), each through [`fp8::fp32_to_fp16_rne`]
+/// lanes (low=src2 / high=src1, spec section 8.3.5), each through `fp8::fp32_to_fp16_rne`
 /// under the canonical default-RNE / DAZ=0 / FTZ=0 contract (OQ-6). Carries no cfg gate and
 /// reads no global state. `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT2_PS2PHX.1-3]`

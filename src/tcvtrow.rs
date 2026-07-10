@@ -8,17 +8,17 @@
 //!   (RNE) (spec section 12.4) (`[ace-tile-instructions.TCVTROW.1]`).
 //! * `TCVTROWPS2BF16H` / `TCVTROWPS2BF16L` — [`_tile_cvtrowps2bf16h`] /
 //!   [`_tile_cvtrowps2bf16l`] convert a tile row of `FP32` elements to `BF16` (via
-//!   [`fp32_to_bf16_rne`], the section-16.1 `fp32_to_bfloat16` helper) into the high / low
+//!   `fp32_to_bf16_rne`, the section-16.1 `fp32_to_bfloat16` helper) into the high / low
 //!   word of each dword (spec section 12.5) (`[ace-tile-instructions.TCVTROW.2]`,
 //!   `[ace-tile-instructions.TCVTROW.3]`).
 //! * `TCVTROWPS2PHH` / `TCVTROWPS2PHL` — [`_tile_cvtrowps2phh`] / [`_tile_cvtrowps2phl`]
-//!   convert a tile row of `FP32` elements to `FP16` (via [`fp32_to_fp16_rne`]) into the
+//!   convert a tile row of `FP32` elements to `FP16` (via `fp32_to_fp16_rne`) into the
 //!   high / low word of each dword (spec section 12.6)
 //!   (`[ace-tile-instructions.TCVTROW.4]`, `[ace-tile-instructions.TCVTROW.5]`).
 //!
 //! # Index semantics (spec section 12.1.1)
 //!
-//! `row = specifier & 0xF`: only bits [3:0] of the immediate/GPR row specifier are
+//! `row = specifier & 0xF`: only bits `[3:0]` of the immediate/GPR row specifier are
 //! relevant, an out-of-range specifier raises NO fault, and every specifier addresses a
 //! valid row of the fixed 16-row tile — these converts are total.
 //!
@@ -35,7 +35,7 @@
 //! All three converts round RTNE as if `MXCSR.RC=RNE`; MXCSR is neither consulted nor
 //! updated and no FP exceptions are generated. For the BF16 forms "DAZ is not obeyed and
 //! is always assumed DAZ=1; FTZ is not obeyed and is always assumed FTZ=1" — FP32 denormal
-//! inputs produce BF16 zero, which [`fp32_to_bf16_rne`]'s leading denormal flush
+//! inputs produce BF16 zero, which `fp32_to_bf16_rne`'s leading denormal flush
 //! implements. For the FP16 forms, input FP32 denormals result in FP16 zero output (an
 //! FP32 denormal is below 2^-126, far under FP16's 2^-24 minimum subnormal, so RNE rounds
 //! it to signed zero without an explicit flush) while FP16 denormal OUTPUTS are permitted.
@@ -45,7 +45,7 @@
 //!
 //! Each convert is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary
 //! path, correct on every target). Per the section-15.3 feature enumeration the family-C
-//! converts gate on `AMX-AVX512 || ACE_VSN >= 1` ([`detect::has_amx_avx512`],
+//! converts gate on `AMX-AVX512 || ACE_VSN >= 1` (`detect::has_amx_avx512`,
 //! `[ace-tile-instructions.DETECT.1-2]`, `[ace-tile-instructions.DISPATCH.1]`). The
 //! register model lives in Rust, so the dispatchers reference the detector to mark the
 //! gate site and take the scalar oracle.
@@ -102,11 +102,7 @@ pub fn _tile_cvtrowd2ps(scope: &TileScope, src: TileId, row: u32) -> [f32; ROW_F
 
 /// Portable `TCVTROWD2PS` oracle — the section-12.4.4 pseudocode: each dword converted
 /// `INT32 -> FP32` under RNE (`i32 as f32` is exactly that conversion).
-pub fn _tile_cvtrowd2ps_scalar(
-    scope: &TileScope,
-    src: TileId,
-    row: u32,
-) -> [f32; ROW_FP32_LANES] {
+pub fn _tile_cvtrowd2ps_scalar(scope: &TileScope, src: TileId, row: u32) -> [f32; ROW_FP32_LANES] {
     let dwords = read_row_dwords(scope, src, row);
     core::array::from_fn(|i| dwords[i] as i32 as f32)
 }
@@ -116,7 +112,7 @@ pub fn _tile_cvtrowd2ps_scalar(
 // ---------------------------------------------------------------------------------------------
 
 /// `TCVTROWPS2BF16H` (spec section 12.5): convert row `row & 0xF` of tile `src` from
-/// `FP32` to `BF16` (RNE, DAZ=1/FTZ=1 via [`fp32_to_bf16_rne`]) into the HIGH word of each
+/// `FP32` to `BF16` (RNE, DAZ=1/FTZ=1 via `fp32_to_bf16_rne`) into the HIGH word of each
 /// dword; the low words are zeroed (`[ace-tile-instructions.TCVTROW.2]`). Gates as
 /// [`_tile_cvtrowd2ps`].
 pub fn _tile_cvtrowps2bf16h(scope: &TileScope, src: TileId, row: u32) -> [u16; ZMM_WORD_LANES] {
@@ -158,7 +154,7 @@ pub fn _tile_cvtrowps2bf16l_scalar(
 // ---------------------------------------------------------------------------------------------
 
 /// `TCVTROWPS2PHH` (spec section 12.6): convert row `row & 0xF` of tile `src` from `FP32`
-/// to `FP16` (RNE via [`fp32_to_fp16_rne`]; input FP32 denormals produce FP16 zero, FP16
+/// to `FP16` (RNE via `fp32_to_fp16_rne`; input FP32 denormals produce FP16 zero, FP16
 /// denormal outputs are permitted) into the HIGH word of each dword; the low words are
 /// zeroed (`[ace-tile-instructions.TCVTROW.4]`). Gates as [`_tile_cvtrowd2ps`].
 pub fn _tile_cvtrowps2phh(scope: &TileScope, src: TileId, row: u32) -> [u16; ZMM_WORD_LANES] {
@@ -198,7 +194,7 @@ pub fn _tile_cvtrowps2phl_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::{TileConfig, _tile_loadconfig};
+    use crate::tile::{_tile_loadconfig, TileConfig};
 
     /// Build a scope whose tile 0 row 2 holds the given 16 dwords.
     fn scope_with_row2(dwords: [u32; 16]) -> (TileScope, TileId) {
