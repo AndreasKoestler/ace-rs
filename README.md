@@ -180,6 +180,30 @@ intrinsic-reachable and execute under Intel SDE; the `ACE`-only `.byte` families
 and encoding-verified, with their SDE differentials wired to go live when SDE gains ACE
 emulation.
 
+## Examples
+
+Five self-contained demos in [`examples/`](./examples), each built from the public API,
+each asserting its dispatcher outputs against the `*_scalar` oracle twins, and each
+runnable everywhere (scalar path) or under Intel SDE (native path where SDE emulates the
+feature):
+
+| Example | Group | Shows |
+|---------|-------|-------|
+| `int8_gemv` | 4.1 | Quantized linear layer via `dpbssd`, plus wrap-vs-saturate (`dpbssds`) |
+| `int8_image_filter` | 4.1 | 4-tap image blur/edge-detect via `dpbuud`/`dpbsud`, ASCII render |
+| `fp8_quant_error` | 4.3 | E4M3 vs E5M2 round-trip error, range/overflow, why scaling decides the winner |
+| `fp4_compress` | 4.3 | 8× weight compression to nibble-packed FP4, `unpackb` read-back |
+| `mx_matmul` | 4.4 | MX block-scaled matmul: `TileScope`, BSR scales, `_tile_top4mxbf8ps` |
+
+```sh
+cargo run --example int8_gemv
+# native VNNI path under SDE (group 4.1 examples report "native path: yes"):
+sde64 -future -- target/debug/examples/int8_gemv
+```
+
+The group-4.3 examples are oracle-only everywhere today (OQ-5); `mx_matmul` runs the
+scalar tile model everywhere until SDE gains ACE emulation.
+
 ## Test
 
 ```sh
