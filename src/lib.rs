@@ -80,16 +80,21 @@
 //! **Iteration 3 — `ACE` group-4 tile instructions, same tripwire posture.** The 25 group-4
 //! tile instructions (families A–G) follow the identical `ACE_REQUIRE_NATIVE` posture. Their
 //! native backend is the opt-in `native` C-shim / `.byte` path (design D7, OQ-6): families A /
-//! B-read / C are intrinsic-reachable and execute under Intel SDE, while the `ACE`-only forms
-//! (family B write, D, E, F, G) are `.byte` raw encodings that are BUILT but not executed until
-//! SDE gains ACE emulation (R2). The hard `ACE_REQUIRE_NATIVE` guard therefore stays **dormant**
+//! B-read / C are intrinsic-reachable (their instructions exist under Intel SDE), but every
+//! group-4 shim first loads the palette-2 (ACE) tile descriptor, and `LDTILECFG` `#GP`s on a
+//! palette-1-only plain-AMX host — which SDE's `-future` model is — so even those
+//! differentials discard (gated `detect::has_palette2()`) until an ACE-capable host runs
+//! them. The `ACE`-only forms (family B write, D, E, F, G) are `.byte` raw encodings that are
+//! BUILT but not executed until SDE gains ACE emulation (R2). The hard `ACE_REQUIRE_NATIVE`
+//! guard therefore stays **dormant**
 //! for group 4 exactly as it does for the AVX10 C-shim families — the group-4-scoped
 //! `ace_tile_native_runs_when_required` test presence-checks the variable and records the
 //! per-family tile detection status rather than vacuously asserting a native branch that cannot
 //! yet run. Each family ships a live `prop_native_matches_oracle` differential (in its
 //! `differential` module) that compares the C / `.byte` native path to the scalar oracle
 //! bit-for-bit under `feature="native"` + the per-family `detect::has_amx_tile()` /
-//! `has_amx_avx512()` / `has_ace()` gate and calls `TestResult::discard()` — never
+//! `has_amx_avx512()` / `has_ace()` gate (plus `has_palette2()` for the palette-2 config
+//! load, see above) and calls `TestResult::discard()` — never
 //! `from_bool(false)` — when the feature or hardware is absent, so a fallback-only runner can
 //! never go vacuously green ([ace-tile-instructions.TESTING.1], [ace-tile-instructions.TESTING.2]).
 //! The layer-2 `tests/encoding.rs` harness golden-checks every `.byte` encoding with no external

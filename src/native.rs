@@ -463,9 +463,15 @@ mx_top_hw!(top4mxbssps_hw, ace_tile_top4mxbssps);
 // ================================ Differential layer (group 4) ================================
 //
 // Native-vs-oracle differentials for the group-4 shims: each property gates on the matching
-// capability probe and DISCARDS (never passes vacuously) when the host lacks it. Families
-// A / B-read / C execute under Intel SDE today; the `.byte` families light up automatically
-// once an ACE-capable SDE/hardware host runs them.
+// capability probe and DISCARDS (never passes vacuously) when the host lacks it. EVERY
+// property here also requires `detect::has_palette2()`: all the shims start by loading the
+// palette-2 (ACE) descriptor, and `LDTILECFG` #GPs on a host whose tile file only
+// enumerates palette 1 — which is every plain-AMX host including Intel SDE's `-future`
+// model (empirically: `#GP XCR0 unsupported palette_id: 2`, SDE 10.8). So although the
+// family-A/B-read/C *instructions* are intrinsic-reachable and exist under SDE, none of
+// these differentials can execute until an ACE-capable (palette-2) SDE/hardware host runs
+// them; they all discard today. (`has_ace()` implies the palette-2 enumeration, so the
+// `.byte`-family property needs no extra gate.)
 #[cfg(test)]
 mod differential {
     use super::*;
@@ -478,11 +484,13 @@ mod differential {
         /// oracle's stored descriptor (byte 0 = 2, bytes 1-63 = 0, spec section 11.3.4), and
         /// native TILEZERO equals the oracle over one marshalled row.
         fn prop_family_a_matches_oracle(seed: Vec<u8>) -> TestResult {
-            if !detect::has_amx_tile() {
+            if !detect::has_amx_tile() || !detect::has_palette2() {
                 return TestResult::discard();
             }
             let cfg = encode_tilecfg(2);
-            // SAFETY: has_amx_tile() confirmed AMX-TILE + XCR0[18:17] + XFD permission.
+            // SAFETY: has_amx_tile() confirmed AMX-TILE + XCR0[18:17] + XFD permission, and
+            // has_palette2() confirmed LDTILECFG accepts the palette-2 descriptor (#GP
+            // otherwise, e.g. under SDE's plain-AMX palette-1-only models).
             let got = unsafe { tile_cfg_roundtrip_hw(&cfg) };
             let scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
             let want = crate::tile::_tile_storeconfig(&scope).to_bytes();
@@ -502,7 +510,7 @@ mod differential {
         /// Families B-read / C: native TILEMOVROW / TCVTROW* over a one-row tile equal the
         /// oracle for the same row data.
         fn prop_row_converts_match_oracle(seed: Vec<u8>, row_sel: u8) -> TestResult {
-            if !detect::has_amx_avx512() {
+            if !detect::has_amx_avx512() || !detect::has_palette2() {
                 return TestResult::discard();
             }
             let cfg = encode_tilecfg(2);
@@ -519,7 +527,8 @@ mod differential {
             if row_sel != 0 {
                 return TestResult::discard();
             }
-            // SAFETY: has_amx_avx512() confirmed the family-C capability set.
+            // SAFETY: has_amx_avx512() confirmed the family-C capability set and
+            // has_palette2() confirmed LDTILECFG accepts the palette-2 descriptor.
             unsafe {
                 let mv = tile_movrow_read_hw(&cfg, &row, 0);
                 let d2 = tcvtrowd2ps_hw(&cfg, &row, 0);

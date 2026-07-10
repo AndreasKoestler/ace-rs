@@ -102,34 +102,52 @@ jobs:
           echo "$HOME/sde" >> "$GITHUB_PATH"
       - name: Verify SDE is runnable
         run: sde64 --version
-      - name: Ensure an AVX10.2 + AMX-tile-capable C compiler (for the `native` feature)
+      - name: Ensure an AVX10.2 + AMX-tile-capable C toolchain (for the `native` feature)
         # The opt-in `native` feature compiles `src/native/avx10_v1_aux.c` with
         # `-mavx10.2` and `src/native/ace_tile.c` with `-mavx10.2 -mamx-tile
         # -mamx-avx512` (design decision D7 / OQ-6), which the `cc` crate drives
         # via $CC. The ACE group-4 tile shims use real AMX-TILE + AMX-AVX512
         # intrinsics for families A/B-read/C and `.byte` raw encodings for the
         # ACE-only rest, so the compiler must know all three ISA flags.
-        # These require GCC >= 15 or Clang >= 20. Probe the runner's default
-        # toolchains; fall back to an explicit gcc-15 install. Fail fast with an
-        # actionable message if none is available, rather than emitting a
-        # confusing mid-build cc error.
+        #
+        # The probe compiles the REAL native TUs, not an empty main with the
+        # flags: accepting `-mavx10.2` is not enough. The whole pipeline has to
+        # work — compiler flags, intrinsic headers, AND the assembler. GCC emits
+        # textual asm and drives the system `as`, and binutils < 2.44 (noble
+        # ships 2.42) rejects the AVX10.2 mnemonics ("no such instruction:
+        # `vcvtph2bf8`"), so a flag-only probe of gcc-15 passes and the real
+        # build then dies mid-`cc`. Clang >= 20 needs no new binutils — its
+        # integrated assembler encodes the instructions itself — which is why
+        # the fallback installs clang from apt.llvm.org rather than gcc-15 from
+        # the toolchain PPA. Requirements: clang >= 20, or gcc >= 15 with
+        # binutils >= 2.44.
         run: |
           set -euo pipefail
-          probe() { printf '#include <immintrin.h>\nint main(){return 0;}\n' | "$1" -mavx10.2 -mamx-tile -mamx-avx512 -x c -c - -o /dev/null 2>/dev/null; }
-          if probe gcc; then echo "CC=gcc" >> "$GITHUB_ENV"
-          elif probe clang; then echo "CC=clang" >> "$GITHUB_ENV"
+          probe() {
+            "$1" -mavx10.2 -mamx-tile -mamx-avx512 -O2 -c src/native/avx10_v1_aux.c -o /dev/null \
+              && "$1" -mavx10.2 -mamx-tile -mamx-avx512 -O2 -c src/native/ace_tile.c -o /dev/null
+          }
+          if probe gcc 2>/dev/null; then echo "CC=gcc" >> "$GITHUB_ENV"
+          elif probe clang 2>/dev/null; then echo "CC=clang" >> "$GITHUB_ENV"
           else
-            # ubuntu-latest is 24.04 (noble); gcc-15 is NOT in the default repos,
-            # so pull it from the ubuntu-toolchain-r/test PPA (has gcc-15 for noble).
-            # Guard each step so a repo/apt failure surfaces the actionable error
-            # below instead of dying silently under `set -e`.
-            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test \
-              && sudo apt-get update \
-              && sudo apt-get install -y gcc-15 \
-              || echo "::warning::gcc-15 install from ubuntu-toolchain-r/test failed"
-            probe gcc-15 || { echo "::error::No AVX10.2 + AMX-tile-capable C compiler (need GCC >= 15 or Clang >= 20) — cannot build the native feature"; exit 1; }
-            echo "CC=gcc-15" >> "$GITHUB_ENV"
+            # ubuntu-latest is 24.04 (noble): default gcc-13/clang-18 don't know
+            # AVX10.2 at all. Install clang from apt.llvm.org (llvm.sh). Try 20
+            # first (the documented minimum), then 21 in case 20's headers
+            # predate an intrinsic this crate uses. Guard each install so an
+            # apt/network failure surfaces the actionable error below instead
+            # of dying silently under `set -e`.
+            found=""
+            wget -qO llvm.sh https://apt.llvm.org/llvm.sh \
+              || echo "::warning::download of apt.llvm.org/llvm.sh failed"
+            for v in 20 21; do
+              sudo bash llvm.sh "$v" || { echo "::warning::clang-$v install from apt.llvm.org failed"; continue; }
+              # Probe loudly: a failure here prints the real compile/assemble error.
+              if probe "clang-$v"; then found="clang-$v"; break; fi
+            done
+            [ -n "$found" ] || { echo "::error::No AVX10.2 + AMX-tile-capable C toolchain (need clang >= 20, or gcc >= 15 with binutils >= 2.44) — cannot build the native feature"; exit 1; }
+            echo "CC=$found" >> "$GITHUB_ENV"
           fi
+          echo "Selected CC: $(grep '^CC=' "$GITHUB_ENV" | tail -1)"
       - name: Run tests with the native paths executed under SDE
         env:
           # Force the differential + guard tests to require the native branch.
@@ -151,13 +169,17 @@ jobs:
         # either way). The group-3 (AVX10_V2_AUX) differentials DISCARD for now
         # (intrinsics absent from current GCC/Clang headers, OQ-5).
         #
-        # ACE group 4 (iteration 3, OQ-6): the intrinsic families A / B-read / C
-        # (tile config lifecycle, tile->ZMM read moves, tile-row converts) EXECUTE
-        # under SDE, so their `prop_native_matches_oracle` differentials light up
-        # here; the `ACE`-only families (B write, D, E, F, G) are `.byte` raw
-        # encodings that are BUILT + encoding-asserted (`tests/encoding.rs`) but
-        # not executed — SDE 10.8 has no ACE emulation yet (R2), so their
-        # differentials DISCARD until a `sde64` ACE probe passes. The
+        # ACE group 4 (iteration 3, OQ-6): ALL group-4 differentials DISCARD under
+        # SDE for now. The intrinsic families A / B-read / C (tile config
+        # lifecycle, tile->ZMM read moves, tile-row converts) have instructions
+        # SDE can execute, but every group-4 shim first loads the palette-2 (ACE)
+        # tile descriptor and `-future`'s plain-AMX tile file is palette-1-only:
+        # LDTILECFG #GPs ("#GP XCR0 unsupported palette_id: 2", observed on SDE
+        # 10.8), so those differentials gate on `detect::has_palette2()` and
+        # discard here. The `ACE`-only families (B write, D, E, F, G) are `.byte`
+        # raw encodings that are BUILT + encoding-asserted (`tests/encoding.rs`)
+        # but not executed — SDE 10.8 has no ACE emulation (R2). All of group 4
+        # lights up once an ACE-capable (palette-2) SDE/hardware host runs. The
         # `ace_tile_native_runs_when_required` guard stays dormant for them
         # (documented, non-vacuous), exactly as the AVX10 C-shim families' guard
         # does. The core `test` gate above still covers the default oracle-only

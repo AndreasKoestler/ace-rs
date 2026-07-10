@@ -337,16 +337,25 @@ pub(crate) fn fp16_to_hf8(bits: u16, saturating: bool) -> u8 {
     fp16_to_fp8(&HF8, bits, saturating)
 }
 
-/// Convert one FP16 lane (raw bits) to one BF8 (E5M2) byte using bias ("SR") rounding,
-/// transcribing the ACE v1 spec section 16.2 `fp16_to_fp8_e5m2` SR branches directly.
+/// Convert one FP16 lane (raw bits) to one BF8 (E5M2) byte using bias ("SR") rounding —
+/// the spec section 16.2 `fp16_to_fp8_e5m2` SR path, with the bias applied
+/// **window-aligned**: added into the 8 bits directly below the destination lsb after the
+/// value is aligned to the output format's grid, then TRUNCATED (no rounding in the SR
+/// path). Verified bit-exact against `VCVTBIASPH2BF8` under Intel SDE (the previous
+/// fixed-position reading — bias at the lsb of the *normalized* FP16 mantissa — diverged
+/// from hardware one lsb on subnormal-result and carry-boundary lanes).
 ///
 /// `bias` is the 8-bit bias rounding term for this lane — per spec section 8.4.5 the byte
-/// `src1.byte[2 * i]` (the low byte of the i-th `u16` of the bias operand). Per section 16.2
-/// it is added at the lsb of the (normalized) 10-bit FP16 mantissa with no shift for the
-/// E5M2 target, the carry propagates into the exponent, and the biased mantissa is then
-/// TRUNCATED (no rounding in the SR path). FP16 subnormal inputs are normalized first, then
-/// biased/truncated over the widened subnormal window. `bias == 0` therefore truncates (it
-/// is NOT [`fp16_to_bf8`]'s RTNE). Overflow: `S.11111.00` when non-saturating, clamp to
+/// `src1.byte[2 * i]` (the low byte of the i-th `u16` of the bias operand).
+///
+/// E5M2 shares FP16's exponent geometry (same width, same bias), so the whole finite-case
+/// conversion collapses to one integer addition on the FP16 magnitude bit pattern: the top
+/// 8 magnitude bits of `bits + bias` ARE the E5M2 encoding. That single add is exactly the
+/// window-aligned semantics — the low 8 FP16 mantissa bits sit directly below the E5M2 lsb
+/// in every binade (subnormals included, the encoding being a monotone integer map), and a
+/// mantissa carry rolls into the exponent field natively. `bias == 0` therefore truncates
+/// (it is NOT [`fp16_to_bf8`]'s RTNE). Overflow — the sum reaching or passing the exponent
+/// field's all-ones encoding — gives `S.11111.00` when non-saturating and clamps to
 /// +/-57344 when saturating.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
@@ -355,88 +364,54 @@ pub(crate) fn fp16_to_bf8_biased(bits: u16, bias: u8, saturating: bool) -> u8 {
     let e_i = ((bits >> 10) & 0x1f) as i32;
     let m_i = (bits & 0x3ff) as u32;
 
-    let (e_o, m_o): (i32, u32) = if e_i == 0x1f {
-        // Inf or NaN (same for all rounding modes).
-        if m_i == 0 {
+    if e_i == 0x1f {
+        // Inf or NaN (same for all rounding modes; the bias is not applied).
+        let enc: u32 = if m_i == 0 {
             if saturating {
-                (0x1e, 0x3) // Inf -> clamp to max_normal
+                (0x1e << 2) | 0x3 // Inf -> clamp to max_normal
             } else {
-                (0x1f, 0x0) // Inf -> overflow encoding
+                0x1f << 2 // Inf -> overflow encoding S.11111.00
             }
         } else {
-            (0x1f, 0x2 | ((m_i >> 8) & 0x1)) // NaN -> preserve payload bit
-        }
-    } else if e_i == 0x00 {
-        if m_i == 0 {
-            (0, 0)
-        } else {
-            // FP16 subnormal: normalize, then add the bias at the lsb of the normalized
-            // 10-bit mantissa and truncate over the widened subnormal window.
-            let mut mant = m_i;
-            let mut exp_unbiased = -14i32;
-            while mant & 0x400 == 0 {
-                mant <<= 1;
-                exp_unbiased -= 1;
-            }
-            let m_n = mant & 0x3ff;
-            let e_n = exp_unbiased + 15; // virtual FP16-normal exponent field
-            let mut e_b = e_n;
-            let mut m_b = m_n + (bias as u32 & 0xff);
-            if m_b & 0xfc00 != 0 {
-                e_b += 1; // carry out of the 10-bit mantissa
-            }
-            m_b &= 0x3ff;
-            if e_b >= 0x1f {
-                if saturating {
-                    (0x1e, 0x3)
-                } else {
-                    (0x1f, 0x0)
-                }
-            } else if e_b <= 0 {
-                let mut m_o = 0u32;
-                if (9 - e_b) <= 11 {
-                    let mant_u = m_b | 0x400;
-                    let shift = 9 - e_b;
-                    m_o = mant_u >> shift; // truncate; no rounding in SR path
-                }
-                (0, m_o)
-            } else {
-                (e_b, m_b >> 8)
-            }
-        }
-    } else {
-        // FP16 normal: add the bias to the 10-bit mantissa, truncate.
-        let mut e_b = e_i;
-        let mut m_b = m_i + (bias as u32 & 0xff);
-        if m_b & 0xfc00 != 0 {
-            e_b += 1;
-        }
-        m_b &= 0x3ff;
-        if e_b >= 0x1f {
-            if saturating {
-                (0x1e, 0x3)
-            } else {
-                (0x1f, 0x0)
-            }
-        } else {
-            (e_b, m_b >> 8) // truncate to 2-bit mantissa
-        }
-    };
+            (0x1f << 2) | 0x2 | ((m_i >> 8) & 0x1) // NaN -> preserve payload bit
+        };
+        return ((s_i << 7) | enc) as u8;
+    }
 
-    ((s_i << 7) | ((e_o as u32 & 0x1f) << 2) | (m_o & 0x3)) as u8
+    // Finite: one integer add on the magnitude bits, truncate to the top 8 (see above).
+    let t = (bits as u32 & 0x7fff) + bias as u32;
+    let mut enc = t >> 8;
+    if enc >= 0x7c {
+        // Sum reached the all-ones exponent field: overflow encoding / saturate.
+        enc = if saturating { 0x7b } else { 0x7c };
+    }
+    ((s_i << 7) | enc) as u8
 }
 
-/// Convert one FP16 lane (raw bits) to one HF8 (E4M3) byte using bias ("SR") rounding,
-/// transcribing the ACE v1 spec section 16.2 `fp16_to_fp8_e4m3` SR branches directly.
+/// Convert one FP16 lane (raw bits) to one HF8 (E4M3) byte using bias ("SR") rounding —
+/// the spec section 16.2 `fp16_to_fp8_e4m3` SR path, with the bias applied
+/// **window-aligned** exactly as in [`fp16_to_bf8_biased`]: the value is first aligned to
+/// the output format's grid (the binade the unbiased value falls in, or the E4M3 subnormal
+/// grid), the 8-bit bias is added into the 8 bits directly below the destination lsb, and
+/// the sum is TRUNCATED (no rounding in the SR path). Verified bit-exact against
+/// `VCVTBIASPH2HF8` under Intel SDE (the previous fixed-position reading — `bias >> 1` at
+/// the lsb of the FP16 mantissa — diverged from hardware one lsb on subnormal-result
+/// lanes, and wrongly flushed deep-subnormal results that a large bias rounds up to the
+/// E4M3 minimum subnormal).
 ///
 /// `bias` is the 8-bit bias rounding term for this lane — per spec section 8.4.5 the byte
-/// `src1.byte[2 * i]`. Per section 16.2 the E4M3 target discards one fewer bit than E5M2,
-/// so the bias is applied shifted right by 1 (`(bias & 0xFF) >> 1`) at the lsb of the 10-bit
-/// FP16 mantissa, with carry into the exponent, then TRUNCATED. Every FP16 subnormal input
-/// flushes to signed zero (all are below the E4M3 minimum) — in SR mode too. `bias == 0`
-/// therefore truncates (it is NOT [`fp16_to_hf8`]'s RTNE). Overflow: NaN `S.1111.111` when
-/// non-saturating, clamp to +/-448 when saturating; a saturating in-binade truncation into
-/// the NaN slot clamps to max_normal.
+/// `src1.byte[2 * i]`.
+///
+/// Unlike E5M2, E4M3's exponent geometry differs from FP16's, so the alignment is
+/// explicit. In a normal output binade FP16 supplies 7 fraction bits below the E4M3 lsb;
+/// the bias is added one bit above their bottom (`frac8 = low7 << 1`) so its full 8-bit
+/// range spans exactly one output lsb. In the subnormal window the significand is shifted
+/// onto the fixed `2^-9` grid (keeping 8 fraction bits, truncating below) before the add —
+/// so FP16 subnormal inputs do NOT unconditionally flush: the bias can carry them up to
+/// the E4M3 minimum subnormal. A carry across a binade boundary is handled natively by the
+/// encoding being a monotone integer map. `bias == 0` therefore truncates (it is NOT
+/// [`fp16_to_hf8`]'s RTNE). Overflow — the sum reaching or passing the NaN slot
+/// `S.1111.111` — gives NaN when non-saturating, clamp to +/-448 when saturating.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
 pub(crate) fn fp16_to_hf8_biased(bits: u16, bias: u8, saturating: bool) -> u8 {
@@ -444,47 +419,36 @@ pub(crate) fn fp16_to_hf8_biased(bits: u16, bias: u8, saturating: bool) -> u8 {
     let e_i = ((bits >> 10) & 0x1f) as i32;
     let m_i = (bits & 0x3ff) as u32;
 
-    let (e_o, m_o): (i32, u32) = if e_i == 0x1f {
+    if e_i == 0x1f {
         // Inf or NaN -> NaN (E4M3 has no Inf); saturating Inf clamps to max_normal.
-        if saturating && m_i == 0 {
-            (0xf, 0x6)
-        } else {
-            (0xf, 0x7)
-        }
-    } else if e_i == 0x00 {
-        // Zero or FP16 subnormal -> zero (FP16 subnormals are all below the E4M3 minimum).
-        (0, 0)
-    } else {
-        // FP16 normal: add the shifted bias to the mantissa, truncate.
-        let mut e_b = e_i;
-        let mut m_b = m_i + ((bias as u32 & 0xff) >> 1);
-        if m_b & 0xfc00 != 0 {
-            e_b += 1; // carry out of the 10-bit mantissa
-        }
-        m_b &= 0x3ff;
-        let newexp = e_b - 15 + 7; // rebias after bias addition
-        if newexp >= 16 {
-            (0xf, if saturating { 0x6 } else { 0x7 })
-        } else if newexp <= 0 {
-            let mut m_o = 0u32;
-            if (8 - newexp) <= 11 {
-                let mant = m_b | 0x400;
-                let shift = 8 - newexp;
-                m_o = mant >> shift; // truncate; no rounding in SR path
-            }
-            (0, m_o)
-        } else {
-            let e_o = newexp;
-            let m_o = m_b >> 7; // truncate to 3-bit mantissa
-            if saturating && e_o == 0xf && m_o == 0x7 {
-                (e_o, 0x6)
-            } else {
-                (e_o, m_o)
-            }
-        }
-    };
+        let enc: u32 = if saturating && m_i == 0 { 0x7e } else { 0x7f };
+        return ((s_i << 7) | enc) as u8;
+    }
 
-    ((s_i << 7) | ((e_o as u32 & 0xf) << 3) | (m_o & 0x7)) as u8
+    // Align the magnitude to the E4M3 grid keeping 8 fraction bits below the output lsb.
+    let (mant_full, e_unb): (u64, i32) = if e_i == 0 {
+        (m_i as u64, -14) // FP16 subnormal: no implicit bit, fixed 2^-14 binade
+    } else {
+        ((m_i | 0x400) as u64, e_i - 15)
+    };
+    // Output exponent field of the unbiased value (E4M3 bias 7); <= 0 is the subnormal
+    // window (grid lsb 2^-9), >= 1 selects a normal binade.
+    let e_o0 = e_unb + 7;
+    let t: u64 = if e_o0 >= 1 {
+        // enc0 = the truncated encoding, frac8 = the 7 discarded FP16 bits, top-aligned.
+        ((((e_o0 as u64) << 3) | (m_i as u64 >> 7)) << 8) | ((m_i as u64 & 0x7f) << 1)
+    } else {
+        // value / 2^-9 with 8 fraction bits = mant_full * 2^(e_unb - 10 + 9 + 8); the
+        // shift is e_o0 <= 0 places right (truncating), at most 21 for the smallest input.
+        mant_full >> (-e_o0)
+    };
+    let t = t + bias as u64;
+    let mut enc = (t >> 8) as u32;
+    if enc >= 0x7f {
+        // Sum reached or passed the NaN slot S.1111.111: overflow encoding / saturate.
+        enc = if saturating { 0x7e } else { 0x7f };
+    }
+    ((s_i << 7) | enc) as u8
 }
 
 /// Exact lossless decode of one HF8 (E4M3) byte to the equivalent FP16 (E5M10) bit
@@ -1341,8 +1305,9 @@ mod tests {
     #[test]
     fn bias_rounding_is_add_bias_then_truncate() {
         // Per the section-16.2 SR pseudocode, family-C bias rounding is NOT
-        // "add-bias-then-RTNE". It adds the 8-bit bias at the lsb of the 10-bit FP16
-        // mantissa and then TRUNCATES toward zero. Two consequences this test pins:
+        // "add-bias-then-RTNE". It adds the 8-bit bias into the 8 bits below the
+        // destination lsb (for a BF8 normal result that is the lsb of the 10-bit FP16
+        // mantissa) and then TRUNCATES toward zero. Two consequences this test pins:
         //
         //  (1) bias == 0 is TRUNCATION, not RTNE. A value just above half an lsb (which RTNE
         //      rounds up) is rounded DOWN by the bias=0 converter.
@@ -1411,32 +1376,39 @@ mod tests {
     }
 
     #[test]
-    fn bias_sr_subnormal_counterexamples_match_spec() {
-        // Section-16.2 SR pins in the subnormal regime — these distinguish the fixed-position
-        // bias add (spec) from a window-aligned bias add (which overweights the bias for
-        // subnormal results).
+    fn bias_sr_subnormal_window_alignment_matches_hardware() {
+        // Section-16.2 SR pins in the subnormal regime — these distinguish the
+        // window-aligned bias add (what `VCVTBIASPH2[B|H]F8` actually do, verified under
+        // Intel SDE) from a fixed-position add at the normalized-FP16-mantissa lsb (an
+        // earlier misreading of the pseudocode, which underweights the bias for subnormal
+        // results). The two divergences that CI caught, pinned as regressions here:
         //
-        // E5M2, min FP16 subnormal 0x0001 (= 2^-24), bias 0xFF: normalize to m_n=0,
-        // e_n = -9; m_b = 0xFF (no carry), e_b = -9 <= 0; window (9 - (-9)) = 18 > 11, so
-        // m_o stays 0 -> +0. A window-aligned model returns 0x01.
-        assert_eq!(fp16_to_bf8_biased(0x0001, 0xff, false), 0x00);
-        // E5M2, normal 0x0201 (e_i=0, m_i=0x201 subnormal): normalize m=0x201 -> one shift
-        // (0x402), m_n = 0x2, e_n = 0 + 15 - 14... transcription: exp_unbiased=-15, e_n=0;
-        // m_b = 0x2 + 0xFF = 0x101, no carry; e_b = 0 <= 0; shift = 9, mant_u = 0x501,
-        // m_o = 0x501 >> 9 = 0x2 -> byte 0x02. Window-aligned model returns 0x03.
-        assert_eq!(fp16_to_bf8_biased(0x0201, 0xff, false), 0x02);
-        // E4M3: EVERY FP16 subnormal input flushes to signed zero in SR mode (all are below
-        // the E4M3 minimum, spec section 16.2) — even with the maximum bias.
-        assert_eq!(fp16_to_hf8_biased(0x0080, 0xff, false), 0x00);
-        assert_eq!(fp16_to_hf8_biased(0x8080, 0xff, false), 0x80);
-        // E4M3, normal source with subnormal result, bias 0x80 (applied >> 1 per spec):
-        // 0x1400 = 2^-10; m_b = 0 + 0x40, e_b = 5, newexp = -3 <= 0; shift = 11,
-        // mant = 0x440, m_o = 0x440 >> 11 = 0 -> +0. Window-aligned model returns 0x01.
-        assert_eq!(fp16_to_hf8_biased(0x1400, 0x80, false), 0x00);
-        // E4M3, 0x1CFF with bias 0xFF: m_b = 0xFF + 0x7F = 0x17E... e_i = 7, m_i = 0xFF;
-        // m_b = 0xFF + 0x7F = 0x17E (no carry), e_b = 7, newexp = -1 <= 0; shift = 9,
-        // mant = 0x57E, m_o = 0x57E >> 9 = 0x2 -> byte 0x02. Window model returns 0x03.
-        assert_eq!(fp16_to_hf8_biased(0x1cff, 0xff, false), 0x02);
+        //  * dispatch lane a=0x2088, bias=0xB8: aligned T = 0x488, +0xB8 = 0x540 -> 5.
+        //    The fixed-position model loses the carry and returns 4.
+        assert_eq!(fp16_to_hf8_biased(0x2088, 0xb8, false), 0x05);
+        //  * dispatch lane a=0x1044, bias=0xDC: aligned T = 0x444 >> 4 = 0x44, +0xDC =
+        //    0x120 -> 1. The fixed-position model truncates the bias away entirely -> 0.
+        assert_eq!(fp16_to_hf8_biased(0x1044, 0xdc, false), 0x01);
+        //
+        // E5M2, min FP16 subnormal 0x0001 (= 2^-24), bias 0xFF: E5M2 shares FP16's
+        // exponent geometry, so the add is the integer add on the bit pattern:
+        // (0x0001 + 0xFF) >> 8 = 0x01 — the bias rounds the minimum subnormal UP.
+        assert_eq!(fp16_to_bf8_biased(0x0001, 0xff, false), 0x01);
+        // E5M2, subnormal 0x0201, bias 0xFF: (0x0201 + 0xFF) >> 8 = 0x03.
+        assert_eq!(fp16_to_bf8_biased(0x0201, 0xff, false), 0x03);
+        // E4M3, FP16 subnormal inputs do NOT unconditionally flush: on the 2^-9 grid
+        // 0x0080 aligns to T = 0x80 >> 7 = 1, +0xFF = 0x100 -> the minimum subnormal, sign
+        // preserved. (With bias 0 they truncate to zero as before.)
+        assert_eq!(fp16_to_hf8_biased(0x0080, 0xff, false), 0x01);
+        assert_eq!(fp16_to_hf8_biased(0x8080, 0xff, false), 0x81);
+        assert_eq!(fp16_to_hf8_biased(0x0080, 0x00, false), 0x00);
+        assert_eq!(fp16_to_hf8_biased(0x8080, 0x00, false), 0x80);
+        // E4M3, normal source with subnormal result, bias 0x80: 0x1400 = 2^-10 aligns to
+        // T = 0x400 >> 3 = 0x80, +0x80 = 0x100 -> 0x01 (exactly half an output lsb, so the
+        // half-bias carries it up).
+        assert_eq!(fp16_to_hf8_biased(0x1400, 0x80, false), 0x01);
+        // E4M3, 0x1CFF with bias 0xFF: T = 0x4FF >> 1 = 0x27F, +0xFF = 0x37E -> 0x03.
+        assert_eq!(fp16_to_hf8_biased(0x1cff, 0xff, false), 0x03);
     }
 
     #[test]
