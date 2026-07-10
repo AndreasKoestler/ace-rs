@@ -119,7 +119,14 @@ jobs:
           if probe gcc; then echo "CC=gcc" >> "$GITHUB_ENV"
           elif probe clang; then echo "CC=clang" >> "$GITHUB_ENV"
           else
-            sudo apt-get update && sudo apt-get install -y gcc-15
+            # ubuntu-latest is 24.04 (noble); gcc-15 is NOT in the default repos,
+            # so pull it from the ubuntu-toolchain-r/test PPA (has gcc-15 for noble).
+            # Guard each step so a repo/apt failure surfaces the actionable error
+            # below instead of dying silently under `set -e`.
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test \
+              && sudo apt-get update \
+              && sudo apt-get install -y gcc-15 \
+              || echo "::warning::gcc-15 install from ubuntu-toolchain-r/test failed"
             probe gcc-15 || { echo "::error::No AVX10.2 + AMX-tile-capable C compiler (need GCC >= 15 or Clang >= 20) — cannot build the native feature"; exit 1; }
             echo "CC=gcc-15" >> "$GITHUB_ENV"
           fi
