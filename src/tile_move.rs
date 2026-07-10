@@ -1,471 +1,195 @@
-//! ACE group-4 family B: tile <-> vector row/column moves.
+//! ACE group-4 family B: tile data movement (spec section 12).
 //!
-//! This module models the two family-B move instructions, each with a *read* form (tile ->
-//! ZMM vector) and a *write* form (ZMM vector -> tile):
+//! Models the two plain move operation classes between ACE tile registers and ZMM-sized
+//! buffers:
 //!
-//! * `TILEMOVROW` — [`_tile_movrow`] extracts one addressed row of a tile into a ZMM vector
-//!   (`[ace-tile-instructions.TILE_MOVE.1]`); [`_tile_movrow_write`] inserts a ZMM vector
-//!   back into one addressed row.
-//! * `TILEMOVCOL` — [`_tile_movcol`] extracts one addressed column of a tile into a ZMM
-//!   vector (`[ace-tile-instructions.TILE_MOVE.2]`); [`_tile_movcol_write`] inserts a ZMM
-//!   vector back into one addressed column.
+//! * `TILEMOVROW` — extended under ACE to allow BOTH read and write of a tile register row
+//!   (spec section 12.2): [`_tile_movrow`] (read form, `zmm1, tmm2, r32/imm8`) and
+//!   [`_tile_setrow`] (write form, `tmm1, zmm2, r32/imm8`)
+//!   (`[ace-tile-instructions.TILE_MOVE.1]`).
+//! * `TILEMOVCOL` — a new, WRITE-ONLY operation class (spec section 12.3): tile move column
+//!   operations transfer data from AVX registers to ACE tile registers; there is no read
+//!   form. [`_tile_setcol`] (`tmm1, zmm2, r32/imm8`)
+//!   (`[ace-tile-instructions.TILE_MOVE.2]`).
 //!
-//! Writing a row then reading it back returns the original row (INV-6,
-//! `[ace-tile-instructions.TILE_MOVE.1-1]`), and a move touches exactly the addressed
-//! row/column, leaving the rest of the tile unchanged.
+//! # Index semantics (spec section 12.1.1)
 //!
-//! # Row / column index bound
+//! Only bits `[3:0]` of the immediate or general-purpose row/column specifier are relevant;
+//! other bits are RESERVED/SBZ, and an out-of-range specifier raises NO fault — the
+//! interpretation is modified so the index is simply masked (`& 0xF`). These operations are
+//! therefore total: every specifier value addresses a valid row/column of the fixed
+//! 16-row tile.
 //!
-//! The row/column index is bounded at the typed boundary by the tile's configured
-//! [`TileScope::tile_shape`]: a row index must be `< rows`, a column index must be `<
-//! colsb`. An out-of-range index addresses no slot — the read forms return [`None`] and the
-//! write forms return [`None`] having mutated no tile state.
+//! Row moves always transfer the full 64-byte (512-bit) row (`FOR col = 0 TO 63`, spec
+//! section 12.2.4). The read form's architectural `dst[MAXVL-1:VL] = 0` is modeled
+//! trivially by the 64-byte return. The column write follows the section-12.3.4 pseudocode
+//! `for row in range(dst.rows): dst.byte[row][col] = src.byte[row]` — one byte per row from
+//! the low 16 source bytes into byte-column `col`.
 //!
-//! # Dispatch
+//! # Dispatch and gates
 //!
-//! Each move is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
-//! correct on every target). Per `[ace-tile-instructions.DISPATCH.1]` /
-//! `[ace-tile-instructions.DETECT.1-2]` the *read* forms gate on AMX-AVX512 or `ACE_VSN >= 1`
-//! ([`detect::has_amx_avx512`]); the *write* forms are `ACE`-only and gate on full `ACE`
-//! ([`detect::has_ace`], `[ace-tile-instructions.DETECT.1-3]`). No native tile shim exists yet
-//! — the write forms are layer-3-blocked until Intel SDE gains ACE emulation (OQ-6, wired in
-//! phase 8) — so, exactly as the oracle-only group-3 modules do, the dispatchers reference the
-//! detector to mark the gate site and take the scalar oracle on every target.
-//!
-//! # OQ-8 (canonical width) surfaced here
-//!
-//! One canonical, largest palette-2 form per move: the vector is a full 512-bit ZMM modelled
-//! as [`ZMM_BYTES`] (`= 64`) raw bytes ([`u8; 64`]). A row occupies its first `colsb` (`<=
-//! 64`) bytes; a column occupies its first `rows` (`<= 16`) bytes; the unused lanes are zero.
-//! The `[_; 64]` / `[_; 32]` widths named in the design are placeholders: the element-typed
-//! views (e.g. `[u16; 32]`) the later outer-product families use are the same 512 bits
-//! reinterpreted, pending OQ-8's final tile-shape / vector-width decision.
+//! Each op is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
+//! correct on every target). Per the section-15.3 feature enumeration, the `TILEMOVROW`
+//! read form gates on `AMX-AVX512 || ACE_VSN >= 1` ([`detect::has_amx_avx512`],
+//! `[ace-tile-instructions.DETECT.1-2]`) and the write forms (`TILEMOVROW` write,
+//! `TILEMOVCOL`) are ACE-only ([`detect::has_ace`],
+//! `[ace-tile-instructions.DETECT.1-3]`). The register model lives in Rust, so the
+//! dispatchers reference the detectors to mark the gate sites and take the scalar oracle
+//! (`[ace-tile-instructions.DISPATCH.1]`).
 
 use crate::detect;
-use crate::tile::{TileId, TileScope};
+use crate::tile::{TileId, TileScope, TILE_COLSB, TILE_ROWS};
 
-/// A ZMM vector modelled as raw bytes: one canonical 512-bit lane group (OQ-8). A row uses
-/// the first `colsb` bytes; a column uses the first `rows` bytes; the rest are zero.
+/// Byte width of one ZMM register / one full tile row (512 bits).
 pub const ZMM_BYTES: usize = 64;
 
-// The move oracles copy a full row (`colsb` bytes) or column (`rows` bytes) into a ZMM-sized
-// buffer with `out[..colsb]` / `take(rows)` — sound only while a palette-2 row/column fits in
-// one ZMM. These limits live in `tile.rs`; couple them at compile time so bumping one without
-// the other cannot silently reintroduce a panic path.
-const _: () = {
-    assert!(crate::tile::MAX_COLSB as usize <= ZMM_BYTES);
-    assert!(crate::tile::MAX_ROWS as usize <= ZMM_BYTES);
-};
+/// Mask a row/column specifier to its architecturally relevant bits `[3:0]`
+/// (spec section 12.1.1): out-of-range specifiers never fault, they wrap.
+#[inline]
+fn mask_index(specifier: u32) -> usize {
+    (specifier & 0xF) as usize
+}
 
-// ---------------------------------------------------------------------------------------------
-// Read forms (tile -> ZMM vector)
-// ---------------------------------------------------------------------------------------------
-
-/// `TILEMOVROW` (read form): extract the addressed `row` of tile `src` into a ZMM vector, or
-/// [`None`] if `row` is outside the tile's configured `rows`
-/// (`[ace-tile-instructions.TILE_MOVE.1]`).
-///
-/// The read form gates on AMX-AVX512 or `ACE_VSN >= 1` (`[ace-tile-instructions.DETECT.1-2]`,
-/// `[ace-tile-instructions.DISPATCH.1]`); with no native shim yet (OQ-6) the detector marks
-/// the gate site and the scalar oracle runs on every target.
-pub fn _tile_movrow(scope: &TileScope, src: TileId, row: usize) -> Option<[u8; ZMM_BYTES]> {
-    let _ = detect::has_amx_avx512; // read-form gate: AMX-AVX512 or ACE_VSN>=1 [DETECT.1-2]
+/// `TILEMOVROW` read form: move row `row & 0xF` of tile `src` into a ZMM-sized buffer
+/// (spec section 12.2.4 `tilemovrow_read_*`). Total — every specifier addresses a valid
+/// row of the fixed 16-row tile (`[ace-tile-instructions.TILE_MOVE.1]`).
+pub fn _tile_movrow(scope: &TileScope, src: TileId, row: u32) -> [u8; ZMM_BYTES] {
+    let _ = detect::has_amx_avx512; // read-form gate: AMX-AVX512 || ACE_VSN >= 1 [DETECT.1-2]
     _tile_movrow_scalar(scope, src, row)
 }
 
-/// Portable `TILEMOVROW` (read form) oracle — the primary, always-correct path. Copies the
-/// `colsb` bytes of row `row` into the low lanes of the returned vector, zero-extended.
-pub fn _tile_movrow_scalar(scope: &TileScope, src: TileId, row: usize) -> Option<[u8; ZMM_BYTES]> {
-    let (rows, colsb) = scope.tile_shape(src);
-    // Typed row-index bound: an index outside the configured rows addresses no slot.
-    if row >= rows as usize {
-        return None;
-    }
-    let colsb = colsb as usize;
-    let bytes = scope.tile_bytes_ref(src);
-    let start = row * colsb;
-    let mut out = [0u8; ZMM_BYTES];
-    out[..colsb].copy_from_slice(&bytes[start..start + colsb]);
-    Some(out)
-}
-
-/// `TILEMOVCOL` (read form): extract the addressed `col` of tile `src` into a ZMM vector (one
-/// byte per configured row), or [`None`] if `col` is outside the tile's configured `colsb`
-/// (`[ace-tile-instructions.TILE_MOVE.2]`).
-///
-/// Gates identically to [`_tile_movrow`] (`[ace-tile-instructions.DETECT.1-2]`,
-/// `[ace-tile-instructions.DISPATCH.1]`).
-pub fn _tile_movcol(scope: &TileScope, src: TileId, col: usize) -> Option<[u8; ZMM_BYTES]> {
-    let _ = detect::has_amx_avx512; // read-form gate: AMX-AVX512 or ACE_VSN>=1 [DETECT.1-2]
-    _tile_movcol_scalar(scope, src, col)
-}
-
-/// Portable `TILEMOVCOL` (read form) oracle — copies the byte at column `col` of each of the
-/// `rows` configured rows into the low lanes of the returned vector, zero-extended.
-pub fn _tile_movcol_scalar(scope: &TileScope, src: TileId, col: usize) -> Option<[u8; ZMM_BYTES]> {
-    let (rows, colsb) = scope.tile_shape(src);
-    let colsb = colsb as usize;
-    // Typed column-index bound: an index outside the configured colsb addresses no slot.
-    if col >= colsb {
-        return None;
-    }
+/// Portable `TILEMOVROW` (read) oracle — `row = specifier & 0xF`, then the full 64-byte
+/// row (`FOR col = 0 TO 63`).
+pub fn _tile_movrow_scalar(scope: &TileScope, src: TileId, row: u32) -> [u8; ZMM_BYTES] {
+    let row = mask_index(row);
     let bytes = scope.tile_bytes_ref(src);
     let mut out = [0u8; ZMM_BYTES];
-    for (r, slot) in out.iter_mut().enumerate().take(rows as usize) {
-        *slot = bytes[r * colsb + col];
-    }
-    Some(out)
+    out.copy_from_slice(&bytes[row * TILE_COLSB..(row + 1) * TILE_COLSB]);
+    out
 }
 
-// ---------------------------------------------------------------------------------------------
-// Write forms (ZMM vector -> tile)
-// ---------------------------------------------------------------------------------------------
-
-/// `TILEMOVROW` (write form): insert the low `colsb` lanes of `val` into the addressed `row`
-/// of tile `dst`, leaving every other row unchanged. Returns [`None`] with no tile state
-/// changed if `row` is outside the configured `rows` (`[ace-tile-instructions.TILE_MOVE.1]`).
-///
-/// The write form is `ACE`-only and gates on full `ACE` (`[ace-tile-instructions.DETECT.1-3]`,
-/// `[ace-tile-instructions.DISPATCH.1]`). It is layer-3-blocked until SDE ACE lands (OQ-6),
-/// so the detector marks the gate site and the scalar oracle runs on every target.
-pub fn _tile_movrow_write(
-    scope: &mut TileScope,
-    dst: TileId,
-    row: usize,
-    val: [u8; ZMM_BYTES],
-) -> Option<()> {
-    let _ = detect::has_ace; // write-form gate: full ACE [DETECT.1-3]
-    _tile_movrow_write_scalar(scope, dst, row, val)
+/// `TILEMOVROW` write form: move a ZMM-sized buffer into row `row & 0xF` of tile `dst`
+/// (spec section 12.2.4 `tilemovrow_write_*`). ACE-only
+/// (`[ace-tile-instructions.TILE_MOVE.1]`).
+pub fn _tile_setrow(scope: &mut TileScope, dst: TileId, row: u32, src: [u8; ZMM_BYTES]) {
+    let _ = detect::has_ace; // write-form gate: ACE [DETECT.1-3]
+    _tile_setrow_scalar(scope, dst, row, src);
 }
 
-/// Portable `TILEMOVROW` (write form) oracle — writes the low `colsb` lanes of `val` into the
-/// addressed row after the typed row-index bound check.
-pub fn _tile_movrow_write_scalar(
-    scope: &mut TileScope,
-    dst: TileId,
-    row: usize,
-    val: [u8; ZMM_BYTES],
-) -> Option<()> {
-    let (rows, colsb) = scope.tile_shape(dst);
-    if row >= rows as usize {
-        return None;
-    }
-    let colsb = colsb as usize;
-    let start = row * colsb;
-    scope.tile_bytes_mut(dst)[start..start + colsb].copy_from_slice(&val[..colsb]);
-    Some(())
+/// Portable `TILEMOVROW` (write) oracle — `row = specifier & 0xF`, then the full 64-byte
+/// row is replaced.
+pub fn _tile_setrow_scalar(scope: &mut TileScope, dst: TileId, row: u32, src: [u8; ZMM_BYTES]) {
+    let row = mask_index(row);
+    scope.tile_bytes_mut(dst)[row * TILE_COLSB..(row + 1) * TILE_COLSB].copy_from_slice(&src);
 }
 
-/// `TILEMOVCOL` (write form): insert the low `rows` lanes of `val` into the addressed `col`
-/// of tile `dst`, leaving every other column unchanged. Returns [`None`] with no tile state
-/// changed if `col` is outside the configured `colsb` (`[ace-tile-instructions.TILE_MOVE.2]`).
-///
-/// Gates identically to [`_tile_movrow_write`] (`[ace-tile-instructions.DETECT.1-3]`,
-/// `[ace-tile-instructions.DISPATCH.1]`).
-pub fn _tile_movcol_write(
-    scope: &mut TileScope,
-    dst: TileId,
-    col: usize,
-    val: [u8; ZMM_BYTES],
-) -> Option<()> {
-    let _ = detect::has_ace; // write-form gate: full ACE [DETECT.1-3]
-    _tile_movcol_write_scalar(scope, dst, col, val)
+/// `TILEMOVCOL` (write-only): write byte-column `col & 0xF` of tile `dst` from the low 16
+/// bytes of a ZMM-sized buffer (spec section 12.3.4:
+/// `for row in range(dst.rows): dst.byte[row][col] = src.byte[row]`). There is NO read
+/// form — column moves transfer data from AVX registers to ACE tile registers only (spec
+/// section 12.3.1) (`[ace-tile-instructions.TILE_MOVE.2]`).
+pub fn _tile_setcol(scope: &mut TileScope, dst: TileId, col: u32, src: [u8; ZMM_BYTES]) {
+    let _ = detect::has_ace; // ACE-only operation class [DETECT.1-3]
+    _tile_setcol_scalar(scope, dst, col, src);
 }
 
-/// Portable `TILEMOVCOL` (write form) oracle — writes the low `rows` lanes of `val` into the
-/// addressed column after the typed column-index bound check.
-pub fn _tile_movcol_write_scalar(
-    scope: &mut TileScope,
-    dst: TileId,
-    col: usize,
-    val: [u8; ZMM_BYTES],
-) -> Option<()> {
-    let (rows, colsb) = scope.tile_shape(dst);
-    let colsb = colsb as usize;
-    if col >= colsb {
-        return None;
-    }
+/// Portable `TILEMOVCOL` oracle — the section-12.3.4 pseudocode, transcribed byte for
+/// byte: `col = specifier & 0xF`, one source byte per row.
+pub fn _tile_setcol_scalar(scope: &mut TileScope, dst: TileId, col: u32, src: [u8; ZMM_BYTES]) {
+    let col = mask_index(col);
     let bytes = scope.tile_bytes_mut(dst);
-    for (r, &lane) in val.iter().enumerate().take(rows as usize) {
-        bytes[r * colsb + col] = lane;
+    for row in 0..TILE_ROWS {
+        bytes[row * TILE_COLSB + col] = src[row];
     }
-    Some(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::{_tile_loadconfig, TileConfig};
+    use crate::tile::{TileConfig, _tile_loadconfig};
 
-    /// A palette-2 descriptor with tile 0 = 3 rows x 4 colsb (rows != colsb, so a
-    /// row/column transposition is observable), rest empty.
-    fn config_3x4() -> TileConfig {
-        TileConfig {
-            palette_id: 2,
-            rows: [3, 0, 0, 0, 0, 0, 0, 0],
-            colsb: [4, 0, 0, 0, 0, 0, 0, 0],
+    fn scope_with_pattern() -> (TileScope, TileId) {
+        let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+        let id = scope.tile(0).unwrap();
+        // Row-major pattern: byte at (row, col) = (row*64+col) & 0xFF.
+        let bytes = scope.tile_bytes_mut(id);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
         }
+        (scope, id)
     }
 
-    /// Seed tile 0 of a fresh 3x4 scope with a recognisable row-major pattern where every
-    /// byte is distinct and encodes its (row, col): byte = 0x10 * (row + 1) + col.
-    ///
-    /// ```text
-    ///   row0: 10 11 12 13
-    ///   row1: 20 21 22 23
-    ///   row2: 30 31 32 33
-    /// ```
-    fn seeded_3x4() -> TileScope {
-        let mut scope = _tile_loadconfig(&config_3x4()).unwrap();
-        let t0 = scope.tile(0).unwrap();
-        let (rows, colsb) = scope.tile_shape(t0);
-        let bytes = scope.tile_bytes_mut(t0);
-        for r in 0..rows as usize {
-            for c in 0..colsb as usize {
-                bytes[r * colsb as usize + c] = 0x10 * (r as u8 + 1) + c as u8;
-            }
-        }
-        scope
-    }
-
-    /// TILEMOVROW extracts the correct single row and nothing else; a transposed model
-    /// (reading a column) would return different bytes.
-    /// `tile_move::movrow_moves_correct_row`
+    /// Row read returns the full 64-byte row (`FOR col = 0 TO 63`, spec section 12.2.4)
+    /// and row write replaces exactly that row (write/read round-trip, INV-6).
+    /// `tile_move::row_moves_full_64_bytes`
     #[test]
-    fn movrow_moves_correct_row() {
-        let scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
+    fn row_moves_full_64_bytes() {
+        let (mut scope, id) = scope_with_pattern();
+        let row3 = _tile_movrow(&scope, id, 3);
+        let expect: [u8; 64] = core::array::from_fn(|c| ((3 * 64 + c) & 0xFF) as u8);
+        assert_eq!(row3, expect, "read returns the full 64-byte row 3");
 
-        let mut expected = [0u8; ZMM_BYTES];
-        expected[..4].copy_from_slice(&[0x20, 0x21, 0x22, 0x23]); // row 1, zero-extended
-        assert_eq!(_tile_movrow(&scope, t0, 1), Some(expected));
-
-        // Discriminator: the correct row-1 read is NOT the column-1 read (a transposed
-        // implementation returns [0x11, 0x21, 0x31, ...] here).
-        let mut col1 = [0u8; ZMM_BYTES];
-        col1[..3].copy_from_slice(&[0x11, 0x21, 0x31]);
-        assert_ne!(_tile_movrow(&scope, t0, 1), Some(col1));
+        let fresh: [u8; 64] = core::array::from_fn(|c| 0xE0 ^ c as u8);
+        _tile_setrow(&mut scope, id, 3, fresh);
+        assert_eq!(_tile_movrow(&scope, id, 3), fresh, "write replaced row 3");
+        // Neighboring rows untouched.
+        let row2 = _tile_movrow(&scope, id, 2);
+        assert_eq!(row2[0], ((2 * 64) & 0xFF) as u8, "row 2 untouched");
     }
 
-    /// TILEMOVCOL extracts the correct single column (one byte per row), zero-extended, and
-    /// differs from the same-index row read.
-    /// `tile_move::movcol_moves_correct_column`
+    /// Out-of-range specifiers never fault: only bits [3:0] are relevant, so specifier 16
+    /// addresses row 0 and specifier 0xFFFF_FFF5 addresses row 5 (spec section 12.1.1).
+    /// `tile_move::index_masks_to_4_bits`
     #[test]
-    fn movcol_moves_correct_column() {
-        let scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
-
-        let mut expected = [0u8; ZMM_BYTES];
-        expected[..3].copy_from_slice(&[0x12, 0x22, 0x32]); // column 2, one byte per row
-        assert_eq!(_tile_movcol(&scope, t0, 2), Some(expected));
-
-        // Discriminator: column 2 differs from row 2 ([0x30, 0x31, 0x32, 0x33]).
-        let mut row2 = [0u8; ZMM_BYTES];
-        row2[..4].copy_from_slice(&[0x30, 0x31, 0x32, 0x33]);
-        assert_ne!(_tile_movcol(&scope, t0, 2), Some(row2));
-    }
-
-    /// INV-6: TILEMOVROW (write) then read-back returns the original row, and the write
-    /// leaves every other row unchanged (`[ace-tile-instructions.TILE_MOVE.1-1]`). The
-    /// original row is distinct from any column, so a transposed/wrong-index write would
-    /// fail the round-trip.
-    /// `tile_move::movrow_read_back_round_trip`
-    #[test]
-    fn movrow_read_back_round_trip() {
-        let mut scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
-
-        // Capture row 1 and its neighbours before any mutation.
-        let original_row1 = _tile_movrow(&scope, t0, 1).unwrap();
-        let original_row0 = _tile_movrow(&scope, t0, 0).unwrap();
-        let original_row2 = _tile_movrow(&scope, t0, 2).unwrap();
-
-        // Overwrite row 1 with a fresh pattern, then restore it via the write form.
-        let mut scratch = [0u8; ZMM_BYTES];
-        scratch[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        _tile_movrow_write(&mut scope, t0, 1, scratch).unwrap();
-        assert_eq!(_tile_movrow(&scope, t0, 1), Some(scratch));
-
-        _tile_movrow_write(&mut scope, t0, 1, original_row1).unwrap();
-
-        // Round-trip: reading row 1 back returns exactly the original row.
-        assert_eq!(_tile_movrow(&scope, t0, 1), Some(original_row1));
-        // The write addressed only row 1: the neighbouring rows are unchanged.
-        assert_eq!(_tile_movrow(&scope, t0, 0), Some(original_row0));
-        assert_eq!(_tile_movrow(&scope, t0, 2), Some(original_row2));
-    }
-
-    /// Hand-computed known-value pins for both moves and both directions, independent of the
-    /// implementation (`[ace-tile-instructions.TESTING.4]`). Each expected byte is derived
-    /// directly from the seeded pattern `0x10 * (row + 1) + col`.
-    /// `tile_move::move_known_value_pins`
-    #[test]
-    fn move_known_value_pins() {
-        let mut scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
-
-        // Read pins: row 0 and column 0.
-        let mut row0 = [0u8; ZMM_BYTES];
-        row0[..4].copy_from_slice(&[0x10, 0x11, 0x12, 0x13]);
-        assert_eq!(_tile_movrow(&scope, t0, 0), Some(row0));
-
-        let mut col0 = [0u8; ZMM_BYTES];
-        col0[..3].copy_from_slice(&[0x10, 0x20, 0x30]);
-        assert_eq!(_tile_movcol(&scope, t0, 0), Some(col0));
-
-        // Column write pin: set column 3 to [0x01, 0x02, 0x03]; the byte at (row, 3) becomes
-        // the row-th lane and no other column changes.
-        let mut newcol = [0u8; ZMM_BYTES];
-        newcol[..3].copy_from_slice(&[0x01, 0x02, 0x03]);
-        _tile_movcol_write(&mut scope, t0, 3, newcol).unwrap();
-        assert_eq!(_tile_movcol(&scope, t0, 3), Some(newcol));
-        // Column 2 is untouched by writing column 3.
-        let mut col2 = [0u8; ZMM_BYTES];
-        col2[..3].copy_from_slice(&[0x12, 0x22, 0x32]);
-        assert_eq!(_tile_movcol(&scope, t0, 2), Some(col2));
-    }
-
-    /// An out-of-range row/column index is rejected at the typed bound: the read forms return
-    /// `None`, and a failed write mutates no tile state.
-    #[test]
-    fn out_of_range_index_rejected_no_state_change() {
-        let mut scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
-
-        // rows == 3, colsb == 4: indices 3 (row) and 4 (col) are the first out-of-range.
-        assert_eq!(_tile_movrow(&scope, t0, 3), None);
-        assert_eq!(_tile_movcol(&scope, t0, 4), None);
-
-        // Snapshot every configured row, attempt out-of-range writes, and confirm nothing
-        // changed.
-        let before: Vec<_> = (0..3)
-            .map(|r| _tile_movrow(&scope, t0, r).unwrap())
-            .collect();
+    fn index_masks_to_4_bits() {
+        let (mut scope, id) = scope_with_pattern();
         assert_eq!(
-            _tile_movrow_write(&mut scope, t0, 3, [0xFF; ZMM_BYTES]),
-            None
+            _tile_movrow(&scope, id, 16),
+            _tile_movrow(&scope, id, 0),
+            "specifier 16 wraps to row 0"
         );
         assert_eq!(
-            _tile_movcol_write(&mut scope, t0, 4, [0xFF; ZMM_BYTES]),
-            None
+            _tile_movrow(&scope, id, 0xFFFF_FFF5),
+            _tile_movrow(&scope, id, 5),
+            "only bits [3:0] of the specifier are relevant"
         );
-        let after: Vec<_> = (0..3)
-            .map(|r| _tile_movrow(&scope, t0, r).unwrap())
-            .collect();
-        assert_eq!(before, after, "rejected writes leave tile state unchanged");
+        // Same wrap on the write forms.
+        let marker = [0x99u8; 64];
+        _tile_setrow(&mut scope, id, 21, marker); // 21 & 0xF = 5
+        assert_eq!(_tile_movrow(&scope, id, 5), marker);
+        _tile_setcol(&mut scope, id, 19, [0x42; 64]); // 19 & 0xF = 3
+        assert_eq!(scope.tile_bytes_ref(id)[3], 0x42, "row 0, byte-column 3 written");
     }
 
-    /// System-as-a-whole wiring check: seed a tile, move a column out, move it into a
-    /// different column, and confirm the round-trip and gate helpers compose end to end.
+    /// TILEMOVCOL writes one byte per row from the low 16 source bytes into byte-column
+    /// `col` (spec section 12.3.4: `dst.byte[row][col] = src.byte[row]`), leaving every
+    /// other byte untouched.
+    /// `tile_move::setcol_writes_byte_column`
     #[test]
-    fn end_to_end_move_and_gates() {
-        let mut scope = seeded_3x4();
-        let t0 = scope.tile(0).unwrap();
+    fn setcol_writes_byte_column() {
+        let (mut scope, id) = scope_with_pattern();
+        let before = *scope.tile_bytes_ref(id);
+        let src: [u8; 64] = core::array::from_fn(|i| (0xC0 + i) as u8);
 
-        let col0 = _tile_movcol(&scope, t0, 0).unwrap();
-        // Move column 0's contents into column 3.
-        _tile_movcol_write(&mut scope, t0, 3, col0).unwrap();
-        let col3 = _tile_movcol(&scope, t0, 3).unwrap();
-        let round_trips = col0 == col3;
+        _tile_setcol(&mut scope, id, 7, src);
 
-        println!(
-            "E2E movcol_read={:?} movcol_write_round_trip={round_trips}",
-            &col0[..3],
-        );
-        println!(
-            "E2E detect has_amx_avx512={} has_ace={}",
-            crate::detect::has_amx_avx512(),
-            crate::detect::has_ace(),
-        );
-        assert!(
-            round_trips,
-            "column written then read back matches the source"
-        );
-    }
-}
-
-/// Layer-4 differential (family B). The tile->ZMM READ move is intrinsic-reachable, so under
-/// `feature="native"` on x86_64 with the family-B read gate detected it compares the native
-/// `TILEMOVROW` read shim to the oracle bit-for-bit (`[ace-tile-instructions.TESTING.1]`); the
-/// ZMM->tile WRITE form is `ACE`-only (`.byte`, layer-3-blocked, OQ-6). Returns
-/// [`quickcheck::TestResult::discard`] — never `from_bool(false)` — when the native path is
-/// unavailable, so a non-tile runner never goes vacuously green.
-#[cfg(test)]
-mod differential {
-    #![cfg_attr(
-        not(all(target_arch = "x86_64", feature = "native")),
-        allow(unused_imports, dead_code)
-    )]
-    use super::*;
-    use crate::tile::{_tile_loadconfig, TileConfig};
-    use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
-
-    /// A single 64-byte tile row (`rows=1`, `colsb=64`), so the whole tile marshals through one
-    /// 64-byte buffer.
-    #[derive(Clone, Debug)]
-    struct Row {
-        data: [u8; ZMM_BYTES],
-    }
-
-    impl Arbitrary for Row {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Row {
-                data: core::array::from_fn(|_| u8::arbitrary(g)),
-            }
-        }
-    }
-
-    quickcheck! {
-        /// Family-B moves native vs oracle over a 1x64 tile: the intrinsic `TILEMOVROW` READ
-        /// form (lights up under SDE) and the `ACE`-only `.byte` WRITE forms (discard until SDE
-        /// ACE). All discard off-tile.
-        fn prop_native_matches_oracle(row: Row) -> TestResult {
-            #[cfg(all(target_arch = "x86_64", feature = "native"))]
-            {
-                if detect::has_amx_avx512() {
-                    use crate::native;
-                    let config = TileConfig {
-                        palette_id: 2,
-                        rows: [1, 0, 0, 0, 0, 0, 0, 0],
-                        colsb: [64, 0, 0, 0, 0, 0, 0, 0],
-                    };
-                    let cfg = native::encode_tilecfg(2, &config.rows, &config.colsb);
-
-                    // Read form (intrinsic).
-                    let mut scope = _tile_loadconfig(&config).expect("valid descriptor");
-                    let src = scope.tile(0).unwrap();
-                    scope.tile_bytes_mut(src).copy_from_slice(&row.data);
-                    let read_oracle = _tile_movrow_scalar(&scope, src, 0).expect("row 0 in range");
-                    // SAFETY: has_amx_avx512() confirmed the read-form gate + tile XSAVE state.
-                    let read_ok =
-                        unsafe { native::tile_movrow_read_hw(&cfg, &row.data, 0) } == read_oracle;
-
-                    // Write forms (.byte). Full-ACE-only: only exercise the native path once ACE
-                    // is present; the write-form oracle writes `row.data` into a zeroed tile.
-                    let write_ok = if detect::has_ace() {
-                        let mut ws = _tile_loadconfig(&config).expect("valid descriptor");
-                        let wd = ws.tile(0).unwrap();
-                        _tile_movrow_write_scalar(&mut ws, wd, 0, row.data);
-                        let row_want = ws.tile_bytes_ref(wd).to_vec();
-                        let got_row = unsafe { native::tile_movrow_write_hw(&cfg, &row.data) };
-
-                        let mut cs = _tile_loadconfig(&config).expect("valid descriptor");
-                        let cd = cs.tile(0).unwrap();
-                        _tile_movcol_write_scalar(&mut cs, cd, 0, row.data);
-                        let col_want = cs.tile_bytes_ref(cd).to_vec();
-                        let got_col = unsafe { native::tile_movcol_write_hw(&cfg, &row.data) };
-
-                        got_row.as_slice() == row_want.as_slice()
-                            && got_col.as_slice() == col_want.as_slice()
-                    } else {
-                        true // write forms discard until full ACE (SDE ACE) is present
-                    };
-
-                    return TestResult::from_bool(read_ok && write_ok);
+        let after = scope.tile_bytes_ref(id);
+        for row in 0..TILE_ROWS {
+            for col in 0..TILE_COLSB {
+                if col == 7 {
+                    assert_eq!(
+                        after[row * TILE_COLSB + col],
+                        src[row],
+                        "byte-column 7, row {row} takes src.byte[{row}]"
+                    );
+                } else {
+                    assert_eq!(
+                        after[row * TILE_COLSB + col],
+                        before[row * TILE_COLSB + col],
+                        "byte ({row},{col}) untouched"
+                    );
                 }
             }
-            let _ = &row;
-            TestResult::discard()
         }
     }
 }

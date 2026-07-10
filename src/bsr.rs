@@ -1,580 +1,262 @@
-//! ACE group-4 family D: block-scale (`BSR`) registers.
+//! ACE group-4 family D: the Block Scale register (`bsr0` / SCALEDATA) and its operations.
 //!
-//! This module models the ACE-new block-scale register file and the four family-D
-//! instructions that seed and move the per-block microscaling exponents the MX-FP8 outer
-//! products (family E, phase 7) consume:
+//! This module models the single ACE Block Scale register and the family-D instructions
+//! that initialize and move the E8M0 microscaling exponents the MX outer products
+//! (families E/F) consume:
 //!
-//! * `BSRINIT` — [`_tile_bsrinit`] seeds an addressed [`BsrReg`] with a full set of per-block
-//!   scale exponents (`[ace-tile-instructions.BSR.1]`).
-//! * `BSRMOVF` — [`_tile_bsrmovf`] moves the FULL block-scale factor of one addressed block
-//!   (`[ace-tile-instructions.BSR.2]`).
-//! * `BSRMOVH` — [`_tile_bsrmovh`] moves the HIGH portion of one addressed block's factor
+//! * `BSRINIT` — [`_bsrinit`] sets all 128 BSR bytes to `0x7F` (E8M0 encoding of `2^0`,
+//!   scale = 1.0). It takes no data operand (spec section 13.1)
+//!   (`[ace-tile-instructions.BSR.1]`).
+//! * `BSRMOVF` — [`_bsrmovf`] moves 1024 bits from two ZMM-sized sources into the full BSR:
+//!   the first source provides the upper 512 bits (A scales), the second the lower 512 bits
+//!   (B scales) (spec section 13.2) (`[ace-tile-instructions.BSR.2]`).
+//! * `BSRMOVH` — [`_bsrmovh`] (write) / [`_bsrmovh_read`] (read) move the upper (A-scale)
+//!   512-bit half of the BSR to or from a ZMM-sized buffer (spec section 13.3)
 //!   (`[ace-tile-instructions.BSR.3]`).
-//! * `BSRMOVL` — [`_tile_bsrmovl`] moves the LOW portion of one addressed block's factor
-//!   (`[ace-tile-instructions.BSR.4]`).
+//! * `BSRMOVL` — [`_bsrmovl`] (write) / [`_bsrmovl_read`] (read) move the lower (B-scale)
+//!   512-bit half (spec section 13.3) (`[ace-tile-instructions.BSR.4]`).
 //!
-//! Only the addressed [`BsrReg`] changes; the rest of the block-scale file is untouched. The
-//! file lives inside the [`TileScope`] guard, so a later MX outer product reads back exactly
-//! the block scale these ops wrote (INV-5, `[ace-tile-instructions.BSR.4-1]`) through the
-//! shared register-model accessor [`TileScope::bsr_scale`].
+//! The register lives inside the [`TileScope`] guard, so a later MX outer product reads back
+//! exactly the block scales these ops wrote (INV-5, `[ace-tile-instructions.BSR.4-1]`).
 //!
-//! # BSR scale-field layout (OQ-3 assumption, grounded against ACE v1 §12)
+//! # Register layout (spec sections 10.2.2 and 10.5)
 //!
-//! The exact `BSR` scale-field bit layout is not confirmed against the ACE v1 rev-1.15 PDF
-//! (OQ-1/OQ-3). Grounded against ACE v1 §12 (block-scale registers), a [`BsrReg`] holds
-//! [`BSR_SCALE_BLOCKS`] per-block microscaling **scale exponents**, one `u8` each — the MX
-//! (microscaling) E8M0 shared-exponent-per-block convention §2.4/§12 describes. A block-scale
-//! *factor* is therefore one 8-bit exponent byte, and the three `BSRMOV` forms address it at
-//! byte / nibble granularity:
+//! One 1024-bit (128-byte) Block Scale register is architected:
 //!
-//! * **F (full)** — the complete 8-bit exponent of one block.
-//! * **H (high)** — the high nibble (bits `7:4`) of one block's exponent, low nibble preserved.
-//! * **L (low)** — the low nibble (bits `3:0`) of one block's exponent, high nibble preserved.
+//! * `BSR[1023:512]` (bytes 64..128) — **A scales**: `A_scales[0..15][0..3]`.
+//! * `BSR[511:0]` (bytes 0..64) — **B scales**: `B_scales[0..15][0..3]`.
 //!
-//! This is the single place to correct once the field layout is pinned against the spec; the
-//! oracle's write/read behaviour (which block / which nibble a factor lands in) is what the
-//! hand-value pins and the write/read-consistency property lock down.
+//! Each 512-bit segment holds four groups of 16 E8M0 scale bytes, organized by element
+//! index: all four group bytes for element `s` are adjacent, so `A_scales[s]` group `g` is
+//! BSR byte `64 + s*4 + g` and `B_scales[s]` group `g` is BSR byte `s*4 + g` — exactly the
+//! `BSR.byte[64 + s*4 + a_group]` / `BSR.byte[s*4 + b_group]` indexing of the section-14
+//! outer-product pseudocode. At reset, and after `BSRINIT` / `LDTILECFG` / `TILERELEASE`,
+//! every byte reads `0x7F` (spec sections 10.2.3, 11.2.1, 11.4.1, 13.1).
 //!
 //! # Dispatch
 //!
 //! Each op is a safe public dispatcher plus a cfg-free `_scalar` oracle (the primary path,
 //! correct on every target). Family D is `ACE`-only and gates on full `ACE`
 //! ([`detect::has_ace`], `[ace-tile-instructions.DETECT.1-3]`,
-//! `[ace-tile-instructions.DISPATCH.1]`). No native tile shim exists yet — the native path is
-//! layer-3-blocked until Intel SDE gains ACE emulation (OQ-6, wired in phase 8) — so, exactly
-//! as the oracle-only group-3 modules and the sibling tile families do, the dispatchers
-//! reference the detector to mark the gate site and take the scalar oracle on every target.
-//!
-//! # OQ-3 (public surface) surfaced here
-//!
-//! The default is realised: first-class `_tile_bsr*` primitives plus a [`BsrId`] handle,
-//! minted only by [`TileScope::bsr`], that the MX products (phase 7) accept to read the block
-//! scale back. The block-scale file is owned by the guard (added to [`TileScope`] here,
-//! fulfilling the phase-1 deferral), so it shares the tile file's RAII lifecycle.
+//! `[ace-tile-instructions.DISPATCH.1]`). The dispatchers reference the detector to mark the
+//! gate site and take the scalar oracle on every target.
 
 use crate::detect;
 use crate::tile::TileScope;
 
-/// Number of addressable block-scale registers in the file (`BSR0..=BSR7`), mirroring the
-/// eight tiles of a palette-2 configuration.
-pub const NUM_BSR: usize = 8;
+/// Size of the Block Scale register in bytes (1024 bits, spec section 10.2.2).
+pub const BSR_BYTES: usize = 128;
 
-/// Number of per-block scale exponents one [`BsrReg`] holds (canonical width, OQ-3/OQ-8). Each
-/// entry is one `u8` E8M0-style microscaling exponent for one block of an MX operand row.
-pub const BSR_SCALE_BLOCKS: usize = 4;
+/// Size of one BSR half (A scales or B scales) in bytes (512 bits).
+pub const BSR_HALF_BYTES: usize = 64;
 
-/// One block-scale register: [`BSR_SCALE_BLOCKS`] per-block microscaling scale exponents
-/// (`u8` each), the values the MX-FP8 outer products apply per block (INV-5).
-///
-/// The layout is the OQ-3 assumption grounded against ACE v1 §12 (see the module docs): a
-/// block-scale factor is one 8-bit exponent, addressed full / high-nibble / low-nibble by the
-/// `BSRMOV{F,H,L}` forms. Only reachable through the owning [`TileScope`].
+/// The INIT value of every BSR byte: E8M0 encoding of `2^0` = 1.0 (spec section 10.2.3).
+pub const BSR_INIT_BYTE: u8 = 0x7F;
+
+/// The single architected Block Scale register (`bsr0`, SCALEDATA): 128 bytes, A scales in
+/// the upper half (bytes 64..128), B scales in the lower half (bytes 0..64).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BsrReg {
-    scales: [u8; BSR_SCALE_BLOCKS],
-}
-
-/// A handle addressing one block-scale register of a [`TileScope`].
-///
-/// A `BsrId` is minted only by [`TileScope::bsr`] — it has no public constructor, so it cannot
-/// be forged to bypass the guard (OQ-3), mirroring [`crate::tile::TileId`]. Like `TileId` it
-/// carries the minting scope's token, and every accessor panics if it is presented to a
-/// different scope. It is the handle the MX-FP8 outer products (phase 7) accept to read the
-/// block scale these ops wrote (INV-5).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct BsrId {
-    index: usize,
-    /// Token of the [`TileScope`] that minted this handle (see [`crate::tile::TileId`]).
-    scope_token: usize,
-}
-
-impl BsrId {
-    /// Mint a handle for register `index` bound to the scope with `scope_token`; called only
-    /// by [`TileScope::bsr`], which bounds `index` to `0..NUM_BSR` (no public constructor).
-    pub(crate) fn new(index: usize, scope_token: usize) -> Self {
-        BsrId { index, scope_token }
-    }
-
-    /// The addressed register's index into the guard-owned file.
-    pub(crate) fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Token of the minting scope, checked by every [`TileScope`] BSR accessor.
-    pub(crate) fn scope_token(&self) -> usize {
-        self.scope_token
-    }
+    bytes: [u8; BSR_BYTES],
 }
 
 impl BsrReg {
-    /// A cleared block-scale register (every block exponent `0`). Used on Acquire and reset on
-    /// Release so a released or freshly-configured guard observes a clean file.
-    pub(crate) fn zeroed() -> Self {
+    /// A BSR in its INIT state: every byte `0x7F` (scale = 1.0, spec section 10.2.3).
+    pub(crate) fn init() -> Self {
         BsrReg {
-            scales: [0u8; BSR_SCALE_BLOCKS],
+            bytes: [BSR_INIT_BYTE; BSR_BYTES],
         }
     }
 
-    /// The full 8-bit scale exponent of `block`, or [`None`] if `block` is out of range.
-    pub(crate) fn scale(&self, block: usize) -> Option<u8> {
-        self.scales.get(block).copied()
+    /// Raw register bytes (byte 0 = BSR bits 7:0).
+    pub(crate) fn bytes(&self) -> &[u8; BSR_BYTES] {
+        &self.bytes
     }
 
-    /// All per-block scale exponents, for the MX outer products (phase 7) to read the block
-    /// scale back verbatim (INV-5).
-    pub(crate) fn scales(&self) -> &[u8; BSR_SCALE_BLOCKS] {
-        &self.scales
+    /// Mutable raw register bytes.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8; BSR_BYTES] {
+        &mut self.bytes
+    }
+
+    /// The A-scale byte for output-row element `s` (0..16) in group `group` (0..4):
+    /// `BSR.byte[64 + s*4 + group]` (spec section 14.1.6).
+    pub(crate) fn a_scale(&self, s: usize, group: usize) -> u8 {
+        self.bytes[BSR_HALF_BYTES + s * 4 + group]
+    }
+
+    /// The B-scale byte for output-column element `s` (0..16) in group `group` (0..4):
+    /// `BSR.byte[s*4 + group]` (spec section 14.1.6).
+    pub(crate) fn b_scale(&self, s: usize, group: usize) -> u8 {
+        self.bytes[s * 4 + group]
     }
 }
 
-// Forward-reference the read side of the BSR register model that phase 7's MX-FP8 outer
-// products consume to read back the block scale these ops wrote (INV-5,
-// `[ace-tile-instructions.BSR.4-1]`). These guard-owned read accessors have no non-test caller
-// yet, so — exactly as `src/tile.rs` marks its delivered-but-not-yet-consumed detector/codec
-// items — a `const _` binding keeps them "used" without a runtime effect and without
-// lint-muting (`#[allow]` is forbidden in production):
-//   * `TileScope::bsr_reg` / `BsrReg::scales` — the whole-register read the MX products apply
-//     per block.
-//   * `TileScope::bsr_scale` / `BsrReg::scale` — the single-block read the family-D tests use.
-const _: () = {
-    let _ = TileScope::bsr_reg;
-    let _ = TileScope::bsr_scale;
-    let _ = BsrReg::scale;
-    let _ = BsrReg::scales;
-};
-
-// ---------------------------------------------------------------------------------------------
-// BSRINIT — seed a block-scale register with per-block scale exponents
-// ---------------------------------------------------------------------------------------------
-
-/// `BSRINIT` (`[ace-tile-instructions.BSR.1]`): seed the addressed [`BsrReg`] with a full set
-/// of per-block scale exponents. Only the addressed register changes.
-///
-/// Family D is `ACE`-only and gates on full `ACE` (`[ace-tile-instructions.DETECT.1-3]`,
-/// `[ace-tile-instructions.DISPATCH.1]`); with no native shim yet (OQ-6) the detector marks
-/// the gate site and the scalar oracle runs on every target.
-pub fn _tile_bsrinit(scope: &mut TileScope, dst: BsrId, exponents: [u8; BSR_SCALE_BLOCKS]) {
-    let _ = detect::has_ace; // family D gate: full ACE [DETECT.1-3]
-    _tile_bsrinit_scalar(scope, dst, exponents);
+/// `BSRINIT`: set all 128 BSR bytes to `0x7F` (E8M0 scale = 1.0). No data operand
+/// (spec section 13.1) (`[ace-tile-instructions.BSR.1]`).
+pub fn _bsrinit(scope: &mut TileScope) {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrinit_scalar(scope);
 }
 
-/// Portable `BSRINIT` oracle — the primary, always-correct path. Overwrites the addressed
-/// register's per-block exponents; `BSRINIT` with the same seed is idempotent.
-pub fn _tile_bsrinit_scalar(scope: &mut TileScope, dst: BsrId, exponents: [u8; BSR_SCALE_BLOCKS]) {
-    scope.bsr_reg_mut(dst).scales = exponents;
+/// Portable `BSRINIT` oracle — the section-13.1.4 pseudocode: `FOR i = 0 TO 127:
+/// BSR.byte[i] = 0x7F`.
+pub fn _bsrinit_scalar(scope: &mut TileScope) {
+    *scope.bsr_mut() = BsrReg::init();
 }
 
-// ---------------------------------------------------------------------------------------------
-// BSRMOVF — move the full block-scale factor of one addressed block
-// ---------------------------------------------------------------------------------------------
-
-/// `BSRMOVF` (`[ace-tile-instructions.BSR.2]`): move the FULL 8-bit block-scale factor into
-/// `block` of the addressed [`BsrReg`], or [`None`] (mutating nothing) if `block` is outside
-/// [`BSR_SCALE_BLOCKS`]. Gates as [`_tile_bsrinit`].
-pub fn _tile_bsrmovf(scope: &mut TileScope, dst: BsrId, block: usize, factor: u8) -> Option<()> {
-    let _ = detect::has_ace; // family D gate: full ACE [DETECT.1-3]
-    _tile_bsrmovf_scalar(scope, dst, block, factor)
+/// `BSRMOVF`: write the full BSR from two 512-bit sources — `a_scales` (the first source
+/// operand, zmm1) becomes `BSR[1023:512]`, `b_scales` (the second source operand,
+/// zmm2/m512) becomes `BSR[511:0]` (spec section 13.2) (`[ace-tile-instructions.BSR.2]`).
+pub fn _bsrmovf(scope: &mut TileScope, a_scales: [u8; BSR_HALF_BYTES], b_scales: [u8; BSR_HALF_BYTES]) {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrmovf_scalar(scope, a_scales, b_scales);
 }
 
-/// Portable `BSRMOVF` oracle — writes the full exponent byte of the addressed block.
-pub fn _tile_bsrmovf_scalar(
+/// Portable `BSRMOVF` oracle — the section-13.2.4 pseudocode:
+/// `BSR[511:0] = src2[511:0]; BSR[1023:512] = src1[511:0]`.
+pub fn _bsrmovf_scalar(
     scope: &mut TileScope,
-    dst: BsrId,
-    block: usize,
-    factor: u8,
-) -> Option<()> {
-    let reg = scope.bsr_reg_mut(dst);
-    *reg.scales.get_mut(block)? = factor;
-    Some(())
+    a_scales: [u8; BSR_HALF_BYTES],
+    b_scales: [u8; BSR_HALF_BYTES],
+) {
+    let bytes = scope.bsr_mut().bytes_mut();
+    bytes[..BSR_HALF_BYTES].copy_from_slice(&b_scales);
+    bytes[BSR_HALF_BYTES..].copy_from_slice(&a_scales);
 }
 
-// ---------------------------------------------------------------------------------------------
-// BSRMOVH — move the high portion (high nibble) of one addressed block's factor
-// ---------------------------------------------------------------------------------------------
-
-/// `BSRMOVH` (`[ace-tile-instructions.BSR.3]`): move the HIGH portion of the block-scale
-/// factor — the high nibble, bits `7:4` — into `block`, preserving its low nibble. The low 4
-/// bits of `high` are the payload. Returns [`None`] (mutating nothing) if `block` is out of
-/// range. Gates as [`_tile_bsrinit`].
-pub fn _tile_bsrmovh(scope: &mut TileScope, dst: BsrId, block: usize, high: u8) -> Option<()> {
-    let _ = detect::has_ace; // family D gate: full ACE [DETECT.1-3]
-    _tile_bsrmovh_scalar(scope, dst, block, high)
+/// `BSRMOVH` write form: load a 512-bit source into the BSR upper (A-scale) half —
+/// `BSR[1023:512] = src[511:0]` (spec section 13.3) (`[ace-tile-instructions.BSR.3]`).
+pub fn _bsrmovh(scope: &mut TileScope, a_scales: [u8; BSR_HALF_BYTES]) {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrmovh_scalar(scope, a_scales);
 }
 
-/// Portable `BSRMOVH` oracle — replaces bits `7:4` of the addressed block's exponent with the
-/// low nibble of `high`; the low nibble (bits `3:0`) is left unchanged.
-pub fn _tile_bsrmovh_scalar(
-    scope: &mut TileScope,
-    dst: BsrId,
-    block: usize,
-    high: u8,
-) -> Option<()> {
-    let reg = scope.bsr_reg_mut(dst);
-    let slot = reg.scales.get_mut(block)?;
-    *slot = (*slot & 0x0F) | ((high & 0x0F) << 4);
-    Some(())
+/// Portable `BSRMOVH` (write) oracle — section-13.3.4 `bsrmovh(src, w1=1)`.
+pub fn _bsrmovh_scalar(scope: &mut TileScope, a_scales: [u8; BSR_HALF_BYTES]) {
+    scope.bsr_mut().bytes_mut()[BSR_HALF_BYTES..].copy_from_slice(&a_scales);
 }
 
-// ---------------------------------------------------------------------------------------------
-// BSRMOVL — move the low portion (low nibble) of one addressed block's factor
-// ---------------------------------------------------------------------------------------------
-
-/// `BSRMOVL` (`[ace-tile-instructions.BSR.4]`): move the LOW portion of the block-scale factor
-/// — the low nibble, bits `3:0` — into `block`, preserving its high nibble. The low 4 bits of
-/// `low` are the payload. Returns [`None`] (mutating nothing) if `block` is out of range.
-/// Gates as [`_tile_bsrinit`].
-pub fn _tile_bsrmovl(scope: &mut TileScope, dst: BsrId, block: usize, low: u8) -> Option<()> {
-    let _ = detect::has_ace; // family D gate: full ACE [DETECT.1-3]
-    _tile_bsrmovl_scalar(scope, dst, block, low)
+/// `BSRMOVH` read form: store the BSR upper (A-scale) half — `dst[511:0] = BSR[1023:512]`
+/// (spec section 13.3). The architectural form also zeroes `dst[MAXVL-1:VL]`, which the
+/// 64-byte return models trivially.
+pub fn _bsrmovh_read(scope: &TileScope) -> [u8; BSR_HALF_BYTES] {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrmovh_read_scalar(scope)
 }
 
-/// Portable `BSRMOVL` oracle — replaces bits `3:0` of the addressed block's exponent with the
-/// low nibble of `low`; the high nibble (bits `7:4`) is left unchanged.
-pub fn _tile_bsrmovl_scalar(
-    scope: &mut TileScope,
-    dst: BsrId,
-    block: usize,
-    low: u8,
-) -> Option<()> {
-    let reg = scope.bsr_reg_mut(dst);
-    let slot = reg.scales.get_mut(block)?;
-    *slot = (*slot & 0xF0) | (low & 0x0F);
-    Some(())
+/// Portable `BSRMOVH` (read) oracle — section-13.3.4 `bsrmovh(src, w1=0)`.
+pub fn _bsrmovh_read_scalar(scope: &TileScope) -> [u8; BSR_HALF_BYTES] {
+    let mut out = [0u8; BSR_HALF_BYTES];
+    out.copy_from_slice(&scope.bsr().bytes()[BSR_HALF_BYTES..]);
+    out
+}
+
+/// `BSRMOVL` write form: load a 512-bit source into the BSR lower (B-scale) half —
+/// `BSR[511:0] = src[511:0]` (spec section 13.3) (`[ace-tile-instructions.BSR.4]`).
+pub fn _bsrmovl(scope: &mut TileScope, b_scales: [u8; BSR_HALF_BYTES]) {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrmovl_scalar(scope, b_scales);
+}
+
+/// Portable `BSRMOVL` (write) oracle — section-13.3.4 `bsrmovl(src, w1=1)`.
+pub fn _bsrmovl_scalar(scope: &mut TileScope, b_scales: [u8; BSR_HALF_BYTES]) {
+    scope.bsr_mut().bytes_mut()[..BSR_HALF_BYTES].copy_from_slice(&b_scales);
+}
+
+/// `BSRMOVL` read form: store the BSR lower (B-scale) half — `dst[511:0] = BSR[511:0]`
+/// (spec section 13.3).
+pub fn _bsrmovl_read(scope: &TileScope) -> [u8; BSR_HALF_BYTES] {
+    let _ = detect::has_ace; // family D gate site [DETECT.1-3]
+    _bsrmovl_read_scalar(scope)
+}
+
+/// Portable `BSRMOVL` (read) oracle — section-13.3.4 `bsrmovl(src, w1=0)`.
+pub fn _bsrmovl_read_scalar(scope: &TileScope) -> [u8; BSR_HALF_BYTES] {
+    let mut out = [0u8; BSR_HALF_BYTES];
+    out.copy_from_slice(&scope.bsr().bytes()[..BSR_HALF_BYTES]);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::{_tile_loadconfig, TileConfig};
+    use crate::tile::{TileConfig, _tile_loadconfig};
 
-    /// A live palette-2 guard whose BSR file the family-D ops address (a minimal single-tile
-    /// descriptor; family D touches only the block-scale file, not the tiles).
     fn scope() -> TileScope {
-        let cfg = TileConfig {
-            palette_id: 2,
-            rows: [1, 0, 0, 0, 0, 0, 0, 0],
-            colsb: [4, 0, 0, 0, 0, 0, 0, 0],
-        };
-        _tile_loadconfig(&cfg).unwrap()
+        _tile_loadconfig(&TileConfig::ace()).expect("valid ACE descriptor")
     }
 
-    /// `BSRINIT` seeds the addressed register with exactly the given per-block exponents, read
-    /// back through the shared model; a fresh register is all-zero before the seed
-    /// (`[ace-tile-instructions.BSR.1]`).
-    /// `bsr::bsrinit_seeds_exponents`
+    /// LDTILECFG leaves the BSR in INIT state (`0x7F` everywhere, spec section 11.2.1), and
+    /// BSRINIT restores it after arbitrary writes (spec section 13.1).
+    /// `bsr::init_state_is_0x7f`
     #[test]
-    fn bsrinit_seeds_exponents() {
-        let mut scope = scope();
-        let b0 = scope.bsr(0).unwrap();
-
-        // Fresh register: every block exponent is zero before any seed.
-        for block in 0..BSR_SCALE_BLOCKS {
-            assert_eq!(scope.bsr_scale(b0, block), Some(0));
-        }
-
-        let exps: [u8; BSR_SCALE_BLOCKS] = [127, 128, 1, 254];
-        _tile_bsrinit(&mut scope, b0, exps);
-        for (block, &want) in exps.iter().enumerate() {
-            assert_eq!(
-                scope.bsr_scale(b0, block),
-                Some(want),
-                "seeded block {block} exponent reads back"
-            );
-        }
-
-        // Idempotent: re-seeding with the same exponents leaves the register unchanged.
-        _tile_bsrinit(&mut scope, b0, exps);
-        for (block, &want) in exps.iter().enumerate() {
-            assert_eq!(scope.bsr_scale(b0, block), Some(want));
-        }
-    }
-
-    /// `BSRMOVF/H/L` round-trip: a full write reads back verbatim; a high-nibble write changes
-    /// only bits 7:4 (low nibble preserved); a low-nibble write changes only bits 3:0 (high
-    /// nibble preserved). Written via the ops, read back through the shared model
-    /// (`[ace-tile-instructions.BSR.2]`, `[ace-tile-instructions.BSR.3]`,
-    /// `[ace-tile-instructions.BSR.4]`).
-    /// `bsr::bsrmov_full_high_low_round_trip`
-    #[test]
-    fn bsrmov_full_high_low_round_trip() {
-        let mut scope = scope();
-        let b0 = scope.bsr(0).unwrap();
-
-        // F (full): the whole exponent byte round-trips.
-        assert_eq!(_tile_bsrmovf(&mut scope, b0, 0, 0xA5), Some(()));
-        assert_eq!(scope.bsr_scale(b0, 0), Some(0xA5));
-
-        // H (high): only bits 7:4 change; the low nibble (0x5) is preserved.
-        assert_eq!(_tile_bsrmovh(&mut scope, b0, 0, 0x0C), Some(()));
-        assert_eq!(
-            scope.bsr_scale(b0, 0),
-            Some(0xC5),
-            "high nibble -> 0xC, low nibble 0x5 preserved"
+    fn init_state_is_0x7f() {
+        let mut s = scope();
+        assert!(
+            s.bsr().bytes().iter().all(|&b| b == BSR_INIT_BYTE),
+            "Acquire leaves the BSR in INIT (0x7F) state"
         );
-
-        // L (low): only bits 3:0 change; the high nibble (0xC) is preserved.
-        assert_eq!(_tile_bsrmovl(&mut scope, b0, 0, 0x03), Some(()));
-        assert_eq!(
-            scope.bsr_scale(b0, 0),
-            Some(0xC3),
-            "low nibble -> 0x3, high nibble 0xC preserved"
-        );
-
-        // Only the low 4 bits of the H/L payload are used (upper bits ignored, not shifted in).
-        assert_eq!(_tile_bsrmovh(&mut scope, b0, 0, 0xF1), Some(())); // payload nibble = 0x1
-        assert_eq!(
-            scope.bsr_scale(b0, 0),
-            Some(0x13),
-            "H payload masked to 0x1"
-        );
-
-        // Out-of-range block: no mutation, None returned.
-        let before: Vec<_> = (0..BSR_SCALE_BLOCKS)
-            .map(|b| scope.bsr_scale(b0, b))
-            .collect();
-        assert_eq!(_tile_bsrmovf(&mut scope, b0, BSR_SCALE_BLOCKS, 0xFF), None);
-        assert_eq!(_tile_bsrmovh(&mut scope, b0, BSR_SCALE_BLOCKS, 0xF), None);
-        assert_eq!(_tile_bsrmovl(&mut scope, b0, BSR_SCALE_BLOCKS, 0xF), None);
-        let after: Vec<_> = (0..BSR_SCALE_BLOCKS)
-            .map(|b| scope.bsr_scale(b0, b))
-            .collect();
-        assert_eq!(before, after, "out-of-range move mutates nothing");
-    }
-
-    /// Only the addressed `BsrReg` (and, within it, the addressed block) changes: seeding /
-    /// moving one register leaves every other register untouched, and a per-block move leaves
-    /// the register's other blocks untouched.
-    /// `bsr::only_addressed_bsr_changes`
-    #[test]
-    fn only_addressed_bsr_changes() {
-        let mut scope = scope();
-        let b0 = scope.bsr(0).unwrap();
-        let b1 = scope.bsr(1).unwrap();
-
-        // Seed both with recognisable, DISTINCT patterns.
-        _tile_bsrinit(&mut scope, b0, [0x11; BSR_SCALE_BLOCKS]);
-        _tile_bsrinit(&mut scope, b1, [0x22; BSR_SCALE_BLOCKS]);
-
-        // Move into one block of b0; b1 must be entirely unchanged, and b0's OTHER blocks too.
-        _tile_bsrmovf(&mut scope, b0, 1, 0x99).unwrap();
-        assert_eq!(
-            scope.bsr_scale(b0, 1),
-            Some(0x99),
-            "addressed block changed"
-        );
-        for block in [0, 2, 3] {
-            assert_eq!(
-                scope.bsr_scale(b0, block),
-                Some(0x11),
-                "b0 block {block} untouched by a move to block 1"
-            );
-        }
-        for block in 0..BSR_SCALE_BLOCKS {
-            assert_eq!(
-                scope.bsr_scale(b1, block),
-                Some(0x22),
-                "b1 block {block} untouched by writes to b0"
-            );
-        }
-    }
-
-    /// Write/read-consistency property (`[ace-tile-instructions.BSR.4-1]`,
-    /// `[ace-tile-instructions.TESTING.3]`): every value written to a register/block through
-    /// the BSR ops reads back identically through the shared `TileScope` model, and a write to
-    /// one register/block is NOT observed at any other — a DISCRIMINATING check that fails if
-    /// the model conflated registers or blocks (write one scale, read a different one back must
-    /// not pass).
-    /// `bsr::write_read_consistency_property`
-    #[test]
-    fn write_read_consistency_property() {
-        let mut scope = scope();
-
-        // A deterministic spread of (register, block, value) triples over the whole file.
-        for reg_ix in 0..NUM_BSR {
-            let id = scope.bsr(reg_ix).unwrap();
-            for block in 0..BSR_SCALE_BLOCKS {
-                // Distinct per (reg, block); +1 keeps every value nonzero so a stale zero from a
-                // conflated/never-written slot is detectable.
-                let value = ((reg_ix * BSR_SCALE_BLOCKS + block) as u8)
-                    .wrapping_mul(7)
-                    .wrapping_add(1);
-                _tile_bsrmovf(&mut scope, id, block, value).unwrap();
-                // Read-back consistency: what we wrote is what we read.
-                assert_eq!(scope.bsr_scale(id, block), Some(value));
-            }
-        }
-
-        // After all writes, every slot still holds ITS OWN value — no cross-register or
-        // cross-block aliasing. This is the negative/discriminating half: if the model shared
-        // storage across registers, later writes would have clobbered earlier reads.
-        for reg_ix in 0..NUM_BSR {
-            let id = scope.bsr(reg_ix).unwrap();
-            for block in 0..BSR_SCALE_BLOCKS {
-                let expected = ((reg_ix * BSR_SCALE_BLOCKS + block) as u8)
-                    .wrapping_mul(7)
-                    .wrapping_add(1);
-                let got = scope.bsr_scale(id, block).unwrap();
-                assert_eq!(
-                    got, expected,
-                    "reg {reg_ix} block {block} kept its own scale"
-                );
-                // Discriminating: reading a value that was written to a DIFFERENT slot must not
-                // pass. Compare against a neighbouring slot's distinct value.
-                let neighbour = ((reg_ix * BSR_SCALE_BLOCKS + block + 1) as u8)
-                    .wrapping_mul(7)
-                    .wrapping_add(1);
-                if neighbour != expected {
-                    assert_ne!(
-                        got, neighbour,
-                        "reg {reg_ix} block {block} must not read a neighbour's scale"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Hand-computed known-value pins, independent of the implementation
-    /// (`[ace-tile-instructions.TESTING.4]`). The load-bearing semantics are (a) which block a
-    /// factor lands in and (b) the full / high-nibble / low-nibble field split (OQ-3, grounded
-    /// against ACE v1 §12); each case's expected result DIFFERS under a wrong model (a MOVH
-    /// that wrote the full byte, or that shifted the whole payload in), so no differential
-    /// tiebreaker is needed here.
-    /// `bsr::known_value_pins`
-    #[test]
-    fn known_value_pins() {
-        let mut scope = scope();
-        let b0 = scope.bsr(0).unwrap();
-
-        // BSRINIT pins the exact per-block exponents (E8M0: 127 is the unit-scale exponent).
-        _tile_bsrinit(&mut scope, b0, [127, 0, 255, 64]);
-        assert_eq!(scope.bsr_scale(b0, 0), Some(127));
-        assert_eq!(scope.bsr_scale(b0, 1), Some(0));
-        assert_eq!(scope.bsr_scale(b0, 2), Some(255));
-        assert_eq!(scope.bsr_scale(b0, 3), Some(64));
-
-        // MOVH on block 1 (currently 0x00): high nibble := 0xA -> 0xA0 (a full-byte write model
-        // would give 0x0A; a whole-payload shift would give 0xA0 only for a masked 0x0A input).
-        _tile_bsrmovh(&mut scope, b0, 1, 0x0A).unwrap();
-        assert_eq!(
-            scope.bsr_scale(b0, 1),
-            Some(0xA0),
-            "MOVH sets bits 7:4 only (0xA0), not the whole byte (0x0A)"
-        );
-
-        // MOVL on block 2 (currently 0xFF): low nibble := 0x3 -> 0xF3 (high nibble 0xF kept).
-        _tile_bsrmovl(&mut scope, b0, 2, 0x3).unwrap();
-        assert_eq!(
-            scope.bsr_scale(b0, 2),
-            Some(0xF3),
-            "MOVL sets bits 3:0 only (0xF3), high nibble 0xF preserved"
+        _bsrmovf(&mut s, [0x11; 64], [0x22; 64]);
+        assert!(s.bsr().bytes().iter().any(|&b| b != BSR_INIT_BYTE));
+        _bsrinit(&mut s);
+        assert!(
+            s.bsr().bytes().iter().all(|&b| b == BSR_INIT_BYTE),
+            "BSRINIT resets every byte to 0x7F"
         );
     }
 
-    /// System-as-a-whole wiring check: seed a BSR via `BSRINIT`, move factors in via
-    /// `BSRMOV{F,H,L}`, and read the same scale back through the shared `TileScope` model end
-    /// to end (INV-5). Prints the observable file state and the gate helper family D reads.
+    /// BSRMOVF places the FIRST source in the UPPER (A-scale) half and the SECOND source in
+    /// the LOWER (B-scale) half — the section-13.2.4 operand order. A swapped model fails
+    /// both assertions.
+    /// `bsr::movf_operand_order`
     #[test]
-    fn end_to_end_bsr_seed_move_read() {
-        let mut scope = scope();
-        let b0 = scope.bsr(0).unwrap();
-
-        _tile_bsrinit(&mut scope, b0, [10, 20, 30, 40]);
-        _tile_bsrmovf(&mut scope, b0, 0, 0x88).unwrap();
-        _tile_bsrmovh(&mut scope, b0, 1, 0x0C).unwrap(); // 20 = 0x14 -> 0xC4
-        _tile_bsrmovl(&mut scope, b0, 2, 0x0F).unwrap(); // 30 = 0x1E -> 0x1F
-
-        let readback: [u8; BSR_SCALE_BLOCKS] =
-            core::array::from_fn(|b| scope.bsr_scale(b0, b).unwrap());
-        println!("E2E bsr file readback = {readback:?}");
-        println!("E2E detect has_ace={}", crate::detect::has_ace());
-
-        // The MX products read this same file (INV-5); pin the composed result.
-        assert_eq!(readback, [0x88, 0xC4, 0x1F, 40]);
-        // Cross-check the read-all accessor the MX products use agrees with per-block reads.
-        assert_eq!(scope.bsr_reg(b0).scales(), &readback);
-    }
-}
-
-/// Layer-4 differential (family D). `BSRINIT`/`BSRMOV*` are `ACE`-only, so their native arm is a
-/// `.byte` raw encoding that is layer-3-blocked until Intel SDE gains ACE emulation (OQ-6, R2).
-/// This asserts bit-for-bit native-vs-oracle agreement of the seeded block-scale exponents
-/// (`[ace-tile-instructions.TESTING.1]`) inside the `feature="native"` + full-`ACE` branch, and
-/// returns [`quickcheck::TestResult::discard`] — never `from_bool(false)` — on every current
-/// host, discarding until SDE ACE lands rather than passing vacuously or failing.
-#[cfg(test)]
-mod differential {
-    #![cfg_attr(
-        not(all(target_arch = "x86_64", feature = "native")),
-        allow(unused_imports, dead_code)
-    )]
-    use super::*;
-    use crate::tile::{_tile_loadconfig, TileConfig, TileScope};
-    use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
-
-    #[derive(Clone, Debug)]
-    struct Exps {
-        exponents: [u8; BSR_SCALE_BLOCKS],
+    fn movf_operand_order() {
+        let mut s = scope();
+        let a: [u8; 64] = core::array::from_fn(|i| 0x80 + i as u8);
+        let b: [u8; 64] = core::array::from_fn(|i| i as u8);
+        _bsrmovf(&mut s, a, b);
+        assert_eq!(&s.bsr().bytes()[64..], &a, "src1 -> BSR[1023:512] (A scales)");
+        assert_eq!(&s.bsr().bytes()[..64], &b, "src2 -> BSR[511:0] (B scales)");
     }
 
-    impl Arbitrary for Exps {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Exps {
-                exponents: core::array::from_fn(|_| u8::arbitrary(g)),
-            }
-        }
+    /// BSRMOVH/BSRMOVL write exactly one half and leave the other untouched; the read forms
+    /// return what the write forms stored (write/read consistency).
+    /// `bsr::half_moves_write_read_consistent`
+    #[test]
+    fn half_moves_write_read_consistent() {
+        let mut s = scope();
+        let a: [u8; 64] = core::array::from_fn(|i| 0xA0 ^ i as u8);
+        _bsrmovh(&mut s, a);
+        assert_eq!(_bsrmovh_read(&s), a, "H write/read round-trips");
+        assert!(
+            s.bsr().bytes()[..64].iter().all(|&b| b == BSR_INIT_BYTE),
+            "H write leaves the B half in INIT state"
+        );
+
+        let b: [u8; 64] = core::array::from_fn(|i| 0x50 ^ i as u8);
+        _bsrmovl(&mut s, b);
+        assert_eq!(_bsrmovl_read(&s), b, "L write/read round-trips");
+        assert_eq!(_bsrmovh_read(&s), a, "L write leaves the A half untouched");
     }
 
-    quickcheck! {
-        /// Family-D `.byte` differential: `BSRINIT` and the full/high/low `BSRMOV*` moves, native
-        /// vs the guard-model oracle. `ACE`-only, so this discards on every current host (OQ-6)
-        /// and lights up bit-for-bit once an ACE-capable SDE lands.
-        fn prop_native_matches_oracle(exps: Exps) -> TestResult {
-            #[cfg(all(target_arch = "x86_64", feature = "native"))]
-            {
-                if detect::has_ace() {
-                    use crate::native;
-                    let config = TileConfig {
-                        palette_id: 2,
-                        rows: [1, 0, 0, 0, 0, 0, 0, 0],
-                        colsb: [64, 0, 0, 0, 0, 0, 0, 0],
-                    };
-                    let cfg = native::encode_tilecfg(2, &config.rows, &config.colsb);
-                    let mut data = [0u8; native::TILE_BYTES];
-                    data[..BSR_SCALE_BLOCKS].copy_from_slice(&exps.exponents);
-
-                    // BSRINIT: seed the register and compare the per-block exponents.
-                    let mut scope = _tile_loadconfig(&config).expect("valid descriptor");
-                    let b0 = scope.bsr(0).unwrap();
-                    _tile_bsrinit(&mut scope, b0, exps.exponents);
-                    let seeded: [u8; BSR_SCALE_BLOCKS] =
-                        core::array::from_fn(|k| scope.bsr_scale(b0, k).unwrap());
-                    // SAFETY: has_ace() confirmed full ACE + the tile/BSR XSAVE state.
-                    let init_ok = unsafe { native::bsrinit_hw(&cfg, &data) }[..BSR_SCALE_BLOCKS]
-                        == seeded;
-
-                    // BSRMOVF/H/L: apply block-0 moves to the seeded register and compare each
-                    // native move shim's output to the oracle read-back of block 0.
-                    let readback_after = |mv: fn(&mut TileScope, BsrId, usize, u8) -> Option<()>,
-                                          arg: u8|
-                     -> u8 {
-                        let mut s = _tile_loadconfig(&config).expect("valid descriptor");
-                        let r = s.bsr(0).unwrap();
-                        _tile_bsrinit(&mut s, r, exps.exponents);
-                        mv(&mut s, r, 0, arg);
-                        s.bsr_scale(r, 0).unwrap()
-                    };
-                    let movf_ref = readback_after(_tile_bsrmovf, exps.exponents[0]);
-                    let movh_ref = readback_after(_tile_bsrmovh, exps.exponents[0] >> 4);
-                    let movl_ref = readback_after(_tile_bsrmovl, exps.exponents[0] & 0x0F);
-                    let movf_ok = unsafe { native::bsrmovf_hw(&cfg, &data) }[0] == movf_ref;
-                    let movh_ok = unsafe { native::bsrmovh_hw(&cfg, &data) }[0] == movh_ref;
-                    let movl_ok = unsafe { native::bsrmovl_hw(&cfg, &data) }[0] == movl_ref;
-
-                    return TestResult::from_bool(init_ok && movf_ok && movh_ok && movl_ok);
-                }
-            }
-            let _ = &exps;
-            TestResult::discard()
-        }
+    /// The scale-byte accessors implement the section-14.1.6 indexing:
+    /// `A_scales[s]` group `g` = byte `64 + s*4 + g`, `B_scales[s]` group `g` = byte
+    /// `s*4 + g` (element-major grouping, spec section 10.2.2).
+    /// `bsr::scale_indexing_matches_spec`
+    #[test]
+    fn scale_indexing_matches_spec() {
+        let mut s = scope();
+        let a: [u8; 64] = core::array::from_fn(|i| i as u8);
+        let b: [u8; 64] = core::array::from_fn(|i| 0x40 + i as u8);
+        _bsrmovf(&mut s, a, b);
+        // Element 3, group 2: A byte = 64 + 3*4 + 2 = byte 78 = a[14]; B byte = b[14].
+        assert_eq!(s.bsr().a_scale(3, 2), a[3 * 4 + 2]);
+        assert_eq!(s.bsr().b_scale(3, 2), b[3 * 4 + 2]);
+        // Element 15, group 3 is the last byte of each half.
+        assert_eq!(s.bsr().a_scale(15, 3), a[63]);
+        assert_eq!(s.bsr().b_scale(15, 3), b[63]);
+        // Element 0, group 0 is the first byte of each half.
+        assert_eq!(s.bsr().a_scale(0, 0), a[0]);
+        assert_eq!(s.bsr().b_scale(0, 0), b[0]);
     }
 }
