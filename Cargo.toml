@@ -1,11 +1,12 @@
 [package]
 name = "ace-rs"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
 description = "x86 AI Compute Extensions (ACE) primitives for Rust. See DESIGN_RATIONALE.md."
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/AndreasKoestler/ace-rs"
+readme = "README.md"
 
 [lib]
 name = "ace"
