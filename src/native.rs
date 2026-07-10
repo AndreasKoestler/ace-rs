@@ -581,21 +581,64 @@ mod differential {
                     return TestResult::from_bool(false);
                 }
 
-                // TOP families over a single marshalled row (row 0 of C).
+                // TOP families over a single marshalled row (row 0 of C): every variant,
+                // each against its own oracle.
+                type Scalar = fn(&mut crate::tile::TileScope, crate::tile::TileId, [u8; 64], [u8; 64]);
+                type Hw = unsafe fn(&[u8; 64], &[u8; 64], &[u8; 64], &[u8; 64]) -> [u8; 64];
+                let int_tops: [(Scalar, Hw); 4] = [
+                    (crate::top::_tile_top4bssd_scalar, top4bssd_hw),
+                    (crate::top::_tile_top4bsud_scalar, top4bsud_hw),
+                    (crate::top::_tile_top4busd_scalar, top4busd_hw),
+                    (crate::top::_tile_top4buud_scalar, top4buud_hw),
+                ];
+                for (scalar, hw) in int_tops {
+                    let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                    let id = scope.tile(0).unwrap();
+                    scalar(&mut scope, id, a, b);
+                    let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                    if hw(&cfg, &c, &a, &b) != want {
+                        return TestResult::from_bool(false);
+                    }
+                }
+                // TOP2BF16PS reinterprets the same 64 bytes as 32 BF16 lanes.
+                let bf16: [u16; 32] =
+                    core::array::from_fn(|i| u16::from_le_bytes([a[2 * i], a[2 * i + 1]]));
+                let bf16_b: [u16; 32] =
+                    core::array::from_fn(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
                 let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
                 let id = scope.tile(0).unwrap();
-                crate::top::_tile_top4bssd_scalar(&mut scope, id, a, b);
+                crate::top::_tile_top2bf16ps_scalar(&mut scope, id, bf16, bf16_b);
                 let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
-                if top4bssd_hw(&cfg, &c, &a, &b) != want {
+                if top2bf16ps_hw(&cfg, &c, &a, &b) != want {
                     return TestResult::from_bool(false);
                 }
+                // MX forms: imm8 fixed 0 in the shims; scales = 0x7F (unit) everywhere.
+                type MxScalar =
+                    fn(&mut crate::tile::TileScope, crate::tile::TileId, [u8; 64], [u8; 64], u8);
+                type MxHw = unsafe fn(
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                ) -> [u8; 64];
+                let mx_tops: [(MxScalar, MxHw); 5] = [
+                    (crate::top::_tile_top4mxbf8ps_scalar, top4mxbf8ps_hw),
+                    (crate::top::_tile_top4mxbhf8ps_scalar, top4mxbhf8ps_hw),
+                    (crate::top::_tile_top4mxhbf8ps_scalar, top4mxhbf8ps_hw),
+                    (crate::top::_tile_top4mxhf8ps_scalar, top4mxhf8ps_hw),
+                    (crate::top::_tile_top4mxbssps_scalar, top4mxbssps_hw),
+                ];
                 let scales = [0x7Fu8; 64];
-                let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
-                let id = scope.tile(0).unwrap();
-                crate::top::_tile_top4mxbf8ps_scalar(&mut scope, id, a, b, 0);
-                let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
-                if top4mxbf8ps_hw(&cfg, &c, &a, &b, &scales, &scales) != want {
-                    return TestResult::from_bool(false);
+                for (scalar, hw) in mx_tops {
+                    let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                    let id = scope.tile(0).unwrap();
+                    scalar(&mut scope, id, a, b, 0);
+                    let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                    if hw(&cfg, &c, &a, &b, &scales, &scales) != want {
+                        return TestResult::from_bool(false);
+                    }
                 }
             }
             TestResult::passed()
