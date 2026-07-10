@@ -13,7 +13,9 @@
 //! * `_bsrmovf` writes the per-row A scales and per-column B scales into the BSR;
 //! * `_tile_top4mxbf8ps` accumulates the outer product, reading the block scales
 //!   implicitly and dequantizing in the precise domain (spec section 14.1);
-//! * `_tile_movrow` reads the f32 result rows back out of the accumulator tile.
+//! * `_tile_movrow` reads the f32 result rows back out of the accumulator tile;
+//! * `_tile_cvtrowps2bf16h` / `_tile_cvtrowps2bf16l` (family C, spec section
+//!   12.5) store each accumulator row back out as BF16.
 //!
 //! # The MX block layout this example uses
 //!
@@ -36,10 +38,14 @@
 //! ```
 //!
 //! The `TOP*` / BSR families are ACE-only, and Intel SDE `-future` has no ACE
-//! emulation yet (it is palette-1/AMX-only), so under SDE these instructions fall
-//! back to the crate's scalar oracle. That is the same spec-conformant model the
-//! public dispatchers take on every target, so this example produces identical
-//! results natively and under SDE:
+//! emulation yet (it is palette-1/AMX-only), so those instructions have no native
+//! encoding to reach at all. The family-C row converts are different: they are
+//! intrinsic-reachable (AMX-AVX512) and DO execute natively under SDE `-future` —
+//! that is how the crate's `--features native` test suite validates the
+//! `TCVTROWPS2BF16{H,L}` shims against the scalar oracle. The public dispatchers
+//! this example calls still model the tile register file in Rust and therefore
+//! take the scalar oracle on every target (see `src/tcvtrow.rs`), so this example
+//! produces identical, spec-conformant results natively and under SDE:
 //!
 //! ```text
 //! cargo build --example mx_matmul
@@ -47,8 +53,10 @@
 //! ```
 
 use ace::{
-    _bsrmovf, _tile_loadconfig, _tile_movrow, _tile_top4mxbf8ps, _tile_top4mxbf8ps_scalar,
-    _tile_zero, ace_scale_a, ace_scale_b, cvtps_bf8, TileConfig, BSR_HALF_BYTES, BSR_INIT_BYTE,
+    _bsrmovf, _tile_cvtrowps2bf16h, _tile_cvtrowps2bf16h_scalar, _tile_cvtrowps2bf16l,
+    _tile_cvtrowps2bf16l_scalar, _tile_loadconfig, _tile_movrow, _tile_top4mxbf8ps,
+    _tile_top4mxbf8ps_scalar, _tile_zero, ace_scale_a, ace_scale_b, cvtps_bf8, TileConfig,
+    BSR_HALF_BYTES, BSR_INIT_BYTE,
 };
 
 /// Output rows / columns: an ACE tile is a fixed 16x16 f32 grid (spec section 10.2.1).
@@ -88,6 +96,20 @@ fn block_exp(vals: impl Iterator<Item = f32>) -> i32 {
 /// (255 is the E8M0 NaN the MX ops treat as "poison this element").
 fn e8m0_byte(exp: i32) -> u8 {
     (exp + E8M0_BIAS).clamp(0, 254) as u8
+}
+
+/// The FP32 -> BF16 rounding the family-C converts mandate (spec sections 12.5.1 and
+/// 16.1), restated independently so the tile op is checked against the rule, not against
+/// itself: round-to-nearest-EVEN on the 16 discarded low bits (bias by 0x7FFF plus the
+/// least-significant kept bit, then truncate — an exact tie rounds to even), with DAZ=1
+/// forced, so an FP32 zero or denormal input becomes a signed BF16 zero. Finite inputs
+/// only, which a finite f32 accumulator guarantees (NaN quieting is the oracle's job).
+fn bf16_rne(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if bits & 0x7f80_0000 == 0 {
+        return ((bits >> 31) as u16) << 15;
+    }
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 fn main() {
@@ -202,6 +224,54 @@ fn main() {
         }
     }
 
+    // ---- Family C: store the f32 accumulator rows back out as BF16 -----------
+
+    // TCVTROWPS2BF16H and TCVTROWPS2BF16L both convert ALL 16 f32 elements of the
+    // addressed row — H/L is a destination-lane choice, not a source split. H puts
+    // each BF16 in the HIGH word of its 32-bit destination slot (odd u16 lane
+    // 2j + 1) and zeroes the low word; L is the mirror (even lane 2j, high word
+    // zeroed) — disjoint half-lanes (spec section 12.5.3, INV-7).
+    let mut max_bf16_rel_err = 0.0f32;
+    for (i, c_row) in c_got.iter().enumerate() {
+        let row = i as u32;
+        let h = _tile_cvtrowps2bf16h(&scope, acc, row);
+        let l = _tile_cvtrowps2bf16l(&scope, acc, row);
+        assert_eq!(
+            h,
+            _tile_cvtrowps2bf16h_scalar(&scope, acc, row),
+            "TCVTROWPS2BF16H dispatcher diverged from its scalar oracle at row {i}"
+        );
+        assert_eq!(
+            l,
+            _tile_cvtrowps2bf16l_scalar(&scope, acc, row),
+            "TCVTROWPS2BF16L dispatcher diverged from its scalar oracle at row {i}"
+        );
+        for (j, &f32_val) in c_row.iter().enumerate() {
+            assert_eq!(h[2 * j], 0, "H must zero the low word of dword {j}");
+            assert_eq!(l[2 * j + 1], 0, "L must zero the high word of dword {j}");
+            let bf16 = l[2 * j];
+            assert_eq!(
+                h[2 * j + 1],
+                bf16,
+                "H and L must carry the same BF16 payload"
+            );
+            // The BF16 must be exactly the RNE rounding of the f32 the TILEMOVROW
+            // path already read back from this row.
+            assert_eq!(bf16, bf16_rne(f32_val), "BF16 != RNE(f32) at ({i}, {j})");
+            // BF16 -> FP32 is exact — BF16 is the top 16 bits of FP32 — so the
+            // decode is a pure shift and the difference is pure rounding error.
+            let back = f32::from_bits(u32::from(bf16) << 16);
+            if f32_val != 0.0 {
+                max_bf16_rel_err = max_bf16_rel_err.max((back - f32_val).abs() / f32_val.abs());
+            }
+        }
+    }
+    // RNE on a 7-bit mantissa is within half an ulp: relative error <= 2^-8.
+    assert!(
+        max_bf16_rel_err <= 0.00390625,
+        "BF16 rounding error {max_bf16_rel_err} exceeds the half-ulp bound 2^-8"
+    );
+
     // ---- Report --------------------------------------------------------------
 
     // BF8 (E5M2) has 2 mantissa bits; with per-block scaling and a K = 32
@@ -213,7 +283,9 @@ fn main() {
     );
 
     #[cfg(target_arch = "x86_64")]
-    let native = "no (ACE has no native/SDE path yet — scalar oracle everywhere)";
+    let native = "no (dispatchers model tile state in Rust — scalar oracle everywhere; \
+                  the family-C TCVTROW shims run natively under SDE via `--features native` tests, \
+                  TOP/BSR are ACE-only with no SDE encoding)";
     #[cfg(not(target_arch = "x86_64"))]
     let native = "n/a (not x86_64)";
 
@@ -223,5 +295,6 @@ fn main() {
     println!("  ACE native path:  {native}");
     println!("  ||C||_max:        {ref_mag:.5}");
     println!("  max rel error:    {max_rel_err:.5} (tolerance {TOLERANCE})");
+    println!("  bf16 store act:   TCVTROWPS2BF16H/L, max rounding error {max_bf16_rel_err:.6} (RNE half-ulp bound 2^-8 = 0.003906)");
     println!("PASS");
 }
