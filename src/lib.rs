@@ -8,14 +8,16 @@
 //!
 //! with a differential test asserting the native path agrees with the scalar oracle.
 //!
-//! This is **iteration 0** (the tracer bullet, design §6 / D9): one primitive — [`dpbssd`] —
-//! wired end to end on stable Rust: build → runtime detect → intrinsic → fallback → test.
+//! **Iterations 0–3 are complete** — all four ACE feature groups (spec §4) are implemented.
+//!
+//! **Iteration 0** (the tracer bullet, design §6 / D9) wired one primitive — [`dpbssd`] —
+//! end to end on stable Rust: build → runtime detect → intrinsic → fallback → test.
 //! It is the only ACE primitive already present in stable `core::arch`, so it needs no
 //! emulator and runs natively on AVX-VNNI-INT8 hardware.
 //!
-//! **Iteration 1** (in progress) adds the `AVX10_V1_AUX` family of FP16↔FP8 / FP32→FP16
+//! **Iteration 1** added the `AVX10_V1_AUX` family of FP16↔FP8 / FP32→FP16
 //! converts and the EVEX byte/word VNNI matrix, each behind a crate-owned capability check
-//! ([`detect`]) over the shared FP8/FP16 conversion oracle ([`fp8`]). The scalar oracle is
+//! (`detect`) over the shared FP8/FP16 conversion oracle (`fp8`). The scalar oracle is
 //! the primary, always-present path; an **opt-in native path** (the `native` cargo feature)
 //! routes each primitive to a hand-written C shim compiled with `-mavx10.2` — there is no
 //! stable `core::arch` EVEX intrinsic for these forms yet — taken only when
@@ -119,9 +121,9 @@
 //! A–G: the palette-2 tile lifecycle + [`TileScope`] RAII guard, tile↔ZMM moves, tile-row
 //! converts, block-scale [`BsrReg`] registers, and the `TOP*` outer products). **Group 4 is
 //! therefore no longer a non-goal** — its reachability is the positive assertion in
-//! [`iteration_surface::iteration_surface_includes_group4`]. The following remain deliberately
+//! `iteration_surface::iteration_surface_includes_group4`. The following remain deliberately
 //! **out of scope** and are NOT present in any public item or native path (verified by
-//! [`non_goal_guards::non_goals_absent`]):
+//! `non_goal_guards::non_goals_absent`):
 //!
 //! - **No palette-1 tile configuration and no AMX `TMUL` dot-product instructions** — the tile
 //!   surface is the palette-2 `ACE` group-4 engine only; the legacy AMX palette-1 configuration
@@ -157,7 +159,10 @@ mod detect;
 pub(crate) mod fp4;
 pub(crate) mod fp6;
 pub(crate) mod fp8;
+// In the non-test lib build the group-4 `_hw` wrappers are referenced only by native.rs's
+// own differential test layer, so allow the resulting dead-code lint outside tests.
 #[cfg(all(target_arch = "x86_64", feature = "native"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod native;
 pub mod tcvtrow;
 pub mod tile;
@@ -246,85 +251,87 @@ pub use cvt_ps_ph::{cvt2ps_phx, cvt2ps_phx_scalar};
 // primary path). Pure stable Rust — no core::simd / nightly ([ace-tile-instructions.STABLE.1]).
 pub use tile::{
     _tile_loadconfig, _tile_loadconfig_scalar, _tile_storeconfig, _tile_storeconfig_scalar,
-    _tile_zero, _tile_zero_scalar, TileConfig, TileConfigError, TileId, TileScope,
+    _tile_zero, _tile_zero_scalar, TileConfig, TileConfigError, TileId, TileScope, MAX_TILES,
+    TILE_BYTES, TILE_COLSB, TILE_ROWS,
 };
 
-// ACE group-4 family B: tile <-> vector row/column moves. Read forms (`_tile_movrow` /
-// `_tile_movcol`, tile -> ZMM) gate on AMX-AVX512 or ACE_VSN>=1; the ACE-only write forms
-// (`_tile_mov{row,col}_write`, ZMM -> tile) gate on full ACE. Each dispatcher mirrors its
-// eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
-// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 placeholders.
+// ACE group-4 family B: tile data movement (spec section 12). `TILEMOVROW` has read AND
+// write forms (`_tile_movrow` / `_tile_setrow`); `TILEMOVCOL` is WRITE-ONLY
+// (`_tile_setcol`, spec section 12.3.1 — column moves transfer data from AVX registers to
+// tile registers only). Row/column specifiers mask to bits [3:0] and never fault (spec
+// section 12.1.1). The read form gates on AMX-AVX512 || ACE_VSN>=1; the write forms are
+// ACE-only. Dispatcher names mirror the spec's C intrinsic equivalents (sections 12.2.10 /
+// 12.3.10) and pair a cfg-free `_scalar` oracle ([ace-tile-instructions.NAMING.1]).
 pub use tile_move::{
-    _tile_movcol, _tile_movcol_scalar, _tile_movcol_write, _tile_movcol_write_scalar, _tile_movrow,
-    _tile_movrow_scalar, _tile_movrow_write, _tile_movrow_write_scalar, ZMM_BYTES,
+    _tile_movrow, _tile_movrow_scalar, _tile_setcol, _tile_setcol_scalar, _tile_setrow,
+    _tile_setrow_scalar, ZMM_BYTES,
 };
 
-// ACE group-4 family C: tile-row converts. Each convert reads one addressed tile row and
-// writes a destination ZMM: `_tile_tcvtrowd2ps` (INT32 -> FP32), `_tile_tcvtrowps2bf16{h,l}`
-// (FP32 -> BF16 via the net-new RNE rounder), and `_tile_tcvtrowps2ph{h,l}` (FP32 -> FP16 via
-// the reused RNE rounder), the H/L pair writing disjoint high/low half-lanes (INV-7). All five
-// gate on AMX-AVX512 or ACE_VSN>=1 ([ace-tile-instructions.DETECT.1-2]); each dispatcher mirrors
-// its eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
-// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+// ACE group-4 family C: tile-row converts (spec sections 12.4-12.6). Each convert reads
+// tile row `specifier & 0xF` and writes a destination ZMM: `_tile_cvtrowd2ps` (INT32 ->
+// FP32, RNE), `_tile_cvtrowps2bf16{h,l}` (FP32 -> BF16, DAZ=1/FTZ=1 per section 12.5.1),
+// and `_tile_cvtrowps2ph{h,l}` (FP32 -> FP16), the H/L pair writing disjoint high/low
+// words of each dword (INV-7). All five gate on AMX-AVX512 || ACE_VSN>=1
+// ([ace-tile-instructions.DETECT.1-2]); dispatcher names mirror the spec's C intrinsic
+// equivalents (sections 12.4.10 / 12.5.9 / 12.6.9).
 pub use tcvtrow::{
-    _tile_tcvtrowd2ps, _tile_tcvtrowd2ps_scalar, _tile_tcvtrowps2bf16h,
-    _tile_tcvtrowps2bf16h_scalar, _tile_tcvtrowps2bf16l, _tile_tcvtrowps2bf16l_scalar,
-    _tile_tcvtrowps2phh, _tile_tcvtrowps2phh_scalar, _tile_tcvtrowps2phl,
-    _tile_tcvtrowps2phl_scalar, ROW_FP32_LANES, ZMM_WORD_LANES,
+    _tile_cvtrowd2ps, _tile_cvtrowd2ps_scalar, _tile_cvtrowps2bf16h, _tile_cvtrowps2bf16h_scalar,
+    _tile_cvtrowps2bf16l, _tile_cvtrowps2bf16l_scalar, _tile_cvtrowps2phh,
+    _tile_cvtrowps2phh_scalar, _tile_cvtrowps2phl, _tile_cvtrowps2phl_scalar, ROW_FP32_LANES,
+    ZMM_WORD_LANES,
 };
 
-// ACE group-4 family D: block-scale (`BSR`) registers. `_tile_bsrinit` seeds a block-scale
-// register with per-block scale exponents; `_tile_bsrmov{f,h,l}` move the full / high-nibble /
-// low-nibble block-scale factor of one addressed block. The `BSR` file is owned by the
-// `TileScope` guard, so the MX-FP8 outer products (phase 7) read back the same block scale
-// these ops wrote (INV-5, `[ace-tile-instructions.BSR.4-1]`). Family D is `ACE`-only and gates
-// on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each dispatcher mirrors its eventual
-// stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
-// ([ace-tile-instructions.NAMING.1]). The scale-field layout is an OQ-3 assumption grounded
-// against ACE v1 §12 (per-block E8M0 exponents); widths are canonical OQ-3/OQ-8 forms.
+// ACE group-4 family D: the single 1024-bit Block Scale register (`bsr0`/SCALEDATA, spec
+// section 13). `_bsrinit` sets all 128 bytes to 0x7F (no data operand); `_bsrmovf` writes
+// the full register from two ZMM-sized sources (src1 -> A scales [1023:512], src2 -> B
+// scales [511:0]); `_bsrmovh`/`_bsrmovl` move the upper/lower 512-bit half with BOTH write
+// and read (`*_read`) forms. The register is owned by the `TileScope` guard, so the MX
+// outer products read back the scales these ops wrote (INV-5,
+// [ace-tile-instructions.BSR.4-1]). Family D is ACE-only
+// ([ace-tile-instructions.DETECT.1-3]); dispatcher names mirror the spec's C intrinsic
+// equivalents (sections 13.1.9 / 13.2.9 / 13.3.9).
 pub use bsr::{
-    _tile_bsrinit, _tile_bsrinit_scalar, _tile_bsrmovf, _tile_bsrmovf_scalar, _tile_bsrmovh,
-    _tile_bsrmovh_scalar, _tile_bsrmovl, _tile_bsrmovl_scalar, BsrId, BsrReg, BSR_SCALE_BLOCKS,
-    NUM_BSR,
+    _bsrinit, _bsrinit_scalar, _bsrmovf, _bsrmovf_scalar, _bsrmovh, _bsrmovh_read,
+    _bsrmovh_read_scalar, _bsrmovh_scalar, _bsrmovl, _bsrmovl_read, _bsrmovl_read_scalar,
+    _bsrmovl_scalar, BsrReg, BSR_BYTES, BSR_HALF_BYTES, BSR_INIT_BYTE,
 };
 
-// ACE group-4 family G: INT8 rank-4 outer-product accumulates, generated by the sibling
-// `define_top!` macro (§3 Option B). `_tile_top4b{ss,su,us,uu}d` widen INT8 (signedness carried
-// in the operand element type, D10) and accumulate the rank-4 outer product into an INT32
-// destination tile with exact i32 wraparound, in the pinned ACE v1 §14 order (see `src/top.rs`).
-// A wrong-signedness or operand-swap call does not compile (E0308, INV-9). Family G is `ACE`-only
-// and gates on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each dispatcher mirrors its
-// eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle (the primary path)
-// ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+// ACE group-4 family G: INT8 rank-4 outer-product accumulates (spec section 14.4).
+// `_tile_top4b{ss,su,us,uu}d` take raw ZMM bytes and widen each INT8 sub-element per the
+// mnemonic's signedness (signed sign-extends, unsigned zero-extends), accumulating the
+// rank-4 outer product into an INT32 destination tile with exact i32 wraparound — no
+// saturating `...DS` forms exist in the spec. Family G is ACE-only
+// ([ace-tile-instructions.DETECT.1-3]); dispatcher names mirror the spec's C intrinsic
+// equivalents (section 14.4.11).
 pub use top::{
     _tile_top4bssd, _tile_top4bssd_scalar, _tile_top4bsud, _tile_top4bsud_scalar, _tile_top4busd,
     _tile_top4busd_scalar, _tile_top4buud, _tile_top4buud_scalar,
 };
 
-// ACE group-4 family F: the BF16 rank-2 outer-product accumulate, `TOP2BF16PS`. It decodes BF16
-// operands (raw `u16` bits) via `fp8::bf16_to_fp32` and accumulates the rank-2 outer product into
-// an FP32 destination tile with NO block scale, in the same pinned ACE v1 §14 order as family G
-// (see `src/top.rs`). Family F is `ACE`-only and gates on full `ACE`
-// ([ace-tile-instructions.DETECT.1-3]); the dispatcher mirrors its eventual stdarch intrinsic stem
-// and pairs a cfg-free `_scalar` oracle (the primary path) ([ace-tile-instructions.NAMING.1]).
-// Widths are canonical OQ-8 forms.
+// ACE group-4 family F: the BF16 rank-2 outer-product accumulate, `TOP2BF16PS` (spec
+// section 14.3). BF16 pairs widen exactly to FP32 with DAZ=1, the two products form one
+// FP32 sum (FTZ=1), and a SINGLE FP32 add accumulates onto the prior tile element (DAZ=1
+// accumulator, FTZ=1 output) — `C = float32_add(C, RNE(a0*b0 + a1*b1))`. No block scale.
+// ACE-only ([ace-tile-instructions.DETECT.1-3]); the dispatcher mirrors the spec's
+// `_tile_top2bf16ps` C intrinsic (section 14.3.11).
 pub use top::{_tile_top2bf16ps, _tile_top2bf16ps_scalar};
 
-// ACE group-4 family E: the MX-FP8 rank-4 outer-product accumulates. Each decodes its FP8
-// operands via the shared `fp8::fp8_e5m2_to_fp32` (BF8/E5M2) / `fp8::fp8_e4m3_to_fp32` (HF8/E4M3)
-// codecs, applies the per-block E8M0 BSR scale addressed by a `BsrId` (reading back exactly the
-// scale the family-D `BSR*` ops wrote, INV-5, [ace-tile-instructions.BSR.4-1]), and accumulates
-// the rank-4 outer product into an FP32 destination tile in the pinned ACE v1 §14 order (scale
-// applied to each decoded operand before the multiply; see `src/top.rs`). The four mixed-format
-// forms are BF8×BF8 / BF8×HF8 / HF8×BF8 / HF8×HF8 ([ace-tile-instructions.MX_TOP.1..4]);
-// `_tile_top4mxbssps` is the block-scaled signed×signed INT8 analogue ([ace-tile-instructions.MX_TOP.5]).
-// Family E is `ACE`-only and gates on full `ACE` ([ace-tile-instructions.DETECT.1-3]); each
-// dispatcher mirrors its eventual stdarch intrinsic stem and pairs a cfg-free `_scalar` oracle
-// (the primary path) ([ace-tile-instructions.NAMING.1]). Widths are canonical OQ-8 forms.
+// ACE group-4 family E: the MX rank-4 outer-product accumulates (spec sections 14.1-14.2).
+// The Block Scale register is read IMPLICITLY; `imm8[5:4]`/`imm8[1:0]` select the A/B
+// scale groups (compose with `ace_scale_a`/`ace_scale_b`, section 14.1.12). One E8M0
+// A-scale per output row and one B-scale per output column; the four sub-element products
+// accumulate EXACTLY in integer fixpoint and the combined scale `2^(s_a + s_b - 254)` is
+// applied once to the sum in the precise domain, with a single RNE conversion to FP32
+// (FTZ=1) and a single accumulate add (DAZ=1). An E8M0 NaN (0xFF) scale yields
+// QNaN_Indefinite for the affected elements. The four FP8 format pairs are BF8xBF8 /
+// BF8xHF8 / HF8xBF8 / HF8xHF8 ([ace-tile-instructions.MX_TOP.1..4]); `_tile_top4mxbssps`
+// is the signed MX INT8 form carrying the combined 2^-12 implicit product bias
+// ([ace-tile-instructions.MX_TOP.5]). ACE-only ([ace-tile-instructions.DETECT.1-3]);
+// dispatcher names mirror the spec's C intrinsic equivalents (sections 14.1.12 / 14.2.12).
 pub use top::{
     _tile_top4mxbf8ps, _tile_top4mxbf8ps_scalar, _tile_top4mxbhf8ps, _tile_top4mxbhf8ps_scalar,
     _tile_top4mxbssps, _tile_top4mxbssps_scalar, _tile_top4mxhbf8ps, _tile_top4mxhbf8ps_scalar,
-    _tile_top4mxhf8ps, _tile_top4mxhf8ps_scalar,
+    _tile_top4mxhf8ps, _tile_top4mxhf8ps_scalar, ace_scale_a, ace_scale_b,
 };
 
 // T1 toolchain risk gate (OQ-1, re-confirmed): `is_x86_feature_detected!("avxvnniint16")`
@@ -2598,37 +2605,41 @@ mod iteration_surface {
     //! ([ace-tile-instructions.NAMING.1]), is a safe stable-Rust entry point
     //! ([ace-tile-instructions.STABLE.1]), and is callable against the `TileScope` guard.
 
-    /// Every group-4 dispatcher is reachable from the crate root by its stdarch-stem name. The
-    /// inventory is machine-checked: the fixed-size array references every `_tile_*` dispatcher
-    /// by path, so a rename, removal, or a missing re-export breaks this compile. `TILERELEASE`
-    /// is Drop-only (the guard's `Drop`), so it is the one group-4 op with no free-standing fn.
+    /// Every group-4 dispatcher is reachable from the crate root by a name matching the
+    /// spec's C intrinsic equivalent. The inventory is machine-checked: the fixed-size
+    /// array references every dispatcher by path, so a rename, removal, or a missing
+    /// re-export breaks this compile. `TILERELEASE` is Drop-only (the guard's `Drop`), so
+    /// it is the one group-4 op with no free-standing fn.
     ///
     /// `lib::iteration_surface_includes_group4`
     #[test]
     fn iteration_surface_includes_group4() {
-        // 26 group-4 dispatcher fns: A(3) + B(4) + C(5) + D(4) + G(4) + F(1) + E(5). Plus the
-        // Drop-only `_tile_release` (TILERELEASE) the family covers every group-4 instruction.
-        let inventory: [*const (); 26] = [
+        // 27 group-4 dispatcher fns: A(3) + B(3) + C(5) + D(6) + G(4) + F(1) + E(5). Plus
+        // the Drop-only TILERELEASE the family covers every group-4 instruction (TILEMOVCOL
+        // is write-only per spec section 12.3.1; BSRMOVH/BSRMOVL each have read + write
+        // forms per section 13.3.2).
+        let inventory: [*const (); 27] = [
             // Family A — tile config lifecycle (LDTILECFG / STTILECFG / TILEZERO).
             crate::_tile_loadconfig as *const (),
             crate::_tile_storeconfig as *const (),
             crate::_tile_zero as *const (),
-            // Family B — tile <-> ZMM row/column moves (read + write forms).
+            // Family B — tile data movement (TILEMOVROW read/write, TILEMOVCOL write-only).
             crate::_tile_movrow as *const (),
-            crate::_tile_movcol as *const (),
-            crate::_tile_movrow_write as *const (),
-            crate::_tile_movcol_write as *const (),
+            crate::_tile_setrow as *const (),
+            crate::_tile_setcol as *const (),
             // Family C — tile-row converts (INT32->FP32, FP32->BF16 H/L, FP32->FP16 H/L).
-            crate::_tile_tcvtrowd2ps as *const (),
-            crate::_tile_tcvtrowps2bf16h as *const (),
-            crate::_tile_tcvtrowps2bf16l as *const (),
-            crate::_tile_tcvtrowps2phh as *const (),
-            crate::_tile_tcvtrowps2phl as *const (),
-            // Family D — block-scale (BSR) registers.
-            crate::_tile_bsrinit as *const (),
-            crate::_tile_bsrmovf as *const (),
-            crate::_tile_bsrmovh as *const (),
-            crate::_tile_bsrmovl as *const (),
+            crate::_tile_cvtrowd2ps as *const (),
+            crate::_tile_cvtrowps2bf16h as *const (),
+            crate::_tile_cvtrowps2bf16l as *const (),
+            crate::_tile_cvtrowps2phh as *const (),
+            crate::_tile_cvtrowps2phl as *const (),
+            // Family D — Block Scale register ops (BSRINIT, BSRMOVF, BSRMOVH/L r+w).
+            crate::_bsrinit as *const (),
+            crate::_bsrmovf as *const (),
+            crate::_bsrmovh as *const (),
+            crate::_bsrmovh_read as *const (),
+            crate::_bsrmovl as *const (),
+            crate::_bsrmovl_read as *const (),
             // Family G — INT8 rank-4 outer products.
             crate::_tile_top4bssd as *const (),
             crate::_tile_top4bsud as *const (),
@@ -2636,7 +2647,7 @@ mod iteration_surface {
             crate::_tile_top4buud as *const (),
             // Family F — BF16 rank-2 outer product.
             crate::_tile_top2bf16ps as *const (),
-            // Family E — MX-FP8 rank-4 outer products.
+            // Family E — MX rank-4 outer products.
             crate::_tile_top4mxbf8ps as *const (),
             crate::_tile_top4mxbhf8ps as *const (),
             crate::_tile_top4mxhbf8ps as *const (),
@@ -2647,26 +2658,21 @@ mod iteration_surface {
         // compile-time fact — adding or removing a dispatcher without updating this list is a
         // compile error, not a stale comment.
         assert!(inventory.iter().all(|&p| !p.is_null()));
-        assert_eq!(inventory.len(), 26);
+        assert_eq!(inventory.len(), 27);
 
         // Callable against the guard (safe stable Rust, no `unsafe`, no nightly): drive a full
         // slice of the surface end-to-end.
-        let cfg = crate::TileConfig {
-            palette_id: 2,
-            rows: [16, 0, 0, 0, 0, 0, 0, 0],
-            colsb: [64, 0, 0, 0, 0, 0, 0, 0],
-        };
+        let cfg = crate::TileConfig::ace();
         let mut scope = crate::_tile_loadconfig(&cfg).expect("valid palette-2 descriptor");
         assert_eq!(crate::_tile_storeconfig(&scope), cfg); // STTILECFG round-trip
         let dst = scope.tile(0).unwrap();
-        let bsr = scope.bsr(0).unwrap();
         crate::_tile_zero(&mut scope, dst);
-        assert!(crate::_tile_movrow(&scope, dst, 0).is_some());
-        assert!(crate::_tile_tcvtrowd2ps(&scope, dst, 0).is_some());
-        crate::_tile_bsrinit(&mut scope, bsr, [127; crate::BSR_SCALE_BLOCKS]);
-        crate::_tile_top4bssd(&mut scope, dst, [1i8; 64], [1i8; 64]);
+        let _row = crate::_tile_movrow(&scope, dst, 0);
+        let _conv = crate::_tile_cvtrowd2ps(&scope, dst, 0);
+        crate::_bsrinit(&mut scope);
+        crate::_tile_top4bssd(&mut scope, dst, [1u8; 64], [1u8; 64]);
         crate::_tile_top2bf16ps(&mut scope, dst, [0u16; 32], [0u16; 32]);
-        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], bsr);
+        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], 0);
     }
 }
 
@@ -2723,22 +2729,16 @@ mod non_goal_guards {
         let _v2_i = crate::unpackb([0u8; 64], crate::ACE_UNPACKB_SIZE(4)); // family I: VUNPACKB
 
         // Group 4 (ACE tile instructions, iteration 3) — NOW in scope (one representative per
-        // family; the full 25-primitive reachability set is asserted in
+        // family; the full 25-instruction reachability set is asserted in
         // `super::iteration_surface`). Group 4 is stateful, so its ops run against a `TileScope`.
-        let cfg = crate::TileConfig {
-            palette_id: 2,
-            rows: [16, 0, 0, 0, 0, 0, 0, 0],
-            colsb: [64, 0, 0, 0, 0, 0, 0, 0],
-        };
-        let mut scope = crate::_tile_loadconfig(&cfg).unwrap(); // family A: LDTILECFG lifecycle
+        let mut scope = crate::_tile_loadconfig(&crate::TileConfig::ace()).unwrap(); // family A
         let dst = scope.tile(0).unwrap();
-        let bsr = scope.bsr(0).unwrap();
         let _g4_c = crate::_tile_movrow(&scope, dst, 0); // family B: tile -> ZMM read move
-        let _g4_conv = crate::_tile_tcvtrowd2ps(&scope, dst, 0); // family C: tile-row convert
-        crate::_tile_bsrinit(&mut scope, bsr, [127; crate::BSR_SCALE_BLOCKS]); // family D: BSR
-        crate::_tile_top4bssd(&mut scope, dst, [0i8; 64], [0i8; 64]); // family G: INT8 TOP
+        let _g4_conv = crate::_tile_cvtrowd2ps(&scope, dst, 0); // family C: tile-row convert
+        crate::_bsrinit(&mut scope); // family D: BSR (no data operand, spec section 13.1)
+        crate::_tile_top4bssd(&mut scope, dst, [0u8; 64], [0u8; 64]); // family G: INT8 TOP
         crate::_tile_top2bf16ps(&mut scope, dst, [0u16; 32], [0u16; 32]); // family F: BF16 TOP
-        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], bsr); // family E: MX-FP8 TOP
+        crate::_tile_top4mxbf8ps(&mut scope, dst, [0u8; 64], [0u8; 64], 0); // family E: MX TOP
 
         // Negative space: NO out-of-scope symbol exists to reference here — the palette-1 tile
         // configuration and the AMX `TMUL` dot products (`TDPBSSD`/`TDPBF16PS`/… — a distinct

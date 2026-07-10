@@ -40,7 +40,7 @@ Three layers per primitive, plus a sunset hook. The shape deliberately mirrors t
 
 ```
 public safe fn  cvtps_hf8(a) -> r      // names mirror the future stdarch intrinsic
-  ├─ (1) cfg(ace_in_stdarch)  -> core::arch::x86_64::_mm512_cvtps_hf8   // auto when upstream lands
+  ├─ (1) forward to core::arch::x86_64::_mm512_cvtps_hf8               // planned sunset hook (D6) — when upstream lands
   ├─ (2) feature="native" + detected -> backend::…                     // opt-in, emits the real insn
   └─ (3) fallback::…                                                    // universal, stable, correct
 ```
@@ -77,13 +77,13 @@ foo_fallback()                                                          // calle
 ```
 Detection macro: `std::arch::is_x86_feature_detected!` (impl in `crates/std_detect/`). Prior art for the dispatch idiom: `multiversion`, `pulp`.
 
-### D3 — Public signatures use `core::arch` vector types, not `core::simd`
+### D3 — Public signatures use plain fixed-size arrays, not `core::simd`
 
-Inputs/outputs are `__m512`, `__m256i`, `__tile1024i`, etc.
+Inputs/outputs are fixed-size arrays — `[f32; 16]`, `[u8; 64]`, `[i32; 8]`, `[u16; 32]`, etc. — that are layout-compatible with the corresponding `__m512`/`__m256i` operands (each `_hw` path already marshals through an unaligned load/store). The `__mNNN`-typed signatures are deferred to the eventual `core::arch` stabilization of the ACE intrinsics; at upstream time the deprecation swap is an import change plus the same lossless array↔vector marshalling.
 
-**Rationale:** these types are **stable** and are the eventual upstream signature, so the deprecation swap is type-identical. `core::simd` is nightly-gated and would forfeit stable compilation.
+**Rationale:** arrays keep the public API construct-and-inspect on every target (including non-x86, where `__m512` operations are unavailable), while staying a thin mechanical wrapper over the future intrinsic signature. `core::simd` is nightly-gated and would forfeit stable compilation.
 
-**core:: reference:** `__mNNN` are defined in `core::arch` (`crates/core_arch/src/x86/mod.rs`), stable since 1.27. `core::simd::Simd<T,N>` (`crates/core_simd/`) is gated behind `feature(portable_simd)` (tracking #86656) — nightly only.
+**core:: reference:** `__mNNN` are defined in `core::arch` (`crates/core_arch/src/x86/mod.rs`), stable since 1.27 — the arrays transmute losslessly to them (see D10's `_mm256_loadu_si256` marshalling). `core::simd::Simd<T,N>` (`crates/core_simd/`) is gated behind `feature(portable_simd)` (tracking #86656) — nightly only.
 
 ### D4 — Do not depend on `core::simd`; bridge optionally via `transmute`
 
@@ -95,19 +95,19 @@ No dependency on the portable SIMD library. If a consumer wants `Simd<T,N>` ergo
 
 ### D5 — Name every public item after its eventual stdarch intrinsic
 
-`cvtps_hf8` mirrors `_mm512_cvtps_hf8`; `tile_top4mxhf8ps` mirrors `_tile_top4mxhf8ps`.
+`cvtps_hf8` mirrors `_mm512_cvtps_hf8`; the tile ops keep the spec's full stem verbatim (`_tile_top4mxhf8ps`, `_tile_movrow`, `_bsrinit`, …).
 
 **Rationale:** makes deprecation mechanical — consumers migrate by changing an import.
 
 **core:: reference:** target names are the intrinsic equivalents the spec already publishes [spec §8.x, §9.x, §14.x "C/C++ Compiler Intrinsic Equivalent"], which are the names stdarch will use in `core::arch::x86_64` (cf. existing `core::arch::x86_64::_mm512_*` and the AMX `_tile_*` in `crates/core_arch/src/x86_64/amx.rs`).
 
-### D6 — Sunset hook: `build.rs` autocfg probe → forward to `core::arch`
+### D6 — Sunset hook: forward to `core::arch` when the intrinsics land (planned)
 
-A build probe compile-tests whether `core::arch::x86_64::_mm512_cvtps_hf8` (etc.) exists and sets `cfg(ace_in_stdarch)`. When set, the safe fn forwards to the real intrinsic.
+What `build.rs` actually does today: under the opt-in `native` feature on an x86_64 target it compiles the two native translation units — `src/native/avx10_v1_aux.c` with `-mavx10.2` and `src/native/ace_tile.c` with `-mavx10.2 -mamx-tile -mamx-avx512` — probing each flag first and panicking with a clear message if the toolchain rejects one. In every other configuration it is a no-op (no `cc` dependency, no compiled C). There is **no** autocfg-style probe and no `cfg(ace_in_stdarch)` today; the forward-to-`core::arch` layer is a *planned* mechanism, to be added when stdarch ships the ACE intrinsics (whether via a compile-probe or a plain version-gated release).
 
-**Rationale:** the day stdarch ships ACE, the crate forwards automatically with no consumer change; the release that adds `#[deprecated(note="use core::arch::x86_64::…")]` keeps the dispatch/fallback (D2) intact.
+**Rationale:** the day stdarch ships ACE, a release swaps the native/dispatch layer to forward to the real intrinsics and adds `#[deprecated(note="use core::arch::x86_64::…")]`, keeping the dispatch/fallback (D2) intact — consumers migrate by changing an import.
 
-**core:: reference:** forwards to `core::arch::x86_64::_*`. Probe mirrors the `autocfg`/`cfg(accessible(...))`-style detection pattern; the deprecated wrappers continue to wrap `is_x86_feature_detected!` because `core::arch` itself never gates.
+**core:: reference:** forwards to `core::arch::x86_64::_*`. The deprecated wrappers would continue to wrap `is_x86_feature_detected!` because `core::arch` itself never gates.
 
 ### D7 — Native backend: C/asm stub via `cc`, with a `.byte` escape hatch; not stable `asm!`
 
@@ -119,9 +119,9 @@ The opt-in `native` feature compiles a C/assembly translation unit (using `<immi
 
 ### D8 — Stateful tile ops: RAII guard around the AMX-derived lifecycle
 
-`TILEZERO`/`LDTILECFG`/`TILERELEASE` and the `TOP*`/`BSR*` ops operate on tile + block-scale register state [spec §10–§14]. Model the config/release lifecycle with an RAII guard; outer products take an opaque tile handle and `__m512i` ZMM inputs.
+`TILEZERO`/`LDTILECFG`/`TILERELEASE` and the `TOP*`/`BSR*` ops operate on tile + block-scale register state [spec §10–§14]. The config/release lifecycle is modelled with an RAII guard (`TileScope`, released via `TILERELEASE` on `Drop`); outer products take an opaque tile handle (`TileId`) and ZMM-sized fixed arrays (`[u8; 64]`, `[u16; 32]` — per D3, not `__m512i`). The state model is spec-conformant: a fixed register file of 8 tiles × 16 rows × 64 bytes (the palette-2 descriptor is byte 0 = palette plus 63 reserved-zero bytes — no per-tile rows/colsb configuration), a **single** 1024-bit Block Scale register (`bsr0`/SCALEDATA, initialized to `0x7F`), row/column specifiers masked to bits [3:0], and MX outer products that select A/B scale groups via `imm8` and apply the combined E8M0 scale once in the precise domain.
 
-**Rationale:** the tile group consumes SIMD vectors but accumulates into a separate register file with required init/release; an RAII guard prevents leaking tile configuration. Palette 2 (ACE) descriptor per [spec §11.2.3].
+**Rationale:** the tile group consumes SIMD-width vectors but accumulates into a separate register file with required init/release; an RAII guard prevents leaking tile configuration. Palette 2 (ACE) descriptor per [spec §11.2.3].
 
 **core:: reference:** the primitives already exist for AMX in `crates/core_arch/src/x86_64/amx.rs` — `_tile_loadconfig`, `_tile_release`, `_tile_zero` — behind `#[target_feature(enable="amx-tile")]` and the unstable `x86_amx_intrinsics` feature (tracking #126622). `core::arch` provides them raw and **un-guarded**; `ace-rs` adds the RAII wrapper (consistent with D2: safety ergonomics are the crate's job, not `core::arch`'s).
 
@@ -177,7 +177,7 @@ For the group-1 family the differential property (`prop_hw_matches_scalar`) is t
 | 0 ✅ | **group 1 complete** — `dpbssd` + the 11 remaining VEX integer multiply-accumulate ops (group 1: `avxvnniint8` byte `VPDPB*` + `avxvnniint16` word `VPDPW*`) | dispatch + oracle + differential-test skeleton (D9), generalised once via the declarative `define_dp!` macro (D11/B1) over typed-per-signedness operands (D10/A1); second CPUID feature family (`avxvnniint16`); dual-feature native-coverage guard |
 | 1 ✅ | AVX10.2 Subset / `AVX10_V1_AUX` (group 2): FP16↔FP8 converts + EVEX VNNI — **26 primitives implemented** | `AVX10_V1_AUX` gating, FP8 format + RTNE/bias rounding oracle, first SDE-only tests; EVEX-generalizes the group-1 dot product. |
 | 2 ✅ | OCP Format Conversions / `AVX10_V2_AUX` (group 3): FP32↔FP8, FP8↔FP4/FP6, `VPMOVSSDB`, `VUNPACKB` — **21 primitives implemented, oracle-only (OQ-5)** | `AVX10_V2_AUX` gating (incl. `XCR0` vector-state check), round-to-odd + bias-rounding FP32→FP8 oracles, FP4/FP6 sub-byte packed formats, symmetric INT32→INT8 saturation, `imm8`-driven unpack. No native path yet: the group-3 intrinsics are absent from current GCC/Clang `-mavx10.2` headers (OQ-5), so every family ships the scalar oracle with the native differential wired to go live when an intrinsic lands. |
-| 3 | `TOP2BF16PS` BF16 rank-2 outer product (group 4) | stateful RAII tile guard (D8), palette 2, the real engine — **`ACE`-gated; not in binutils 2.44 / likely not SDE 10.8 (§7): `.byte` encoding + layers 1–2 only until tooling lands** |
+| 3 ✅ | ACE tile instructions (group 4): the **full group shipped** — all 25 instructions (tile lifecycle, `TILEMOVROW`/`TILEMOVCOL`, row converts, `BSR*`, `TOP2BF16PS` + the four `TOP4B*D` + the five MX `TOP4MX*` outer products) | stateful RAII tile guard (D8), palette 2, single 1024-bit Block Scale register, `imm8` scale-group selection with precise-domain scaling; native C shims for the intrinsic-reachable families (A / B-read / C, executed under SDE) and `.byte` raw encodings for the `ACE`-only families, every encoding golden-checked against spec §6.3 by the `tests/encoding.rs` harness |
 
 ---
 
@@ -198,10 +198,10 @@ binutils 2.44 `gas/NEWS` ("Changes in 2.44") lists Diamond Rapids support under 
 
 **Consequences:**
 
-1. The ACE value-add — the outer-product engine (`TOP*`) and block-scale registers (`BSR*`) — is gated by the **`ACE` flag alone**, which binutils 2.44 does not know. Intel's `AMX-FP8` in 2.44 is the *dot-product* AMX under palette 1 (TMUL) — a **different instruction family** from ACE's *outer-product* `TOP4MX*F8PS` under palette 2 (ACE). Group 4's compute therefore needs `.byte` raw encoding (D7) or a later binutils.
+1. The ACE value-add — the outer-product engine (`TOP*`) and the Block Scale register ops (`BSR*`) — is gated by the **`ACE` flag alone**, which binutils 2.44 does not know. Intel's `AMX-FP8` in 2.44 is the *dot-product* AMX under palette 1 (TMUL) — a **different instruction family** from ACE's *outer-product* `TOP4MX*F8PS` under palette 2 (ACE). Group 4's compute therefore needs `.byte` raw encoding (D7) or a later binutils.
 2. **SDE 10.8 (15 Mar 2026) predates the ACE v1.15 spec (May 2026)** by two months, so it almost certainly does not emulate the `ACE`-gated `TOP*`/`BSR*`. Treat ACE-exclusive emulation as unavailable until proven on a machine: `sde64 -help | grep -i ace` (knob present?) or run a one-instruction `TOP4MX` test and check for `#UD`. (intel.com blocks scripted access to the release notes, so this could not be confirmed remotely.)
 
-**Net:** bullets 0–2 (groups 1–3) are fully buildable + oracle-testable today, and groups 1–2 are natively testable (SDE for group 2). **Caveat discovered during bullet-2 implementation (OQ-5, §9):** assembler (binutils) and emulator (SDE) support for the group-3 converts does *not* imply **compiler intrinsic** support — the `_mm512_cvtps_bf8`/`cvtbf8_ps`/FP4/FP6/`cvtssepi32_epi8`/`unpackb` intrinsics are absent from the GCC/Clang `-mavx10.2` headers as of GCC 16.x, so group 3 currently has **no native C-shim path** (D7 is inapplicable until the headers catch up) and is verified by layer 1 (oracle) only. **Bullet 3 (group-4 `TOP*`/`BSR*`) is blocked on layer-3 testing** — implement via `.byte` (D7), verify via layers 1–2 (oracle + encoding, §5), and add SDE execution only once a build proves ACE emulation exists. Re-verify when binutils >2.44 and SDE >10.8 ship.
+**Net:** bullets 0–2 (groups 1–3) are fully buildable + oracle-testable today, and groups 1–2 are natively testable (SDE for group 2). **Caveat discovered during bullet-2 implementation (OQ-5, §9):** assembler (binutils) and emulator (SDE) support for the group-3 converts does *not* imply **compiler intrinsic** support — the `_mm512_cvtps_bf8`/`cvtbf8_ps`/FP4/FP6/`cvtssepi32_epi8`/`unpackb` intrinsics are absent from the GCC/Clang `-mavx10.2` headers as of GCC 16.x, so group 3 currently has **no native C-shim path** (D7 is inapplicable until the headers catch up) and is verified by layer 1 (oracle) only. **Bullet 3 (group 4) shipped on exactly the plan above:** the `ACE`-only forms (`TOP*`, `BSR*`, `TILEMOVROW` write, `TILEMOVCOL`) are implemented via `.byte` raw encodings (D7) verified by layers 1–2 (oracle + the §6.3 encoding harness in `tests/encoding.rs`), while the intrinsic-reachable families (A / B-read / C) use real intrinsics and execute under SDE; the `ACE`-only SDE differentials go live once a build proves ACE emulation exists. Re-verify when binutils >2.44 and SDE >10.8 ship.
 
 ---
 

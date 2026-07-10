@@ -52,7 +52,8 @@ pub fn cvtph_bf8(a: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtph_bf8_hw(a) };
         }
     }
@@ -73,7 +74,7 @@ unsafe fn cvtph_bf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtph_bf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_bf8`] in non-saturating mode. Carries no
+/// Maps each FP16 lane through `fp8::fp16_to_bf8` in non-saturating mode. Carries no
 /// cfg gate and reads no global state. `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtph_bf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_bf8(a[i], false))
@@ -89,7 +90,8 @@ pub fn cvtphs_bf8(a: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtphs_bf8_hw(a) };
         }
     }
@@ -110,7 +112,7 @@ unsafe fn cvtphs_bf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtphs_bf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_bf8`] in saturating mode (overflow clamps
+/// Maps each FP16 lane through `fp8::fp16_to_bf8` in saturating mode (overflow clamps
 /// to +/-57344). `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtphs_bf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_bf8(a[i], true))
@@ -126,7 +128,8 @@ pub fn cvtph_hf8(a: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtph_hf8_hw(a) };
         }
     }
@@ -147,7 +150,7 @@ unsafe fn cvtph_hf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtph_hf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_hf8`] in non-saturating mode.
+/// Maps each FP16 lane through `fp8::fp16_to_hf8` in non-saturating mode.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtph_hf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_hf8(a[i], false))
@@ -163,7 +166,8 @@ pub fn cvtphs_hf8(a: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtphs_hf8_hw(a) };
         }
     }
@@ -184,7 +188,7 @@ unsafe fn cvtphs_hf8_hw(a: [u16; 32]) -> [u8; 32] {
 
 /// Portable reference oracle for [`cvtphs_hf8`] — the primary always-correct path.
 ///
-/// Maps each FP16 lane through [`fp8::fp16_to_hf8`] in saturating mode (overflow clamps
+/// Maps each FP16 lane through `fp8::fp16_to_hf8` in saturating mode (overflow clamps
 /// to +/-448). `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvtphs_hf8_scalar(a: [u16; 32]) -> [u8; 32] {
     core::array::from_fn(|i| fp8::fp16_to_hf8(a[i], true))
@@ -227,7 +231,8 @@ pub fn cvt2ph_bf8(src1: [u16; 32], src2: [u16; 32]) -> [u8; 64] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvt2ph_bf8_hw(src1, src2) };
         }
     }
@@ -263,7 +268,8 @@ pub fn cvt2phs_bf8(src1: [u16; 32], src2: [u16; 32]) -> [u8; 64] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvt2phs_bf8_hw(src1, src2) };
         }
     }
@@ -299,7 +305,8 @@ pub fn cvt2ph_hf8(src1: [u16; 32], src2: [u16; 32]) -> [u8; 64] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvt2ph_hf8_hw(src1, src2) };
         }
     }
@@ -334,7 +341,8 @@ pub fn cvt2phs_hf8(src1: [u16; 32], src2: [u16; 32]) -> [u8; 64] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvt2phs_hf8_hw(src1, src2) };
         }
     }
@@ -388,8 +396,10 @@ fn bias_byte(bias: [u16; 32], i: usize) -> u8 {
 /// Biased FP16 -> BF8 (E5M2) convert, non-saturating.
 ///
 /// Converts `a` to BF8 applying the per-lane bias rounding term from `bias`
-/// (`bias = bias[i].byte[0]`, spec section 8.4.5) before rounding (spec section 2.6.3).
-/// A zero bias reproduces [`cvtph_bf8`]; overflow yields the BF8 NaN/overflow encoding.
+/// (`bias = bias[i].byte[0]`, spec section 8.4.5), added at the mantissa lsb and then
+/// truncated per the section-16.2 SR pseudocode. NOTE: a zero bias TRUNCATES — it is NOT
+/// [`cvtph_bf8`]'s RTNE (they agree only when no discarded bits round up). Overflow yields
+/// the BF8 overflow encoding `S.11111.00`.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.1]`
@@ -397,7 +407,8 @@ pub fn cvtbiasph_bf8(a: [u16; 32], bias: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtbiasph_bf8_hw(a, bias) };
         }
     }
@@ -434,7 +445,8 @@ pub fn cvtbiasphs_bf8(a: [u16; 32], bias: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtbiasphs_bf8_hw(a, bias) };
         }
     }
@@ -462,8 +474,10 @@ pub fn cvtbiasphs_bf8_scalar(a: [u16; 32], bias: [u16; 32]) -> [u8; 32] {
 
 /// Biased FP16 -> HF8 (E4M3) convert, non-saturating.
 ///
-/// Like [`cvtbiasph_bf8`] but targets HF8: a zero bias reproduces [`cvtph_hf8`] and
-/// overflow yields the HF8 NaN encoding `S.1111.111`.
+/// Like [`cvtbiasph_bf8`] but targets HF8: the bias is applied `>> 1` (E4M3 discards one
+/// fewer bit, spec section 16.2), FP16 subnormal inputs flush to signed zero, and overflow
+/// yields the HF8 NaN encoding `S.1111.111`. A zero bias TRUNCATES — it is NOT
+/// [`cvtph_hf8`]'s RTNE.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.1]`
@@ -471,7 +485,8 @@ pub fn cvtbiasph_hf8(a: [u16; 32], bias: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtbiasph_hf8_hw(a, bias) };
         }
     }
@@ -507,7 +522,8 @@ pub fn cvtbiasphs_hf8(a: [u16; 32], bias: [u16; 32]) -> [u8; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvtbiasphs_hf8_hw(a, bias) };
         }
     }
@@ -707,17 +723,18 @@ mod tests {
         let near_one = fp16_bits(0, 15, 0b00_0000_0001);
         let a: [u16; 32] = [near_one; 32];
 
-        // (1) zero bias == plain family A (cvtph_bf8 / cvtphs_bf8).
+        // (1) zero bias TRUNCATES (section-16.2 SR); it agrees with plain family A here
+        // only because this value rounds DOWN under RTNE too (discarded bits below half).
         let zero_bias = [0u16; 32];
         assert_eq!(
             cvtbiasph_bf8(a, zero_bias),
             cvtph_bf8(a),
-            "zero bias reproduces non-saturating family A"
+            "zero bias agrees with family A on a round-down value"
         );
         assert_eq!(
             cvtbiasphs_bf8(a, zero_bias),
             cvtphs_bf8(a),
-            "zero bias reproduces saturating family A"
+            "zero bias agrees with saturating family A on a round-down value"
         );
         assert_eq!(
             cvtbiasph_bf8(a, zero_bias)[0] & 0b11,

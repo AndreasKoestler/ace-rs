@@ -1,11 +1,20 @@
 //! Crate-owned `AVX10_V1_AUX` / `AVX10_V2_AUX` capability checks.
 //!
 //! `std_detect` exposes no stable token for the AVX10.2-subset features this crate
-//! targets, so detection is a hand-rolled CPUID probe. The capability gate is the
-//! layered check `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2` (plus the `AVX10_V2_AUX` bit for
-//! the group-3 converts) together with the `XCR0`/`CR4.OSXSAVE` operating-system
-//! enablement state bits (`[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.2]`,
+//! targets, so detection is a hand-rolled CPUID probe. The capability gate is
+//! `AVX10.2` (plus the `AVX10_V2_AUX` bit for the group-3 converts) together with the
+//! `XCR0`/`CR4.OSXSAVE` operating-system enablement state bits
+//! (`[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.2]`,
 //! `[avx10-v2-aux-ocp-conversions.DETECTION.1]`).
+//!
+//! The spec's layered check `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2` describes when the
+//! *instructions* exist, but these gates guard the crate's native shims, which are
+//! compiled as whole translation units with `-mavx10.2` / `target("avx10.2")` — the
+//! compiler may emit any AVX10.2 instruction inside them, not only the AUX subset. A CPU
+//! satisfying the `(AVX10.1 AND AVX10_V1_AUX)` arm without AVX10.2 could therefore still
+//! `#UD` inside a shim, so the gates require the full `AVX10.2` the shims are built for.
+//! Every result is cached (`OnceLock`) — CPUID feature bits are immutable for the life of
+//! the process, and the raw probe costs several serializing CPUIDs per call.
 //!
 //! On non-x86_64 targets the checks return `false` so the public dispatchers always
 //! select the scalar oracle (`[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.3]`,
@@ -31,11 +40,12 @@
 const XCR0_VECTOR_STATE: u64 = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7);
 
 /// Shared OS-enablement + AVX10-base probe common to every AVX10.2-subset capability
-/// check. Returns `Some((avx10.1, avx10.2, sub-leaf-1 ECX))` once the AVX10 leaf,
-/// `CR4.OSXSAVE`, the `XCR0` vector state, and the AVX10-supported bit are all confirmed;
-/// `None` if any precondition fails (in which case the caller reports no capability).
+/// check. Returns `Some((AVX10_VSN, sub-leaf-1 ECX))` once the AVX10 leaf, `CR4.OSXSAVE`,
+/// the `XCR0` vector state, the AVX10-supported bit, and 512-bit vector support are all
+/// confirmed; `None` if any precondition fails (in which case the caller reports no
+/// capability). `AVX10_VSN >= 1` means AVX10.1, `>= 2` means AVX10.2 (spec section 3.1).
 #[cfg(target_arch = "x86_64")]
-fn avx10_base() -> Option<(bool, bool, u32)> {
+fn avx10_base() -> Option<(u32, u32)> {
     use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv};
 
     // CPUID leaf 0 reports the maximum standard leaf. AVX10 lives at leaf 0x24, so a CPU
@@ -50,39 +60,71 @@ fn avx10_base() -> Option<(bool, bool, u32)> {
     if (__cpuid(1).ecx >> 27) & 1 == 0 {
         return None;
     }
+    // SAFETY: CR4.OSXSAVE (CPUID.1:ECX[27]) was confirmed set immediately above, so
+    // XGETBV with ECX=0 is a defined, non-faulting read of XCR0.
     let xcr0 = unsafe { _xgetbv(0) };
     if xcr0 & XCR0_VECTOR_STATE != XCR0_VECTOR_STATE {
         return None;
     }
 
+    // AVX10 enumeration proper: CPUID.(EAX=07H,ECX=1):EDX[19]. This — not any bit in leaf
+    // 0x24 — is the architectural "AVX10 supported" bit (ACE v1 spec section 3.1).
+    if (__cpuid_count(7, 1).edx >> 19) & 1 == 0 {
+        return None;
+    }
+
     // AVX10 converged-ISA leaf: CPUID.(EAX=24H,ECX=0):EBX.
-    //   bit 16    = AVX10 supported at all
     //   bits 7:0  = AVX10 converged version (>= 1 means AVX10.1, >= 2 means AVX10.2)
+    //   bits 18:16 = RESERVED, architecturally reading "111" (ACE v1 spec section 3.1 /
+    //   15.5.1). Bit 18 was the 512-bit vector-length bit in AVX10 spec rev 1.0; checking
+    //   it accepts both the rev-1.0 reading and the fixed "111" reading, and every native
+    //   shim in this crate is 512-bit (ZMM), so a part reporting it 0 must stay on the
+    //   scalar oracle.
     let avx10 = __cpuid_count(0x24, 0);
-    if (avx10.ebx >> 16) & 1 == 0 {
+    if (avx10.ebx >> 18) & 1 == 0 {
         return None;
     }
     let version = avx10.ebx & 0xff;
 
     // The AUX feature bits live in CPUID.(EAX=24H,ECX=1):ECX (V1_AUX at bit 2, V2_AUX at
-    // bit 3); hand the raw ECX back so each caller reads the bit it needs.
+    // bit 3, spec section 3.1); hand the raw ECX back so each caller reads what it needs.
     let aux_ecx = __cpuid_count(0x24, 1).ecx;
-    Some((version >= 1, version >= 2, aux_ecx))
+    Some((version, aux_ecx))
 }
 
-/// Returns `true` when the running CPU supports `AVX10_V1_AUX` with OS state enabled.
+/// The spec section-3.2 step-1 base arm: `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2`,
+/// evaluated on top of [`avx10_base`]'s OS-state and enumeration checks.
+#[cfg(target_arch = "x86_64")]
+fn avx10_step1_base_arm() -> bool {
+    match avx10_base() {
+        Some((version, aux_ecx)) => {
+            let v1_aux = (aux_ecx >> 2) & 1 != 0;
+            (version >= 1 && v1_aux) || version >= 2
+        }
+        None => false,
+    }
+}
+
+/// Returns `true` when the running CPU supports the `AVX10_V1_AUX` native shims with OS
+/// state enabled.
 ///
-/// Gates on `CPUID.(EAX=24H,ECX=1):ECX[2]` under the layered check
-/// `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2`, plus the [`XCR0_VECTOR_STATE`] and
-/// `CR4.OSXSAVE` bits surfaced through CPUID. `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.2]`
+/// Requires full `AVX10.2` (leaf 0x24 version >= 2), plus the [`XCR0_VECTOR_STATE`] and
+/// `CR4.OSXSAVE` bits surfaced through CPUID. The spec's weaker
+/// `(AVX10.1 AND AVX10_V1_AUX)` arm is deliberately NOT accepted: it proves the AUX
+/// *instructions* exist, but the shims this gate guards are compiled with
+/// `target("avx10.2")`, so only full AVX10.2 makes calling them sound (see the module
+/// docs). Cached after the first probe. `[avx10-v1-aux-fp16-fp8-evex-vnni.DISPATCH.2]`
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_avx10_v1_aux() -> bool {
-    let Some((avx10_1, avx10_2, aux)) = avx10_base() else {
-        return false;
-    };
-    let avx10_v1_aux = (aux >> 2) & 1 != 0;
-    // Layered guard: (AVX10.1 AND AVX10_V1_AUX) OR AVX10.2.
-    (avx10_1 && avx10_v1_aux) || avx10_2
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let Some((version, _aux)) = avx10_base() else {
+            return false;
+        };
+        // Shim-soundness guard: full AVX10.2 only (module docs explain why the spec's
+        // (AVX10.1 AND AVX10_V1_AUX) arm is insufficient for `-mavx10.2` shims).
+        version >= 2
+    })
 }
 
 /// Non-x86_64 stub: no AVX10 capability exists, so the dispatcher always selects the
@@ -95,31 +137,28 @@ pub(crate) fn has_avx10_v1_aux() -> bool {
 /// Returns `true` when the running CPU supports `AVX10_V2_AUX` with OS state enabled.
 ///
 /// Gates on `CPUID.(EAX=24H,ECX=1):ECX[3]` (the `AVX10_V2_AUX` token — FP32->FP8
-/// converts, the FP4/FP6 converts, `VPMOVSSDB`, `VUNPACKB`) under the ACE v1 spec §3.2
-/// layered detection:
-///
-///   1. `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2`
-///   2. `AVX10_V2_AUX`
-///
-/// together with the [`XCR0_VECTOR_STATE`] (AVX-512 vector/opmask XSAVE state) and
-/// `CR4.OSXSAVE` operating-system enablement bits, otherwise an EVEX-encoded native path
-/// would fault (`[avx10-v2-aux-ocp-conversions.DETECTION.1]`).
+/// converts, the FP4/FP6 converts, `VPMOVSSDB`, `VUNPACKB`) AND full `AVX10.2`, together
+/// with the [`XCR0_VECTOR_STATE`] (AVX-512 vector/opmask XSAVE state) and `CR4.OSXSAVE`
+/// operating-system enablement bits, otherwise an EVEX-encoded native path would fault
+/// (`[avx10-v2-aux-ocp-conversions.DETECTION.1]`). As with [`has_avx10_v1_aux`], the ACE
+/// v1 spec §3.2 layered base check `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2` is tightened
+/// to full `AVX10.2` because any future V2_AUX shim will be compiled `-mavx10.2` (module
+/// docs). Cached after the first probe.
 ///
 /// NOTE: §3.2 also lists the tile + BSR XSAVE state (`XCR0[20,18:17]`) for *full ACE v1*
 /// support, but those belong to the out-of-scope group-4 tile instructions and are not
-/// required to issue the group-3 vector converts — see [`XCR0_VECTOR_STATE`]. The
-/// iteration-1 [`has_avx10_v1_aux`] gate (which reads `ECX[2]`) shares the same base probe
-/// and is behaviourally unchanged.
+/// required to issue the group-3 vector converts — see [`XCR0_VECTOR_STATE`].
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_avx10_v2_aux() -> bool {
-    let Some((avx10_1, avx10_2, aux)) = avx10_base() else {
-        return false;
-    };
-    let avx10_v1_aux = (aux >> 2) & 1 != 0;
-    let avx10_v2_aux = (aux >> 3) & 1 != 0;
-    // Layered guard (§3.2 steps 1-2): the base ISA must be present
-    // ((AVX10.1 AND AVX10_V1_AUX) OR AVX10.2) AND the AVX10_V2_AUX feature itself.
-    ((avx10_1 && avx10_v1_aux) || avx10_2) && avx10_v2_aux
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let Some((version, aux)) = avx10_base() else {
+            return false;
+        };
+        let avx10_v2_aux = (aux >> 3) & 1 != 0;
+        // Shim-soundness guard: full AVX10.2 AND the AVX10_V2_AUX feature itself.
+        version >= 2 && avx10_v2_aux
+    })
 }
 
 /// Non-x86_64 stub: no AVX10 capability exists, so the dispatcher always selects the
@@ -132,48 +171,121 @@ pub(crate) fn has_avx10_v2_aux() -> bool {
 // ===================== ACE group-4 tile-instruction detection =====================
 //
 // The group-4 tile instructions (families A-G: tile lifecycle, moves, tile-row converts,
-// BSR registers, and the `TOP*` outer products) use a stateful register file — the AMX-tile
-// data/config registers plus the ACE block-scale registers (`BSR*`) — that the group-3
-// vector converts above never touch. They therefore need a SEPARATE XSAVE-state mask and a
+// BSR register, and the `TOP*` outer products) use a stateful register file — the AMX-tile
+// data/config registers plus the ACE block-scale register (SCALEDATA) — that the group-3
+// vector converts above never touch. They therefore need SEPARATE XSAVE-state masks and a
 // per-family capability gate rather than the single `XCR0_VECTOR_STATE` / AVX10 check.
 //
-// OQ-5 (hand-rolled CPUID composition): `std_detect` still exposes no stable token for
-// `has_ace`/AMX-TILE/AMX-AVX512, so — exactly as [`avx10_base`] does for AVX10 — these are
-// hand-rolled CPUID probes composed on the shared base probe. The exact ACE feature-bit and
-// `ACE_VSN` leaf/sub-leaf positions transcribe the ACE v1 spec section 3.2 *full-ACE-v1*
-// detection algorithm; they are Inferred (OQ-5) pending confirmation against the rev-1.15
-// PDF and are the single place to correct once the tokens are pinned or `std_detect` gains
-// them. Non-x86_64 targets stub every helper to `false` so the dispatchers always take the
-// scalar oracle.
+// `std_detect` still exposes no stable token for AMX-TILE/AMX-AVX512/ACE, so — exactly as
+// [`avx10_base`] does for AVX10 — these are hand-rolled CPUID probes. All positions are
+// confirmed against the rev-1.15 PDF (sections 3.1, 15.5, Appendix A): AMX-TILE = leaf 07H
+// EDX[24]; AMX-AVX512 = leaf 1EH sub-leaf 1 EAX[7]; ACE = leaf 07H sub-leaf 1 ECX[11];
+// ACE_VSN = leaf 1DH sub-leaf 2 EAX[7:0] (the spec redefines that sub-leaf: EAX[7:0] =
+// ACE_VSN, EAX[31:8] reserved, populated with zeros when ACE is absent — section 15.5.1).
+// Per the spec formula `ACEv1 = (ACE AND ACE_VSN >= 1)`, `ACE_VSN` is never consulted
+// without the ACE feature bit. Non-x86_64 targets stub every helper to `false` so the
+// dispatchers always take the scalar oracle.
+//
+// XSAVE granularity (spec section 15.4): the existing AMX framework instructions
+// (LDTILECFG/STTILECFG/TILEZERO/TILERELEASE) remain sensitive to only `XCR0[18:17]`
+// (section 15.4.1) — NOT to the ACE-only `XCR0[20]` (SCALEDATA), which cannot even be set
+// on non-ACE parts. Only the ACE instruction families require `XCR0[20,18:17] = 0b111`
+// (sections 3.2 and 15.4.6). Gating the plain AMX families on bit 20 would permanently
+// disable them on every existing AMX CPU.
 
-/// XSAVE state required before ANY native tile path may run: the AVX-512 vector state PLUS
-/// the AMX-tile + BSR state bits `XCR0[20,18:17]=0b111` (spec section 3.2)
-/// (`[ace-tile-instructions.DETECT.2]`).
+/// XSAVE state for the plain AMX framework instructions (family A):
+/// `XCR0[18:17]` — bit 17 = TILECFG, bit 18 = TILEDATA (spec section 15.4.1).
+#[cfg(target_arch = "x86_64")]
+const XCR0_AMX_FRAMEWORK_STATE: u64 = (1 << 18) | (1 << 17);
+
+/// XSAVE state required before an ACE-family native path may run: the AVX-512 vector state
+/// PLUS the AMX-tile + SCALEDATA state bits `XCR0[20,18:17]=0b111` (spec sections 3.2 and
+/// 15.4.6) (`[ace-tile-instructions.DETECT.2]`).
 ///
 /// This is a SEPARATE constant, deliberately NOT a widening of [`XCR0_VECTOR_STATE`]: the
 /// group-3 vector converts must keep gating on the vector state alone (see that constant's
-/// docs), so requiring the AMX/BSR bits there would wrongly reject a CPU that supports the
-/// converts but whose OS has not enabled the tile state. Bit 17 = tile config, bit 18 = tile
-/// data, bit 20 = the ACE block-scale (`BSR`) state.
+/// docs). Bit 17 = tile config, bit 18 = tile data, bit 20 = the ACE block-scale
+/// (SCALEDATA) state.
 #[cfg(target_arch = "x86_64")]
 const XCR0_TILE_STATE: u64 = XCR0_VECTOR_STATE | (1 << 20) | (1 << 18) | (1 << 17);
 
-/// `true` when `CR4.OSXSAVE` is set and `XCR0` has the full tile + BSR state
-/// ([`XCR0_TILE_STATE`]) enabled — the OS-enablement precondition for every native tile
-/// path (`[ace-tile-instructions.DETECT.2]`).
+/// `true` when `CR4.OSXSAVE` is set and `XCR0` has all the bits in `mask` enabled.
 #[cfg(target_arch = "x86_64")]
-fn xcr0_tile_state_enabled() -> bool {
+fn xcr0_state_enabled(mask: u64) -> bool {
     use core::arch::x86_64::{__cpuid, _xgetbv};
     // CR4.OSXSAVE (CPUID.1:ECX[27]) gates XGETBV.
     if (__cpuid(1).ecx >> 27) & 1 == 0 {
         return false;
     }
+    // SAFETY: CR4.OSXSAVE (CPUID.1:ECX[27]) was confirmed set immediately above, so
+    // XGETBV with ECX=0 is a defined, non-faulting read of XCR0.
     let xcr0 = unsafe { _xgetbv(0) };
-    xcr0 & XCR0_TILE_STATE == XCR0_TILE_STATE
+    xcr0 & mask == mask
 }
 
-/// `ACE_VSN`, the ACE version, read from `CPUID.(EAX=1DH,ECX=2):EAX[7:0]`; `0` when the leaf
-/// is absent. Inferred leaf/sub-leaf/field (OQ-5). `>= 1` denotes ACE v1.
+/// Per-process tile-state permission (`IA32_XFD[18]` handling, spec sections 15.4.3 and
+/// 15.4.6): every tile-data instruction raises `#NM` while `IA32_XFD[18] = 1`, and on
+/// Linux the kernel keeps `XFD[18]` set for each process until it requests the dynamic
+/// XSTATE component via `arch_prctl(ARCH_REQ_XCOMP_PERM, <feature>)` — even though
+/// `XGETBV` already reports `XCR0[18] = 1`. So a CPUID/XCR0-only probe would report tile
+/// support while the very first native tile shim faults.
+///
+/// `feature` is the highest dynamic XSTATE component number needed (18 = TILEDATA for the
+/// plain AMX families, 20 = SCALEDATA for the ACE families). Returns `true` when the
+/// kernel grants (or has already granted) the permission. On x86_64 non-Linux targets
+/// this returns `true`: no equivalent userspace request exists there and the OSes that
+/// enable the XCR0 bits do so without a per-process opt-in.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn request_xcomp_perm(feature: u64) -> bool {
+    // arch_prctl(2) codes from the kernel ABI (asm/prctl.h).
+    const ARCH_GET_XCOMP_PERM: u64 = 0x1022;
+    const ARCH_REQ_XCOMP_PERM: u64 = 0x1023;
+    const SYS_ARCH_PRCTL: u64 = 158;
+
+    unsafe fn arch_prctl(code: u64, addr: u64) -> i64 {
+        let ret: i64;
+        // SAFETY: raw `arch_prctl` syscall; both commands only read/update the calling
+        // process's XSTATE permission bitmap and write nothing through `addr` for
+        // ARCH_REQ_XCOMP_PERM (addr is the feature number). For ARCH_GET_XCOMP_PERM the
+        // kernel writes a u64 bitmap through the pointer in `addr`.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") SYS_ARCH_PRCTL,
+                in("rdi") code,
+                in("rsi") addr,
+                out("rcx") _,
+                out("r11") _,
+                lateout("rax") ret,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    // Fast path: already permitted?
+    let mut bitmap: u64 = 0;
+    // SAFETY: `bitmap` is a valid writable u64 for ARCH_GET_XCOMP_PERM.
+    if unsafe { arch_prctl(ARCH_GET_XCOMP_PERM, &mut bitmap as *mut u64 as u64) } == 0
+        && bitmap & (1 << feature) != 0
+    {
+        return true;
+    }
+    // SAFETY: ARCH_REQ_XCOMP_PERM takes the feature number by value.
+    unsafe { arch_prctl(ARCH_REQ_XCOMP_PERM, feature) == 0 }
+}
+
+/// Non-Linux x86_64 stub (see the Linux variant's docs).
+#[cfg(all(target_arch = "x86_64", not(target_os = "linux")))]
+fn request_xcomp_perm(_feature: u64) -> bool {
+    true
+}
+
+/// `ACE_VSN`, the ACE version, read from `CPUID.(EAX=1DH,ECX=2):EAX[7:0]` (spec sections
+/// 3.1 and 15.5.1); `0` when the leaf is absent. `>= 1` denotes ACE v1. The spec defines
+/// this sub-leaf as EAX[7:0] = ACE_VSN with EAX[31:8] reserved, populated with zeros when
+/// ACE is not implemented; per the spec formula `ACEv1 = (ACE AND ACE_VSN >= 1)` callers
+/// consult it only together with the ACE feature bit ([`ace_v1_present`]).
 #[cfg(target_arch = "x86_64")]
 fn ace_vsn() -> u32 {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
@@ -184,53 +296,119 @@ fn ace_vsn() -> u32 {
     __cpuid_count(0x1d, 2).eax & 0xff
 }
 
-/// Returns `true` when the running CPU supports the AMX-TILE capability with the tile + BSR
-/// XSAVE state enabled — the native gate for family A (tile config lifecycle)
-/// (`[ace-tile-instructions.DETECT.1]`, `[ace-tile-instructions.DETECT.1-1]`).
-///
-/// Gates on `CPUID.(EAX=07H,ECX=0):EDX[24]` (AMX-TILE) plus [`XCR0_TILE_STATE`].
+/// `true` when the ACE feature bit `CPUID.(EAX=07H,ECX=1):ECX[11]` is set AND
+/// `ACE_VSN >= 1` — the spec's `ACEv1 = (ACE AND ACE_VSN >= 1)` formula (sections 3.1,
+/// 15.5.1, Appendix A; §3.2 steps 3-4).
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn has_amx_tile() -> bool {
+fn ace_v1_present() -> bool {
     use core::arch::x86_64::__cpuid_count;
-    if !xcr0_tile_state_enabled() {
-        return false;
-    }
-    // AMX-TILE = CPUID.(EAX=07H,ECX=0):EDX[24].
-    (__cpuid_count(7, 0).edx >> 24) & 1 != 0
+    let ace_bit = (__cpuid_count(7, 1).ecx >> 11) & 1 != 0; // ACE = Fn07H/1 ECX[11] (§3.1)
+    ace_bit && ace_vsn() >= 1
 }
 
-/// Returns `true` when the running CPU supports the AMX-AVX512 tile path OR ACE v1 — the
-/// native gate for family C (tile-row converts) and the `TILEMOVROW` read form
+/// Returns `true` when the running CPU supports the AMX-TILE capability with the AMX
+/// framework XSAVE state enabled and per-process tile permission granted — the native gate
+/// for family A (tile config lifecycle)
+/// (`[ace-tile-instructions.DETECT.1]`, `[ace-tile-instructions.DETECT.1-1]`).
+///
+/// Gates on `CPUID.(EAX=07H,ECX=0):EDX[24]` (AMX-TILE, spec section 3.1) plus
+/// `XCR0[18:17]` ([`XCR0_AMX_FRAMEWORK_STATE`] — the plain AMX framework instructions are
+/// sensitive to only these two bits, spec section 15.4.1, NOT the ACE-only `XCR0[20]`)
+/// plus the Linux `arch_prctl` TILEDATA permission ([`request_xcomp_perm`]).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_amx_tile() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use core::arch::x86_64::__cpuid_count;
+        if !xcr0_state_enabled(XCR0_AMX_FRAMEWORK_STATE) {
+            return false;
+        }
+        // AMX-TILE = CPUID.(EAX=07H,ECX=0):EDX[24].
+        if (__cpuid_count(7, 0).edx >> 24) & 1 == 0 {
+            return false;
+        }
+        // IA32_XFD[18] must be 0 for tile-data access (spec section 15.4.6).
+        request_xcomp_perm(18)
+    })
+}
+
+/// Returns `true` when the running CPU supports the tile-row read/convert path — the native
+/// gate for family C (tile-row converts) and the `TILEMOVROW` read form
 /// (`[ace-tile-instructions.DETECT.1]`, `[ace-tile-instructions.DETECT.1-2]`).
 ///
-/// Composes on [`avx10_base`] (AVX10 base + vector OS state) and requires the tile XSAVE
-/// state, then the AMX-AVX512 feature bit `CPUID.(EAX=07H,ECX=1):EDX[21]` OR `ACE_VSN >= 1`.
-/// The AMX-AVX512 bit position is Inferred (OQ-5).
+/// The spec section-15.3 feature enumeration for these instructions is
+/// `AMX-AVX512 || ACE_VSN >= 1`, on top of AMX-TILE. AMX-AVX512 =
+/// `CPUID.(EAX=1EH,ECX=1):EAX[7]` (leaf 1EH sub-leaf 1 EAX enumerates the AMX feature
+/// flags; the spec populates the leaf with zeros on ACE-only parts, which the
+/// `ace_v1_present()` arm covers — section 15.5.2). These instructions also write ZMM
+/// state, so the AVX-512 vector XSAVE state is required (section 15.4.6); [`avx10_base`]
+/// additionally requires the AVX10 enumeration because the crate's family-C shims are
+/// compiled `-mavx10.2` (a shim-soundness tightening, see the module docs).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_amx_avx512() -> bool {
-    use core::arch::x86_64::__cpuid_count;
-    if avx10_base().is_none() || !xcr0_tile_state_enabled() {
-        return false;
-    }
-    let amx_avx512 = (__cpuid_count(7, 1).edx >> 21) & 1 != 0; // Inferred bit (OQ-5)
-    amx_avx512 || ace_vsn() >= 1
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        use core::arch::x86_64::{__cpuid, __cpuid_count};
+        if !has_amx_tile() {
+            return false;
+        }
+        // ZMM writes need the AVX-512 vector XSAVE state; avx10_base also proves the
+        // AVX10 enumeration the `-mavx10.2`-compiled shim needs.
+        if avx10_base().is_none() {
+            return false;
+        }
+        // AMX-AVX512 = CPUID.(EAX=1EH,ECX=1):EAX[7]; guard the leaf first.
+        let amx_avx512 = __cpuid(0).eax >= 0x1e && (__cpuid_count(0x1e, 1).eax >> 7) & 1 != 0;
+        amx_avx512 || ace_v1_present()
+    })
 }
 
 /// Returns `true` when the running CPU supports the full ACE v1 capability — the native gate
 /// for families D/E/F/G and the write-form tile moves
 /// (`[ace-tile-instructions.DETECT.1]`, `[ace-tile-instructions.DETECT.1-3]`).
 ///
-/// Full ACE v1 (spec section 3.2) = ACE `CPUID.(EAX=07H,ECX=1):ECX[11]` AND `ACE_VSN >= 1`
-/// AND AMX-TILE, with the tile + BSR XSAVE state enabled (the last two via
-/// [`has_amx_tile`]). The ACE feature-bit position and `ACE_VSN` leaf are Inferred (OQ-5).
+/// Implements ALL seven steps of the spec section-3.2 detection algorithm:
+/// 1. `(AVX10.1 AND AVX10_V1_AUX) OR AVX10.2` ([`avx10_step1_base_arm`])
+/// 2. `AVX10_V2_AUX` (`CPUID.(EAX=24H,ECX=1):ECX[3]`)
+/// 3. `ACE` (`CPUID.(EAX=07H,ECX=1):ECX[11]`)
+/// 4. `ACE_VSN >= 1` (`CPUID.(EAX=1DH,ECX=2):EAX[7:0]`)
+/// 5. `XCR0[20,18:17] = 0b111` (tile + SCALEDATA XSAVE state)
+/// 6. `XCR0[7:5] = 0b111` (AVX-512 state; [`avx10_base`] also checks `XCR0[2:1]`,
+///    required by section 15.4.6 for ACE instructions that access AVX state)
+/// 7. `CR4.OSXSAVE = 1`
+///
+/// plus the per-process SCALEDATA permission (`IA32_XFD`, spec sections 15.4.3/15.4.6,
+/// [`request_xcomp_perm`]) and AMX-TILE (spec section 3.1 lists it as a required AMX
+/// component; also keeps `has_ace() => has_amx_tile()`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_ace() -> bool {
-    use core::arch::x86_64::__cpuid_count;
-    if !has_amx_tile() {
-        return false;
-    }
-    let ace_bit = (__cpuid_count(7, 1).ecx >> 11) & 1 != 0; // ACE Fn7/1 ECX[11] (Inferred, OQ-5)
-    ace_bit && ace_vsn() >= 1
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        // Steps 1-2 (+ steps 6-7 via avx10_base's CR4.OSXSAVE/XCR0 vector checks).
+        if !avx10_step1_base_arm() {
+            return false;
+        }
+        let Some((_, aux)) = avx10_base() else {
+            return false;
+        };
+        if (aux >> 3) & 1 == 0 {
+            return false; // step 2: AVX10_V2_AUX
+        }
+        // Steps 3-4.
+        if !ace_v1_present() {
+            return false;
+        }
+        // Step 5 (plus vector state again; XCR0_TILE_STATE is a superset of step 6).
+        if !xcr0_state_enabled(XCR0_TILE_STATE) {
+            return false;
+        }
+        // AMX-TILE component + TILEDATA permission.
+        if !has_amx_tile() {
+            return false;
+        }
+        // SCALEDATA (dynamic XSTATE component 20) permission.
+        request_xcomp_perm(20)
+    })
 }
 
 /// Non-x86_64 stubs: no tile capability exists, so every tile dispatcher takes the scalar

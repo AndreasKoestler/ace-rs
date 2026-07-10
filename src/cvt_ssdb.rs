@@ -21,8 +21,10 @@
 //! (`[avx10-v2-aux-ocp-conversions.CVT_SSDB.2]`). The asymmetric `VPMOVSDB` lacks this
 //! property — it would map `i32::MIN` to `-128`.
 //!
-//! The public dispatcher is a safe fn that selects the scalar oracle whenever the running
-//! CPU lacks `AVX10_V2_AUX` (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
+//! The public dispatcher is a safe fn; with no native group-3 intrinsic available in
+//! current toolchains it always takes the scalar oracle (see the OQ-5 note below), with
+//! `detect::has_avx10_v2_aux` marking where the native gate goes live
+//! (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`). The `_scalar`
 //! oracle is the primary, always-correct path on every target including non-x86
 //! (`[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]`,
 //! `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`); it carries no cfg gate, reads no global
@@ -39,12 +41,12 @@
 //! in the toolchain. Per OQ-5 there is therefore no native C shim, no `extern "C"`
 //! declaration, and no `_hw` path; each dispatcher resolves to its `_scalar` sibling on every
 //! target. The capability check
-//! [`crate::detect::has_avx10_v2_aux`] is never consulted — with no native path there is
+//! `crate::detect::has_avx10_v2_aux` is never consulted — with no native path there is
 //! nothing to gate; the dispatcher only references the detector to mark the future gate
 //! site. A native path is added once the intrinsic lands in the toolchain. The
 //! differential test that would otherwise tie a native path to the oracle DISCARDS (no native
 //! path exists), so correctness is grounded against the sect 9.8.5 pseudocode transcribed in
-//! [`saturate_int32_to_symmetric_int8`].
+//! `saturate_int32_to_symmetric_int8`.
 
 use crate::detect;
 
@@ -76,10 +78,10 @@ fn saturate_int32_to_symmetric_int8(x: i32) -> i8 {
 /// dispatcher.
 ///
 /// Per lane: clamp the signed `i32` to the symmetric `[-127, +127]` and narrow to `i8` via
-/// [`saturate_int32_to_symmetric_int8`]. The output is one quarter of the input width (16
+/// `saturate_int32_to_symmetric_int8`. The output is one quarter of the input width (16
 /// dwords -> 16 bytes, `[avx10-v2-aux-ocp-conversions.CVT_SSDB.3]`).
 ///
-/// No native path is wired, so [`detect::has_avx10_v2_aux`] is never consulted (OQ-5,
+/// No native path is wired, so `detect::has_avx10_v2_aux` is never consulted (OQ-5,
 /// see the module docs — `_mm512_cvtssepi32_epi8` is absent from the `-mavx10.2` toolchain);
 /// the dispatcher resolves to [`cvtssepi32_epi8_scalar`] on every target, returning
 /// the spec-defined value (`[avx10-v2-aux-ocp-conversions.DETECTION.2]`).
@@ -95,7 +97,7 @@ pub fn cvtssepi32_epi8(a: [i32; 16]) -> [i8; 16] {
 
 /// Portable reference oracle for [`cvtssepi32_epi8`] — the primary always-correct path.
 ///
-/// Maps each `i32` lane through [`saturate_int32_to_symmetric_int8`], the sect 9.8.5
+/// Maps each `i32` lane through `saturate_int32_to_symmetric_int8`, the sect 9.8.5
 /// symmetric clamp. Carries no cfg gate and reads no global state.
 /// `[avx10-v2-aux-ocp-conversions.CORRECTNESS.1]` `[avx10-v2-aux-ocp-conversions.CORRECTNESS.2]`
 pub fn cvtssepi32_epi8_scalar(a: [i32; 16]) -> [i8; 16] {

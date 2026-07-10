@@ -33,7 +33,8 @@ pub fn cvthf8_ph(a: [u8; 32]) -> [u16; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvthf8_ph_hw(a) };
         }
     }
@@ -54,7 +55,7 @@ unsafe fn cvthf8_ph_hw(a: [u8; 32]) -> [u16; 32] {
 
 /// Portable reference oracle for [`cvthf8_ph`] — the primary always-correct path.
 ///
-/// Maps each HF8 lane through [`fp8::hf8_to_fp16`], the exact E4M3->FP16 decode. Carries
+/// Maps each HF8 lane through `fp8::hf8_to_fp16`, the exact E4M3->FP16 decode. Carries
 /// no cfg gate and reads no global state. `[avx10-v1-aux-fp16-fp8-evex-vnni.ORACLE.1]`
 pub fn cvthf8_ph_scalar(a: [u8; 32]) -> [u16; 32] {
     core::array::from_fn(|i| fp8::hf8_to_fp16(a[i]))

@@ -117,17 +117,25 @@ extern "C" {
     pub(crate) fn ace_tile_tcvtrowps2phh(cfg: *const u8, data: *const u8, row: u32, out: *mut u16);
     pub(crate) fn ace_tile_tcvtrowps2phl(cfg: *const u8, data: *const u8, row: u32, out: *mut u16);
 
-    // Family B write (.byte): ZMM -> tile row / column.
+    // Family B write (.byte, §6.3.3): ZMM -> tile row / byte-column (row/col fixed 0).
     pub(crate) fn ace_tile_movrow_write(cfg: *const u8, data: *const u8, out: *mut u8);
     pub(crate) fn ace_tile_movcol_write(cfg: *const u8, data: *const u8, out: *mut u8);
 
-    // Family D (.byte): block-scale registers.
-    pub(crate) fn ace_tile_bsrinit(cfg: *const u8, data: *const u8, out: *mut u8);
-    pub(crate) fn ace_tile_bsrmovf(cfg: *const u8, data: *const u8, out: *mut u8);
-    pub(crate) fn ace_tile_bsrmovh(cfg: *const u8, data: *const u8, out: *mut u8);
-    pub(crate) fn ace_tile_bsrmovl(cfg: *const u8, data: *const u8, out: *mut u8);
+    // Family D (.byte, §6.3.5): Block Scale register ops over the implicit bsr0. Each shim
+    // reads the halves back through the BSRMOVH/BSRMOVL read forms so the register state is
+    // observable.
+    pub(crate) fn ace_bsrinit_read(cfg: *const u8, out_a: *mut u8, out_b: *mut u8);
+    pub(crate) fn ace_bsrmovf_read(
+        a: *const u8,
+        b: *const u8,
+        cfg: *const u8,
+        out_a: *mut u8,
+        out_b: *mut u8,
+    );
+    pub(crate) fn ace_bsrmovh_roundtrip(a: *const u8, cfg: *const u8, out_a: *mut u8);
+    pub(crate) fn ace_bsrmovl_roundtrip(b: *const u8, cfg: *const u8, out_b: *mut u8);
 
-    // Family G (.byte): INT8 rank-4 outer products (C += A (x) B).
+    // Families G/F (.byte, §6.3.8/§6.3.9): outer products, C(tmm1) += A(zmm0) (x) B(zmm2).
     pub(crate) fn ace_tile_top4bssd(
         cfg: *const u8,
         c: *const u8,
@@ -156,8 +164,6 @@ extern "C" {
         b: *const u8,
         out: *mut u8,
     );
-
-    // Family F (.byte): BF16 rank-2 outer product, no block scale.
     pub(crate) fn ace_tile_top2bf16ps(
         cfg: *const u8,
         c: *const u8,
@@ -166,13 +172,15 @@ extern "C" {
         out: *mut u8,
     );
 
-    // Family E (.byte): MX-FP8 rank-4 outer products with a per-block BSR scale.
+    // Family E (.byte, §6.3.6/§6.3.7): MX rank-4 outer products. The BSR is implicit; the
+    // shim seeds it with BSRMOVF from the caller's A/B scale buffers; imm8 fixed 0.
     pub(crate) fn ace_tile_top4mxbf8ps(
         cfg: *const u8,
         c: *const u8,
         a: *const u8,
         b: *const u8,
-        bsr: *const u8,
+        a_scales: *const u8,
+        b_scales: *const u8,
         out: *mut u8,
     );
     pub(crate) fn ace_tile_top4mxbhf8ps(
@@ -180,7 +188,8 @@ extern "C" {
         c: *const u8,
         a: *const u8,
         b: *const u8,
-        bsr: *const u8,
+        a_scales: *const u8,
+        b_scales: *const u8,
         out: *mut u8,
     );
     pub(crate) fn ace_tile_top4mxhbf8ps(
@@ -188,7 +197,8 @@ extern "C" {
         c: *const u8,
         a: *const u8,
         b: *const u8,
-        bsr: *const u8,
+        a_scales: *const u8,
+        b_scales: *const u8,
         out: *mut u8,
     );
     pub(crate) fn ace_tile_top4mxhf8ps(
@@ -196,7 +206,8 @@ extern "C" {
         c: *const u8,
         a: *const u8,
         b: *const u8,
-        bsr: *const u8,
+        a_scales: *const u8,
+        b_scales: *const u8,
         out: *mut u8,
     );
     pub(crate) fn ace_tile_top4mxbssps(
@@ -204,73 +215,79 @@ extern "C" {
         c: *const u8,
         a: *const u8,
         b: *const u8,
-        bsr: *const u8,
+        a_scales: *const u8,
+        b_scales: *const u8,
         out: *mut u8,
     );
 }
 
-/// A 64-byte row-major tile / ZMM marshalling buffer (palette-2 tiles are at most
-/// `16 rows * 64 colsb` but every native shim moves data one 64-byte row / ZMM at a time).
-pub(crate) const TILE_BYTES: usize = 64;
+/// A 64-byte marshalling buffer: one ZMM / one tile row / one BSR half.
+pub(crate) const ROW_BYTES: usize = 64;
 
-/// Serialize a palette-2 tile descriptor into the 64-byte `LDTILECFG` layout the AMX intrinsics
-/// consume: byte 0 = palette id, byte 1 = start row (0), `colsb[t]` as little-endian `u16` at
-/// offset `16 + 2*t`, `rows[t]` at offset `48 + t`; every other byte reserved (0). This is the
-/// memory-marshalling counterpart the family-A/C shims load with `_tile_loadconfig`.
-pub(crate) fn encode_tilecfg(palette: u8, rows: &[u8; 8], colsb: &[u16; 8]) -> [u8; 64] {
+/// Serialize a [`crate::tile::TileConfig`]-shaped descriptor into the 64-byte `LDTILECFG`
+/// layout: byte 0 = palette id, bytes 1-63 = 0 (the palette-2 descriptor has no per-tile
+/// fields — spec section 11.2.3).
+pub(crate) fn encode_tilecfg(palette: u8) -> [u8; 64] {
     let mut cfg = [0u8; 64];
     cfg[0] = palette;
-    for t in 0..8 {
-        let c = colsb[t].to_le_bytes();
-        cfg[16 + 2 * t] = c[0];
-        cfg[16 + 2 * t + 1] = c[1];
-        cfg[48 + t] = rows[t];
-    }
     cfg
 }
 
-/// `_hw` wrappers: marshal fixed-size Rust buffers into the C shims. Every wrapper is `unsafe`
-/// and may be called only once the matching capability check has confirmed the running CPU
-/// supports the form (`detect::has_amx_tile` / `has_amx_avx512` / `has_ace`) with the tile +
-/// BSR XSAVE state enabled — otherwise the tile / EVEX instruction would fault (`#UD`). Callers
-/// go through the differential properties, which gate on those probes.
+// `_hw` wrappers: marshal fixed-size Rust buffers into the C shims. Every wrapper is `unsafe`
+// and may be called only once the matching capability check has confirmed the running CPU
+// supports the form (`detect::has_amx_tile` / `has_amx_avx512` / `has_ace`) with the required
+// XSAVE state enabled — otherwise the tile / EVEX instruction would fault (`#UD`). Callers go
+// through the differential properties, which gate on those probes.
+
+/// Family A: STTILECFG round-trip of a 64-byte descriptor.
 ///
 /// # Safety
-/// The CPU must support the relevant tile capability and OS tile-state enablement; the input
-/// buffers must be the documented lengths.
-
-/// Family A: STTILECFG round-trip of a 64-byte descriptor (INV-3).
+/// The CPU must support AMX-TILE with the tile XSAVE state enabled
+/// (`crate::detect::has_amx_tile`), otherwise the tile instructions fault (`#UD`).
 pub(crate) unsafe fn tile_cfg_roundtrip_hw(cfg: &[u8; 64]) -> [u8; 64] {
     let mut out = [0u8; 64];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers; the
+    // caller upholds the capability precondition above.
     ace_tile_cfg_roundtrip(cfg.as_ptr(), out.as_mut_ptr());
     out
 }
 
-/// Family A: TILEZERO of tile 0.
-pub(crate) unsafe fn tile_zero_hw(cfg: &[u8; 64], data: &[u8; TILE_BYTES]) -> [u8; TILE_BYTES] {
-    let mut out = [0u8; TILE_BYTES];
+/// Family A: TILEZERO of tile 0 (one 64-byte row marshalled).
+///
+/// # Safety
+/// The CPU must support AMX-TILE with the tile XSAVE state enabled
+/// (`crate::detect::has_amx_tile`), otherwise the tile instructions fault (`#UD`).
+pub(crate) unsafe fn tile_zero_hw(cfg: &[u8; 64], data: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
+    let mut out = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
     ace_tile_zero(cfg.as_ptr(), data.as_ptr(), out.as_mut_ptr());
     out
 }
 
 /// Family B read: TILEMOVROW read form (tile row -> ZMM).
+///
+/// # Safety
+/// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+/// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
 pub(crate) unsafe fn tile_movrow_read_hw(
     cfg: &[u8; 64],
-    data: &[u8; TILE_BYTES],
+    data: &[u8; ROW_BYTES],
     row: u32,
-) -> [u8; TILE_BYTES] {
-    let mut out = [0u8; TILE_BYTES];
+) -> [u8; ROW_BYTES] {
+    let mut out = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
     ace_tile_movrow_read(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
     out
 }
 
 /// Family C: TCVTROWD2PS (tile row INT32 -> FP32 ZMM).
-pub(crate) unsafe fn tcvtrowd2ps_hw(
-    cfg: &[u8; 64],
-    data: &[u8; TILE_BYTES],
-    row: u32,
-) -> [f32; 16] {
+///
+/// # Safety
+/// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+/// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
+pub(crate) unsafe fn tcvtrowd2ps_hw(cfg: &[u8; 64], data: &[u8; ROW_BYTES], row: u32) -> [f32; 16] {
     let mut out = [0f32; 16];
+    // SAFETY (FFI): the 64-byte inputs and 16-lane f32 output match the shim's contract.
     ace_tile_tcvtrowd2ps(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
     out
 }
@@ -278,8 +295,13 @@ pub(crate) unsafe fn tcvtrowd2ps_hw(
 macro_rules! tcvtrow_word_hw {
     ($name:ident, $shim:ident) => {
         /// Family C tile-row FP32 -> narrow (BF16 / FP16) convert (ZMM word lanes out).
-        pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; TILE_BYTES], row: u32) -> [u16; 32] {
+        ///
+        /// # Safety
+        /// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+        /// (`crate::detect::has_amx_avx512`), otherwise the instruction faults (`#UD`).
+        pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; ROW_BYTES], row: u32) -> [u16; 32] {
             let mut out = [0u16; 32];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented buffer lengths.
             $shim(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
             out
         }
@@ -292,9 +314,14 @@ tcvtrow_word_hw!(tcvtrowps2phl_hw, ace_tile_tcvtrowps2phl);
 
 macro_rules! move_write_hw {
     ($name:ident, $shim:ident) => {
-        /// Family B write / family D single-tile `.byte` shim (ZMM/data -> tile, stored back).
-        pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; TILE_BYTES]) -> [u8; TILE_BYTES] {
-            let mut out = [0u8; TILE_BYTES];
+        /// Family B write `.byte` shim (ZMM -> tile row/column 0, tile 1 stored back).
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
+        pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
+            let mut out = [0u8; ROW_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(cfg.as_ptr(), data.as_ptr(), out.as_mut_ptr());
             out
         }
@@ -302,21 +329,83 @@ macro_rules! move_write_hw {
 }
 move_write_hw!(tile_movrow_write_hw, ace_tile_movrow_write);
 move_write_hw!(tile_movcol_write_hw, ace_tile_movcol_write);
-move_write_hw!(bsrinit_hw, ace_tile_bsrinit);
-move_write_hw!(bsrmovf_hw, ace_tile_bsrmovf);
-move_write_hw!(bsrmovh_hw, ace_tile_bsrmovh);
-move_write_hw!(bsrmovl_hw, ace_tile_bsrmovl);
+
+/// Family D: BSRINIT then read both BSR halves back (A half, B half).
+///
+/// # Safety
+/// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
+pub(crate) unsafe fn bsrinit_hw(cfg: &[u8; 64]) -> ([u8; ROW_BYTES], [u8; ROW_BYTES]) {
+    let mut a = [0u8; ROW_BYTES];
+    let mut b = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
+    ace_bsrinit_read(cfg.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr());
+    (a, b)
+}
+
+/// Family D: BSRMOVF (a -> A scales, b -> B scales), both halves read back.
+///
+/// # Safety
+/// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
+pub(crate) unsafe fn bsrmovf_hw(
+    cfg: &[u8; 64],
+    a: &[u8; ROW_BYTES],
+    b: &[u8; ROW_BYTES],
+) -> ([u8; ROW_BYTES], [u8; ROW_BYTES]) {
+    let mut oa = [0u8; ROW_BYTES];
+    let mut ob = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
+    ace_bsrmovf_read(
+        a.as_ptr(),
+        b.as_ptr(),
+        cfg.as_ptr(),
+        oa.as_mut_ptr(),
+        ob.as_mut_ptr(),
+    );
+    (oa, ob)
+}
+
+/// Family D: BSRMOVH write-then-read round-trip of the A half.
+///
+/// # Safety
+/// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
+pub(crate) unsafe fn bsrmovh_hw(cfg: &[u8; 64], a: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
+    let mut out = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
+    ace_bsrmovh_roundtrip(a.as_ptr(), cfg.as_ptr(), out.as_mut_ptr());
+    out
+}
+
+/// Family D: BSRMOVL write-then-read round-trip of the B half.
+///
+/// # Safety
+/// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+/// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
+pub(crate) unsafe fn bsrmovl_hw(cfg: &[u8; 64], b: &[u8; ROW_BYTES]) -> [u8; ROW_BYTES] {
+    let mut out = [0u8; ROW_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
+    ace_bsrmovl_roundtrip(b.as_ptr(), cfg.as_ptr(), out.as_mut_ptr());
+    out
+}
 
 macro_rules! top_hw {
     ($name:ident, $shim:ident) => {
-        /// Family G / F rank-N outer-product `.byte` shim: `C += A (x) B`, dst tile stored back.
+        /// Families G/F outer-product `.byte` shim: `C += A (x) B`, dst tile stored back
+        /// (one 64-byte row marshalled).
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
-            c: &[u8; TILE_BYTES],
-            a: &[u8; TILE_BYTES],
-            b: &[u8; TILE_BYTES],
-        ) -> [u8; TILE_BYTES] {
-            let mut out = [0u8; TILE_BYTES];
+            c: &[u8; ROW_BYTES],
+            a: &[u8; ROW_BYTES],
+            b: &[u8; ROW_BYTES],
+        ) -> [u8; ROW_BYTES] {
+            let mut out = [0u8; ROW_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(
                 cfg.as_ptr(),
                 c.as_ptr(),
@@ -336,21 +425,29 @@ top_hw!(top2bf16ps_hw, ace_tile_top2bf16ps);
 
 macro_rules! mx_top_hw {
     ($name:ident, $shim:ident) => {
-        /// Family E MX-FP8 rank-4 outer-product `.byte` shim with a per-block BSR scale.
+        /// Family E MX rank-4 outer-product `.byte` shim: the implicit BSR is seeded with
+        /// BSRMOVF from the A/B scale buffers, imm8 fixed 0 (scale groups 0/0).
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + SCALEDATA XSAVE state enabled
+        /// (`crate::detect::has_ace`), otherwise the encoded instruction faults (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
-            c: &[u8; TILE_BYTES],
-            a: &[u8; TILE_BYTES],
-            b: &[u8; TILE_BYTES],
-            bsr: &[u8; TILE_BYTES],
-        ) -> [u8; TILE_BYTES] {
-            let mut out = [0u8; TILE_BYTES];
+            c: &[u8; ROW_BYTES],
+            a: &[u8; ROW_BYTES],
+            b: &[u8; ROW_BYTES],
+            a_scales: &[u8; ROW_BYTES],
+            b_scales: &[u8; ROW_BYTES],
+        ) -> [u8; ROW_BYTES] {
+            let mut out = [0u8; ROW_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(
                 cfg.as_ptr(),
                 c.as_ptr(),
                 a.as_ptr(),
                 b.as_ptr(),
-                bsr.as_ptr(),
+                a_scales.as_ptr(),
+                b_scales.as_ptr(),
                 out.as_mut_ptr(),
             );
             out
@@ -362,3 +459,195 @@ mx_top_hw!(top4mxbhf8ps_hw, ace_tile_top4mxbhf8ps);
 mx_top_hw!(top4mxhbf8ps_hw, ace_tile_top4mxhbf8ps);
 mx_top_hw!(top4mxhf8ps_hw, ace_tile_top4mxhf8ps);
 mx_top_hw!(top4mxbssps_hw, ace_tile_top4mxbssps);
+
+// ================================ Differential layer (group 4) ================================
+//
+// Native-vs-oracle differentials for the group-4 shims: each property gates on the matching
+// capability probe and DISCARDS (never passes vacuously) when the host lacks it. Families
+// A / B-read / C execute under Intel SDE today; the `.byte` families light up automatically
+// once an ACE-capable SDE/hardware host runs them.
+#[cfg(test)]
+mod differential {
+    use super::*;
+    use crate::detect;
+    use crate::tile::{_tile_loadconfig, TileConfig};
+    use quickcheck::{quickcheck, TestResult};
+
+    quickcheck! {
+        /// Family A: the native STTILECFG round-trip of the palette-2 descriptor equals the
+        /// oracle's stored descriptor (byte 0 = 2, bytes 1-63 = 0, spec section 11.3.4), and
+        /// native TILEZERO equals the oracle over one marshalled row.
+        fn prop_family_a_matches_oracle(seed: Vec<u8>) -> TestResult {
+            if !detect::has_amx_tile() {
+                return TestResult::discard();
+            }
+            let cfg = encode_tilecfg(2);
+            // SAFETY: has_amx_tile() confirmed AMX-TILE + XCR0[18:17] + XFD permission.
+            let got = unsafe { tile_cfg_roundtrip_hw(&cfg) };
+            let scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+            let want = crate::tile::_tile_storeconfig(&scope).to_bytes();
+            if got != want {
+                return TestResult::from_bool(false);
+            }
+
+            let mut row = [0u8; ROW_BYTES];
+            for (i, b) in seed.iter().take(ROW_BYTES).enumerate() {
+                row[i] = *b;
+            }
+            // SAFETY: capability confirmed above.
+            let zeroed = unsafe { tile_zero_hw(&cfg, &row) };
+            TestResult::from_bool(zeroed == [0u8; ROW_BYTES])
+        }
+
+        /// Families B-read / C: native TILEMOVROW / TCVTROW* over a one-row tile equal the
+        /// oracle for the same row data.
+        fn prop_row_converts_match_oracle(seed: Vec<u8>, row_sel: u8) -> TestResult {
+            if !detect::has_amx_avx512() {
+                return TestResult::discard();
+            }
+            let cfg = encode_tilecfg(2);
+            let mut row = [0u8; ROW_BYTES];
+            for (i, b) in seed.iter().take(ROW_BYTES).enumerate() {
+                row[i] = *b;
+            }
+            // Oracle scope with the row in tile 0 row 0.
+            let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+            let id = scope.tile(0).unwrap();
+            crate::tile_move::_tile_setrow_scalar(&mut scope, id, 0, row);
+            let row_sel = (row_sel & 0xF) as u32;
+            // The shim loads only one 64-byte row into the tile, so compare row 0 reads.
+            if row_sel != 0 {
+                return TestResult::discard();
+            }
+            // SAFETY: has_amx_avx512() confirmed the family-C capability set.
+            unsafe {
+                let mv = tile_movrow_read_hw(&cfg, &row, 0);
+                let d2 = tcvtrowd2ps_hw(&cfg, &row, 0);
+                let bh = tcvtrowps2bf16h_hw(&cfg, &row, 0);
+                let bl = tcvtrowps2bf16l_hw(&cfg, &row, 0);
+                let ph = tcvtrowps2phh_hw(&cfg, &row, 0);
+                let pl = tcvtrowps2phl_hw(&cfg, &row, 0);
+                let ok = mv == crate::tile_move::_tile_movrow_scalar(&scope, id, 0)
+                    && d2.iter().map(|f| f.to_bits()).collect::<Vec<_>>()
+                        == crate::tcvtrow::_tile_cvtrowd2ps_scalar(&scope, id, 0)
+                            .iter()
+                            .map(|f| f.to_bits())
+                            .collect::<Vec<_>>()
+                    && bh == crate::tcvtrow::_tile_cvtrowps2bf16h_scalar(&scope, id, 0)
+                    && bl == crate::tcvtrow::_tile_cvtrowps2bf16l_scalar(&scope, id, 0)
+                    && ph == crate::tcvtrow::_tile_cvtrowps2phh_scalar(&scope, id, 0)
+                    && pl == crate::tcvtrow::_tile_cvtrowps2phl_scalar(&scope, id, 0);
+                TestResult::from_bool(ok)
+            }
+        }
+
+        /// ACE-only `.byte` families (B-write, D, E, F, G): native equals oracle. Discards
+        /// until an ACE-capable host runs the suite (has_ace() is false everywhere today).
+        fn prop_ace_byte_families_match_oracle(seed: Vec<u8>) -> TestResult {
+            if !detect::has_ace() {
+                return TestResult::discard();
+            }
+            let cfg = encode_tilecfg(2);
+            let mut a = [0u8; ROW_BYTES];
+            let mut b = [0u8; ROW_BYTES];
+            for i in 0..ROW_BYTES {
+                a[i] = seed.get(i).copied().unwrap_or(0x11);
+                b[i] = seed.get(ROW_BYTES + i).copied().unwrap_or(0x22);
+            }
+            let c = [0u8; ROW_BYTES];
+
+            // BSR: BSRINIT reads back 0x7F halves; BSRMOVF/H/L round-trip the written halves.
+            // SAFETY: has_ace() confirmed the full §3.2 capability set.
+            unsafe {
+                let (ia, ib) = bsrinit_hw(&cfg);
+                if ia != [0x7F; 64] || ib != [0x7F; 64] {
+                    return TestResult::from_bool(false);
+                }
+                let (oa, ob) = bsrmovf_hw(&cfg, &a, &b);
+                if oa != a || ob != b {
+                    return TestResult::from_bool(false);
+                }
+                if bsrmovh_hw(&cfg, &a) != a || bsrmovl_hw(&cfg, &b) != b {
+                    return TestResult::from_bool(false);
+                }
+
+                // TILEMOVROW/TILEMOVCOL write (row/col 0): compare tile row 0 against oracle.
+                let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                let id = scope.tile(0).unwrap();
+                crate::tile_move::_tile_setrow_scalar(&mut scope, id, 0, a);
+                let want_row0 = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                if tile_movrow_write_hw(&cfg, &a) != want_row0 {
+                    return TestResult::from_bool(false);
+                }
+                let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                let id = scope.tile(0).unwrap();
+                crate::tile_move::_tile_setcol_scalar(&mut scope, id, 0, a);
+                let want_row0 = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                if tile_movcol_write_hw(&cfg, &a) != want_row0 {
+                    return TestResult::from_bool(false);
+                }
+
+                // TOP families over a single marshalled row (row 0 of C): every variant,
+                // each against its own oracle.
+                type Scalar = fn(&mut crate::tile::TileScope, crate::tile::TileId, [u8; 64], [u8; 64]);
+                type Hw = unsafe fn(&[u8; 64], &[u8; 64], &[u8; 64], &[u8; 64]) -> [u8; 64];
+                let int_tops: [(Scalar, Hw); 4] = [
+                    (crate::top::_tile_top4bssd_scalar, top4bssd_hw),
+                    (crate::top::_tile_top4bsud_scalar, top4bsud_hw),
+                    (crate::top::_tile_top4busd_scalar, top4busd_hw),
+                    (crate::top::_tile_top4buud_scalar, top4buud_hw),
+                ];
+                for (scalar, hw) in int_tops {
+                    let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                    let id = scope.tile(0).unwrap();
+                    scalar(&mut scope, id, a, b);
+                    let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                    if hw(&cfg, &c, &a, &b) != want {
+                        return TestResult::from_bool(false);
+                    }
+                }
+                // TOP2BF16PS reinterprets the same 64 bytes as 32 BF16 lanes.
+                let bf16: [u16; 32] =
+                    core::array::from_fn(|i| u16::from_le_bytes([a[2 * i], a[2 * i + 1]]));
+                let bf16_b: [u16; 32] =
+                    core::array::from_fn(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
+                let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                let id = scope.tile(0).unwrap();
+                crate::top::_tile_top2bf16ps_scalar(&mut scope, id, bf16, bf16_b);
+                let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                if top2bf16ps_hw(&cfg, &c, &a, &b) != want {
+                    return TestResult::from_bool(false);
+                }
+                // MX forms: imm8 fixed 0 in the shims; scales = 0x7F (unit) everywhere.
+                type MxScalar =
+                    fn(&mut crate::tile::TileScope, crate::tile::TileId, [u8; 64], [u8; 64], u8);
+                type MxHw = unsafe fn(
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                    &[u8; 64],
+                ) -> [u8; 64];
+                let mx_tops: [(MxScalar, MxHw); 5] = [
+                    (crate::top::_tile_top4mxbf8ps_scalar, top4mxbf8ps_hw),
+                    (crate::top::_tile_top4mxbhf8ps_scalar, top4mxbhf8ps_hw),
+                    (crate::top::_tile_top4mxhbf8ps_scalar, top4mxhbf8ps_hw),
+                    (crate::top::_tile_top4mxhf8ps_scalar, top4mxhf8ps_hw),
+                    (crate::top::_tile_top4mxbssps_scalar, top4mxbssps_hw),
+                ];
+                let scales = [0x7Fu8; 64];
+                for (scalar, hw) in mx_tops {
+                    let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+                    let id = scope.tile(0).unwrap();
+                    scalar(&mut scope, id, a, b, 0);
+                    let want = crate::tile_move::_tile_movrow_scalar(&scope, id, 0);
+                    if hw(&cfg, &c, &a, &b, &scales, &scales) != want {
+                        return TestResult::from_bool(false);
+                    }
+                }
+            }
+            TestResult::passed()
+        }
+    }
+}
