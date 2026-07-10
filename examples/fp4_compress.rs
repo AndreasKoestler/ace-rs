@@ -160,7 +160,7 @@ fn main() {
     }
     println!("\nunpackb(size=4, start=0, zext): all 64 nibbles match hand extraction");
     println!(
-        "  packed[0] = {:#04x} -> lanes [{:#03x}, {:#03x}]",
+        "  packed[0] = {:#04x} -> lanes [{:#x}, {:#x}]",
         packed[0], nibbles[0], nibbles[1]
     );
 
