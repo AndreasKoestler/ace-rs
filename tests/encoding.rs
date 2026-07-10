@@ -1,348 +1,450 @@
-//! Layer-2 encoding-assertion harness for the ACE group-4 `.byte` raw-encoding primitives
-//! (`[ace-tile-instructions.TESTING.5]`, design.md §11 "Layer-2 encoding harness").
+//! Layer-2 encoding-assertion harness for the ACE group-4 raw-encoding primitives
+//! (`[ace-tile-instructions.TESTING.5]`).
 //!
-//! This is the net-new harness the design calls for (the repo shipped no `.byte` path and no
-//! disassembly test before phase 8). It has two independent guarantees:
+//! Every golden constant below is transcribed from the ACE v1 rev-1.15 specification's
+//! section-6.3 encoding tables (PDF pages 26-27). The harness has two independent
+//! guarantees:
 //!
-//!  1. [`golden_bytes_match_per_byte_primitive`] — for every `ACE`-only `.byte` primitive
-//!     (family B write forms, D, E, F, G) it asserts the emitted byte sequence equals its
-//!     spec-derived golden constant. It reconstructs the EVEX encoding from the documented ACE
-//!     v1 §6 fields (prefix / map / pp / W / opcode / ModRM) and asserts the reconstruction
-//!     equals the recorded golden bytes, plus the EVEX structural invariants; then
-//!     [`c_shim_bytes_match_golden`] parses the actual `.byte` sequences out of
-//!     `src/native/ace_tile.c` and asserts they are exactly the golden set — so a
+//!  1. [`golden_bytes_match_per_byte_primitive`] — for every ACE-only raw-encoded
+//!     instruction form used by the `.byte` shims it reconstructs the VEX/EVEX byte
+//!     sequence from the documented section-6.3 fields (encoding kind / map / pp / W /
+//!     opcode / ModRM / vvvv / imm8) and asserts the reconstruction equals the recorded
+//!     golden bytes, plus structural invariants. Then [`c_shim_bytes_match_golden`] parses
+//!     the actual `.byte` sequences out of `src/native/ace_tile.c` and asserts every
+//!     sequence there is a golden constant and every golden constant appears — so a
 //!     transcription error IN THE C FILE (not merely in this table) is caught. Both ALWAYS
-//!     run and need NO external tool, so a `.byte` transcription error is caught on every
-//!     `cargo test` (R3 mitigation).
+//!     run and need NO external tool.
 //!
-//!  2. [`disassembly_mnemonic_operands_or_skip`] — when a system disassembler (`llvm-mc` or
-//!     `objdump`) is present it disassembles each golden byte sequence and, where the tool
-//!     recognizes the ACE mnemonic, asserts it matches; when the tool is absent — or does not
-//!     yet know the ACE encodings (binutils 2.46 / current LLVM predate ACE v1.15) — it
-//!     skips-with-warning and NEVER fails (mirroring the SDE capability-probe policy, R2/R3).
+//!  2. [`disassembly_mnemonic_operands_or_skip`] — when a system disassembler (`llvm-mc`
+//!     or `objdump`) is present it disassembles each golden sequence and, where the tool
+//!     recognizes the ACE mnemonic, asserts it matches; when the tool is absent — or does
+//!     not yet know the ACE encodings (binutils 2.46 / current LLVM predate ACE v1.15) —
+//!     it skips-with-warning and NEVER fails.
 //!
-//! The golden constants below are the single source of truth shared with the `.byte` shims in
-//! `src/native/ace_tile.c`; the two must stay in lockstep.
+//! Section-6.3 rows transcribed here (register-direct forms the shims use):
 //!
-//! ASSEMBLER/SDE ACE EMULATION UNAVAILABLE; ENCODINGS GROUNDED AGAINST ACE v1 §6. The exact
-//! rev-1.15 opcode-table bytes are pending confirmation against the PDF; each encoding here is a
-//! structurally-valid EVEX tile-instruction form per the §6 format, and the golden constants are
-//! pinned so any drift in the `.byte` shims (or this table) fails the reconstruction assertion.
+//! ```text
+//! TILEMOVROW (write, imm8)  EVEX.512.66.0F3A.W1 07 /ib      §6.3.3
+//! TILEMOVCOL (write, imm8)  EVEX.512.66.0F3A.W1 2F /ib      §6.3.3
+//! BSRINIT                   VEX.128.F2.0F38.W1 49 11:000:000 §6.3.5
+//! BSRMOVF                   EVEX.512.NP.MAP6.W1 95           §6.3.5
+//! BSRMOVH (write / read)    EVEX.512.F2.MAP6.W1 / .W0 95     §6.3.5
+//! BSRMOVL (write / read)    EVEX.512.F3.MAP6.W1 / .W0 95     §6.3.5
+//! TOP4BSSD/BSUD/BUSD/BUUD   EVEX.512.{F2,F3,66,NP}.0F38.W0 5E §6.3.9
+//! TOP2BF16PS                EVEX.512.F3.0F38.W0 5C           §6.3.8
+//! TOP4MX{B,BH,HB,H}F8PS     EVEX.512.{NP,F2,F3,66}.0F3A.W0 8D /ib §6.3.6
+//! TOP4MXBSSPS               EVEX.512.F2.0F3A.W0 8F /ib       §6.3.7
+//! ```
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// One ACE `.byte` primitive's spec-derived EVEX encoding.
-///
-/// Every ACE group-4 `.byte` form is a 6-byte EVEX register-register instruction
-/// `62 P0 P1 P2 opcode modrm` (ACE v1 §6 EVEX tile-instruction format):
-///   * `P0 = 0xF0 | map` — the leading nibble is `RXBR'` = `1111` (no register extension; the
-///     tmm operands are `tmm0..7`), bit 3 = 0, `mmm` = `map` in bits `[2:0]`.
-///   * `P1 = (W<<7) | 0b0_1111_1_00 | pp` — `vvvv` = `1111` (no third source unless the form
-///     uses it; the `.byte` operands are marshalled through fixed tmm registers), the mandatory
-///     `1` at bit 2, and the legacy-prefix selector `pp` in bits `[1:0]`.
-///   * `P2 = 0x48` — `z=0`, `L'L=10` (512-bit), `b=0`, `V'=1`, `aaa=000` (no write-mask).
-///   * `modrm = 0xC8` — `mod=11` (register direct), `reg=001` (tmm1, destination), `rm=000`
-///     (tmm0, first source).
+/// `pp` legacy-prefix selector values.
+const PP_NP: u8 = 0b00;
+const PP_66: u8 = 0b01;
+const PP_F3: u8 = 0b10;
+const PP_F2: u8 = 0b11;
+
+/// Opcode map selector: 0F38 = 2, 0F3A = 3, MAP6 = 6 (EVEX mmm / VEX mmmmm).
+const MAP_0F38: u8 = 2;
+const MAP_0F3A: u8 = 3;
+const MAP_6: u8 = 6;
+
+/// One ACE raw-encoded instruction form's spec-derived encoding (ACE v1 §6.3).
 struct Golden {
     mnemonic: &'static str,
+    /// `true` for the sole VEX-encoded form (BSRINIT); `false` for EVEX.
+    vex: bool,
     map: u8,
     w: bool,
     pp: u8,
     opcode: u8,
     modrm: u8,
+    /// The EVEX.vvvv register operand (0 if the form has none; stored inverted in P1).
+    vvvv: u8,
+    /// Trailing imm8 for the `/ib` forms.
+    imm8: Option<u8>,
     /// The pinned golden byte sequence (shared with `src/native/ace_tile.c`).
-    bytes: [u8; 6],
+    bytes: &'static [u8],
 }
 
 impl Golden {
-    /// Reconstruct the EVEX bytes from the documented §6 fields; the golden `bytes` must equal
-    /// this reconstruction (that equality is the transcription check).
-    fn reconstruct(&self) -> [u8; 6] {
-        let p0 = 0xF0 | self.map;
-        // P1 base 0x7C = W(0) vvvv(1111) 1 pp(00); OR in W (bit 7) and pp (bits 1:0).
-        let p1 = (if self.w { 0x80 } else { 0 }) | 0x7C | self.pp;
-        let p2 = 0x48;
-        [0x62, p0, p1, p2, self.opcode, self.modrm]
+    /// Reconstruct the byte sequence from the documented §6.3 fields; the golden `bytes`
+    /// must equal this reconstruction (that equality is the transcription check).
+    fn reconstruct(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.vex {
+            // 3-byte VEX: C4 [R̄X̄B̄ mmmmm] [W v̄v̄v̄v̄ L pp] opcode modrm. 128-bit -> L = 0.
+            out.push(0xC4);
+            out.push(0xE0 | self.map); // R̄X̄B̄ = 111
+            let vbar = (!self.vvvv) & 0xF;
+            out.push(((self.w as u8) << 7) | (vbar << 3) | self.pp);
+        } else {
+            // 4-byte EVEX: 62 P0 P1 P2. P0 = R̄X̄B̄R̄' 0 mmm; P1 = W v̄v̄v̄v̄ 1 pp;
+            // P2 = 0x48 (z=0, L'L=10 for 512-bit, b=0, V̄'=1, aaa=000).
+            out.push(0x62);
+            out.push(0xF0 | self.map);
+            let vbar = (!self.vvvv) & 0xF;
+            out.push(((self.w as u8) << 7) | (vbar << 3) | 0x04 | self.pp);
+            out.push(0x48);
+        }
+        out.push(self.opcode);
+        out.push(self.modrm);
+        if let Some(ib) = self.imm8 {
+            out.push(ib);
+        }
+        out
     }
 }
 
-/// The complete `.byte` inventory: family B write forms (2), D (4), E (5), F (1), G (4) = 16.
-/// Each `pp` distinguishes a signedness pair / format; `W` distinguishes the INT8 (W=0) vs
-/// FP32-accumulating MX (W=1) families; the opcode distinguishes the operation.
+/// The complete raw-encoding inventory used by the `.byte` shims. Register assignment
+/// (documented in `src/native/ace_tile.c`): the TOP forms put the destination tile tmm1 in
+/// ModRM.reg, src1 = zmm0 in ModRM.rm, src2 = zmm2 in EVEX.vvvv; the write moves put tmm1
+/// in reg and the source zmm0 in rm with imm8 = 0; the BSR forms fix ModRM.reg = 000
+/// (bsr0 is implicit), BSRMOVF takes zmm1 in vvvv (A scales) and zmm2 in rm (B scales),
+/// and the half moves take zmm1 in rm.
 const GOLDEN: &[Golden] = &[
-    // Family B write (map 5, pp = F3): ZMM -> tile row / column.
+    // Family B write (§6.3.3, imm8 forms, row/column 0).
     Golden {
         mnemonic: "TILEMOVROW",
-        map: 5,
-        w: false,
-        pp: 0b10,
-        opcode: 0x6C,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0x7E, 0x48, 0x6C, 0xC8],
+        vex: false,
+        map: MAP_0F3A,
+        w: true,
+        pp: PP_66,
+        opcode: 0x07,
+        modrm: 0xC8, // reg = tmm1, rm = zmm0
+        vvvv: 0,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0xFD, 0x48, 0x07, 0xC8, 0x00],
     },
     Golden {
         mnemonic: "TILEMOVCOL",
-        map: 5,
-        w: false,
-        pp: 0b10,
-        opcode: 0x6D,
+        vex: false,
+        map: MAP_0F3A,
+        w: true,
+        pp: PP_66,
+        opcode: 0x2F,
         modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0x7E, 0x48, 0x6D, 0xC8],
+        vvvv: 0,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0xFD, 0x48, 0x2F, 0xC8, 0x00],
     },
-    // Family D (map 5, W=1, no prefix): block-scale registers.
+    // Family D (§6.3.5).
     Golden {
         mnemonic: "BSRINIT",
-        map: 5,
+        vex: true, // the ONE VEX-encoded ACE-only form
+        map: MAP_0F38,
         w: true,
-        pp: 0b00,
-        opcode: 0x50,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0xFC, 0x48, 0x50, 0xC8],
+        pp: PP_F2,
+        opcode: 0x49,
+        modrm: 0xC0, // 11:000:000
+        vvvv: 0,
+        imm8: None,
+        bytes: &[0xC4, 0xE2, 0xFB, 0x49, 0xC0],
     },
     Golden {
         mnemonic: "BSRMOVF",
-        map: 5,
+        vex: false,
+        map: MAP_6,
         w: true,
-        pp: 0b00,
-        opcode: 0x51,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0xFC, 0x48, 0x51, 0xC8],
+        pp: PP_NP,
+        opcode: 0x95,
+        modrm: 0xC2, // 11:000:010 — reg fixed 000, rm = zmm2 (B scales)
+        vvvv: 1,     // zmm1 (A scales)
+        imm8: None,
+        bytes: &[0x62, 0xF6, 0xF4, 0x48, 0x95, 0xC2],
     },
     Golden {
-        mnemonic: "BSRMOVH",
-        map: 5,
+        mnemonic: "BSRMOVH", // write form (W1)
+        vex: false,
+        map: MAP_6,
         w: true,
-        pp: 0b00,
-        opcode: 0x52,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0xFC, 0x48, 0x52, 0xC8],
+        pp: PP_F2,
+        opcode: 0x95,
+        modrm: 0xC1, // 11:000:001 — rm = zmm1
+        vvvv: 0,
+        imm8: None,
+        bytes: &[0x62, 0xF6, 0xFF, 0x48, 0x95, 0xC1],
     },
     Golden {
-        mnemonic: "BSRMOVL",
-        map: 5,
-        w: true,
-        pp: 0b00,
-        opcode: 0x53,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF5, 0xFC, 0x48, 0x53, 0xC8],
+        mnemonic: "BSRMOVH", // read form (W0)
+        vex: false,
+        map: MAP_6,
+        w: false,
+        pp: PP_F2,
+        opcode: 0x95,
+        modrm: 0xC1,
+        vvvv: 0,
+        imm8: None,
+        bytes: &[0x62, 0xF6, 0x7F, 0x48, 0x95, 0xC1],
     },
-    // Family G (map 6, W=0, opcode 0x60): INT8 rank-4 outer products; pp = signedness pair.
+    Golden {
+        mnemonic: "BSRMOVL", // write form (W1)
+        vex: false,
+        map: MAP_6,
+        w: true,
+        pp: PP_F3,
+        opcode: 0x95,
+        modrm: 0xC1,
+        vvvv: 0,
+        imm8: None,
+        bytes: &[0x62, 0xF6, 0xFE, 0x48, 0x95, 0xC1],
+    },
+    Golden {
+        mnemonic: "BSRMOVL", // read form (W0)
+        vex: false,
+        map: MAP_6,
+        w: false,
+        pp: PP_F3,
+        opcode: 0x95,
+        modrm: 0xC1,
+        vvvv: 0,
+        imm8: None,
+        bytes: &[0x62, 0xF6, 0x7E, 0x48, 0x95, 0xC1],
+    },
+    // Family G (§6.3.9): opcode 5E, pp = signedness pair (F2=SS, F3=SU, 66=US, NP=UU).
     Golden {
         mnemonic: "TOP4BSSD",
-        map: 6,
+        vex: false,
+        map: MAP_0F38,
         w: false,
-        pp: 0b11,
-        opcode: 0x60,
-        modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0x7F, 0x48, 0x60, 0xC8],
+        pp: PP_F2,
+        opcode: 0x5E,
+        modrm: 0xC8, // reg = tmm1, rm = zmm0
+        vvvv: 2,     // zmm2
+        imm8: None,
+        bytes: &[0x62, 0xF2, 0x6F, 0x48, 0x5E, 0xC8],
     },
     Golden {
         mnemonic: "TOP4BSUD",
-        map: 6,
+        vex: false,
+        map: MAP_0F38,
         w: false,
-        pp: 0b10,
-        opcode: 0x60,
+        pp: PP_F3,
+        opcode: 0x5E,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0x7E, 0x48, 0x60, 0xC8],
+        vvvv: 2,
+        imm8: None,
+        bytes: &[0x62, 0xF2, 0x6E, 0x48, 0x5E, 0xC8],
     },
     Golden {
         mnemonic: "TOP4BUSD",
-        map: 6,
+        vex: false,
+        map: MAP_0F38,
         w: false,
-        pp: 0b01,
-        opcode: 0x60,
+        pp: PP_66,
+        opcode: 0x5E,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0x7D, 0x48, 0x60, 0xC8],
+        vvvv: 2,
+        imm8: None,
+        bytes: &[0x62, 0xF2, 0x6D, 0x48, 0x5E, 0xC8],
     },
     Golden {
         mnemonic: "TOP4BUUD",
-        map: 6,
+        vex: false,
+        map: MAP_0F38,
         w: false,
-        pp: 0b00,
-        opcode: 0x60,
+        pp: PP_NP,
+        opcode: 0x5E,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0x7C, 0x48, 0x60, 0xC8],
+        vvvv: 2,
+        imm8: None,
+        bytes: &[0x62, 0xF2, 0x6C, 0x48, 0x5E, 0xC8],
     },
-    // Family F (map 6, W=0, opcode 0x61, pp = F3): BF16 rank-2 outer product.
+    // Family F (§6.3.8): opcode 5C, pp = F3.
     Golden {
         mnemonic: "TOP2BF16PS",
-        map: 6,
+        vex: false,
+        map: MAP_0F38,
         w: false,
-        pp: 0b10,
-        opcode: 0x61,
+        pp: PP_F3,
+        opcode: 0x5C,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0x7E, 0x48, 0x61, 0xC8],
+        vvvv: 2,
+        imm8: None,
+        bytes: &[0x62, 0xF2, 0x6E, 0x48, 0x5C, 0xC8],
     },
-    // Family E (map 6, W=1, opcode 0x70): MX-FP8 rank-4 outer products; pp = format pair.
+    // Family E (§6.3.6): opcode 8D /ib, pp = FP8 format pair (NP=BF8·BF8, F2=BF8·HF8,
+    // F3=HF8·BF8, 66=HF8·HF8); §6.3.7: TOP4MXBSSPS = F2, opcode 8F /ib.
     Golden {
         mnemonic: "TOP4MXBF8PS",
-        map: 6,
-        w: true,
-        pp: 0b00,
-        opcode: 0x70,
+        vex: false,
+        map: MAP_0F3A,
+        w: false,
+        pp: PP_NP,
+        opcode: 0x8D,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0xFC, 0x48, 0x70, 0xC8],
+        vvvv: 2,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0x6C, 0x48, 0x8D, 0xC8, 0x00],
     },
     Golden {
         mnemonic: "TOP4MXBHF8PS",
-        map: 6,
-        w: true,
-        pp: 0b01,
-        opcode: 0x70,
+        vex: false,
+        map: MAP_0F3A,
+        w: false,
+        pp: PP_F2,
+        opcode: 0x8D,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0xFD, 0x48, 0x70, 0xC8],
+        vvvv: 2,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0x6F, 0x48, 0x8D, 0xC8, 0x00],
     },
     Golden {
         mnemonic: "TOP4MXHBF8PS",
-        map: 6,
-        w: true,
-        pp: 0b10,
-        opcode: 0x70,
+        vex: false,
+        map: MAP_0F3A,
+        w: false,
+        pp: PP_F3,
+        opcode: 0x8D,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0xFE, 0x48, 0x70, 0xC8],
+        vvvv: 2,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0x6E, 0x48, 0x8D, 0xC8, 0x00],
     },
     Golden {
         mnemonic: "TOP4MXHF8PS",
-        map: 6,
-        w: true,
-        pp: 0b11,
-        opcode: 0x70,
+        vex: false,
+        map: MAP_0F3A,
+        w: false,
+        pp: PP_66,
+        opcode: 0x8D,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0xFF, 0x48, 0x70, 0xC8],
+        vvvv: 2,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0x6D, 0x48, 0x8D, 0xC8, 0x00],
     },
-    // Family E signed×signed INT8 block-scaled analogue of TOP4BSSD (opcode 0x71).
     Golden {
         mnemonic: "TOP4MXBSSPS",
-        map: 6,
-        w: true,
-        pp: 0b00,
-        opcode: 0x71,
+        vex: false,
+        map: MAP_0F3A,
+        w: false,
+        pp: PP_F2,
+        opcode: 0x8F,
         modrm: 0xC8,
-        bytes: [0x62, 0xF6, 0xFC, 0x48, 0x71, 0xC8],
+        vvvv: 2,
+        imm8: Some(0),
+        bytes: &[0x62, 0xF3, 0x6F, 0x48, 0x8F, 0xC8, 0x00],
     },
 ];
 
-/// For every `.byte` primitive the emitted byte sequence equals its spec-derived golden constant
-/// (`[ace-tile-instructions.TESTING.5]`). Always runs; no external tool. Reconstructs the EVEX
-/// encoding from the ACE v1 §6 fields and asserts it equals the recorded golden bytes, then
-/// checks the EVEX structural invariants (prefix / no-extension nibble / map / mandatory bit /
-/// 512-bit no-mask P2 / register-direct ModRM). Also asserts every encoding is unique.
+/// For every raw-encoded form the golden byte sequence equals its reconstruction from the
+/// section-6.3 fields, plus structural invariants. Always runs; no external tool.
 ///
 /// `encoding::golden_bytes_match_per_byte_primitive`
 #[test]
 fn golden_bytes_match_per_byte_primitive() {
     assert_eq!(
         GOLDEN.len(),
-        16,
-        "16 ACE-only .byte primitives: B-write(2) + D(4) + E(5) + F(1) + G(4)"
+        18,
+        "18 raw-encoded forms: B-write(2) + D(6: BSRINIT + BSRMOVF + H/L write+read) + \
+         G(4) + F(1) + E(5)"
     );
 
-    let mut seen = Vec::new();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
     for g in GOLDEN {
-        // 1. The golden constant equals the reconstruction from the documented §6 fields.
-        //    (The transcription check against the `.byte` shims in src/native/ace_tile.c is
-        //    `c_shim_bytes_match_golden`, which parses that file.)
+        // 1. The golden constant equals the reconstruction from the documented §6.3 fields.
         assert_eq!(
             g.bytes,
-            g.reconstruct(),
-            "{} golden bytes must equal the §6 EVEX reconstruction",
+            g.reconstruct().as_slice(),
+            "{} golden bytes must equal the §6.3 reconstruction",
             g.mnemonic
         );
 
-        // 2. EVEX structural invariants (ACE v1 §6 tile-instruction format).
-        assert_eq!(g.bytes[0], 0x62, "{}: EVEX prefix byte", g.mnemonic);
-        assert_eq!(
-            g.bytes[1] >> 4,
-            0x0F,
-            "{}: R/X/B/R' = 1111 (no register extension, tmm0..7)",
-            g.mnemonic
-        );
-        assert_eq!(
-            g.bytes[1] & 0x07,
-            g.map,
-            "{}: EVEX map field matches the documented map",
-            g.mnemonic
-        );
-        assert_eq!(g.bytes[1] & 0x08, 0, "{}: P0 bit 3 reserved 0", g.mnemonic);
-        assert_eq!(
-            (g.bytes[2] >> 2) & 1,
-            1,
-            "{}: P1 mandatory bit 2 = 1",
-            g.mnemonic
-        );
+        // 2. Structural invariants.
+        if g.vex {
+            assert_eq!(g.bytes[0], 0xC4, "{}: 3-byte VEX prefix", g.mnemonic);
+            assert_eq!(g.bytes[1] >> 5, 0b111, "{}: R̄X̄B̄ = 111", g.mnemonic);
+            assert_eq!(g.bytes[1] & 0x1F, g.map, "{}: VEX map", g.mnemonic);
+            assert_eq!(
+                (g.bytes[2] >> 2) & 1,
+                0,
+                "{}: VEX.L = 0 (128-bit, §6.3.5)",
+                g.mnemonic
+            );
+        } else {
+            assert_eq!(g.bytes[0], 0x62, "{}: EVEX prefix byte", g.mnemonic);
+            assert_eq!(
+                g.bytes[1] >> 4,
+                0x0F,
+                "{}: R/X/B/R' = 1111 (no register extension)",
+                g.mnemonic
+            );
+            assert_eq!(g.bytes[1] & 0x07, g.map, "{}: EVEX map field", g.mnemonic);
+            assert_eq!(g.bytes[1] & 0x08, 0, "{}: P0 bit 3 reserved 0", g.mnemonic);
+            assert_eq!((g.bytes[2] >> 2) & 1, 1, "{}: P1 bit 2 = 1", g.mnemonic);
+            assert_eq!(
+                g.bytes[3], 0x48,
+                "{}: P2 = z0 L'L=10 (512-bit) b0 V'1 aaa=000",
+                g.mnemonic
+            );
+        }
         assert_eq!(g.bytes[2] & 0x03, g.pp, "{}: pp field", g.mnemonic);
         assert_eq!(g.bytes[2] >> 7, g.w as u8, "{}: W field", g.mnemonic);
-        assert_eq!(
-            g.bytes[3], 0x48,
-            "{}: P2 = z0 L'L=10 (512-bit) b0 V'1 aaa000 (no write-mask)",
-            g.mnemonic
-        );
-        assert_eq!(g.bytes[4], g.opcode, "{}: opcode byte", g.mnemonic);
-        assert_eq!(
-            g.bytes[5] >> 6,
-            0b11,
-            "{}: ModRM mod=11 (register-direct tile operands)",
-            g.mnemonic
-        );
 
-        // 3. Uniqueness: no two ACE .byte primitives share an encoding.
+        // 3. Uniqueness: no two forms share an encoding.
         assert!(
-            !seen.contains(&g.bytes),
+            !seen.contains(&g.bytes.to_vec()),
             "{}: duplicate encoding {:02X?}",
             g.mnemonic,
             g.bytes
         );
-        seen.push(g.bytes);
+        seen.push(g.bytes.to_vec());
     }
     println!(
-        "encoding: {} ACE .byte golden encodings verified against ACE v1 §6 (no external tool)",
+        "encoding: {} ACE raw encodings verified against the ACE v1 §6.3 tables",
         GOLDEN.len()
     );
 }
 
-/// Extract every 6-byte `.byte` sequence (`0x62,0x..,0x..,0x..,0x..,0x..`) from C source
-/// text. Every ACE `.byte` shim spells its bytes as one comma-separated literal beginning
-/// with the EVEX prefix `0x62`, so scanning for that prefix and parsing six `0xNN` tokens
-/// recovers the shims' exact encodings without a C parser.
-fn extract_byte_sequences(c_source: &str) -> Vec<[u8; 6]> {
+/// Extract every `.byte 0x..,0x..` sequence from C source text: scan for the literal
+/// `".byte "` opener and parse the consecutive comma-separated `0xNN` tokens that follow
+/// (a sequence ends at the first non-`0xNN` token).
+fn extract_byte_sequences(c_source: &str) -> Vec<Vec<u8>> {
     let mut found = Vec::new();
-    for (start, _) in c_source.match_indices("0x62,") {
+    // Sequences start with the EVEX prefix 0x62 or the VEX prefix 0xC4. (Some shims carry
+    // their bytes through a macro parameter, so scanning for `.byte` adjacency would miss
+    // them; the prefix marker catches both spellings.)
+    let starts: Vec<usize> = c_source
+        .match_indices("0x62,")
+        .chain(c_source.match_indices("0xc4,"))
+        .map(|(i, _)| i)
+        .collect();
+    for start in starts {
         let rest = &c_source[start..];
-        let tokens: Vec<&str> = rest.splitn(7, ',').take(6).collect();
-        if tokens.len() != 6 {
-            continue;
-        }
-        let mut bytes = [0u8; 6];
-        let mut ok = true;
-        for (i, tok) in tokens.iter().enumerate() {
-            // The final token runs on to the rest of the line (`0xc8" ::: "memory"...`), so
-            // parse exactly the leading `0xNN` of each token.
-            let tok = tok.trim();
+        let mut bytes = Vec::new();
+        for tok in rest.split(',') {
+            let tok = tok.trim_start();
             match tok
                 .get(..4)
                 .and_then(|t| t.strip_prefix("0x"))
                 .map(|h| u8::from_str_radix(h, 16))
             {
-                Some(Ok(b)) => bytes[i] = b,
-                _ => {
-                    ok = false;
-                    break;
+                Some(Ok(b)) => {
+                    bytes.push(b);
+                    // A token with anything beyond the `0xNN` literal (`0xc0\n\t"` at a
+                    // line end, `0xc8" :::` at a sequence end) terminates THIS sequence —
+                    // otherwise the scan would run into the next `.byte` line of a
+                    // multi-instruction asm block.
+                    if !tok[4..].trim().is_empty() {
+                        break;
+                    }
                 }
+                _ => break,
             }
         }
-        if ok {
+        if !bytes.is_empty() {
             found.push(bytes);
         }
     }
     found
 }
 
-/// The `.byte` sequences actually present in `src/native/ace_tile.c` are exactly the golden
-/// set — same sequences, same multiplicities. This is the real transcription check: editing a
-/// byte in either the C shim or the golden table (but not both) fails this test, with no
-/// external tool and regardless of whether the `native` feature is enabled
-/// (`[ace-tile-instructions.TESTING.5]`, R3 mitigation).
+/// The `.byte` sequences actually present in `src/native/ace_tile.c` are exactly drawn
+/// from the golden set, and every golden encoding appears at least once. This is the real
+/// transcription check: editing a byte in either the C shim or the golden table (but not
+/// both) fails this test, with no external tool and regardless of whether the `native`
+/// feature is enabled (`[ace-tile-instructions.TESTING.5]`).
 ///
 /// `encoding::c_shim_bytes_match_golden`
 #[test]
@@ -351,26 +453,29 @@ fn c_shim_bytes_match_golden() {
     let source = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {path} (the .byte shim source): {e}"));
 
-    let mut in_c = extract_byte_sequences(&source);
-    let mut in_golden: Vec<[u8; 6]> = GOLDEN.iter().map(|g| g.bytes).collect();
-    in_c.sort_unstable();
-    in_golden.sort_unstable();
+    let in_c = extract_byte_sequences(&source);
+    assert!(!in_c.is_empty(), "no .byte sequences found in ace_tile.c");
 
+    // Every sequence in the C file is a golden encoding (the BSR read forms and BSRMOVF
+    // appear in several shims, so multiplicities legitimately differ).
+    for seq in &in_c {
+        assert!(
+            GOLDEN.iter().any(|g| g.bytes == seq.as_slice()),
+            ".byte sequence {seq:02X?} in ace_tile.c has no §6.3 golden entry — the shim \
+             drifted from the spec table"
+        );
+    }
+    // Every golden encoding appears in the C file.
     for g in GOLDEN {
         assert!(
-            in_c.contains(&g.bytes),
-            "{}: golden bytes {:02X?} not found in ace_tile.c — the .byte shim drifted or is missing",
+            in_c.iter().any(|seq| seq.as_slice() == g.bytes),
+            "{}: golden bytes {:02X?} not found in ace_tile.c — the .byte shim is missing",
             g.mnemonic,
             g.bytes
         );
     }
-    assert_eq!(
-        in_c, in_golden,
-        "ace_tile.c .byte sequences must be exactly the golden set (a sequence in the C file \
-         has no golden entry, or multiplicities differ)"
-    );
     println!(
-        "encoding: {} .byte sequences parsed from ace_tile.c match the golden table exactly",
+        "encoding: {} .byte sequences parsed from ace_tile.c, all matching the §6.3 golden set",
         in_c.len()
     );
 }
@@ -430,10 +535,10 @@ fn disasm_objdump(bytes: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// When a disassembler is present, disassemble each `.byte` primitive and assert the spec
-/// mnemonic + operands where the tool recognizes the ACE encoding; when the tool is absent — or
-/// does not yet know the ACE mnemonics (binutils 2.46 / current LLVM predate ACE v1.15) —
-/// skip-with-warning and NEVER fail (`[ace-tile-instructions.TESTING.5]`, R2/R3).
+/// When a disassembler is present, disassemble each golden sequence and assert the spec
+/// mnemonic where the tool recognizes the ACE encoding; when the tool is absent — or does
+/// not yet know the ACE mnemonics (binutils 2.46 / current LLVM predate ACE v1.15) —
+/// skip-with-warning and NEVER fail (`[ace-tile-instructions.TESTING.5]`).
 ///
 /// `encoding::disassembly_mnemonic_operands_or_skip`
 #[test]
@@ -456,7 +561,7 @@ fn disassembly_mnemonic_operands_or_skip() {
     let mut matched = 0usize;
     let mut unrecognized = 0usize;
     for g in GOLDEN {
-        let text = match run(&g.bytes) {
+        let text = match run(g.bytes) {
             Some(t) => t,
             None => {
                 eprintln!(
@@ -470,9 +575,8 @@ fn disassembly_mnemonic_operands_or_skip() {
         // ACE mnemonics are not in current binutils/LLVM tables, so the tool typically emits
         // `(bad)` / `.byte`-style output. Where it DOES surface the spec mnemonic, assert it;
         // where it decodes the bytes as some OTHER valid instruction, surface that loudly —
-        // a golden encoding aliasing an allocated x86 opcode (real EVEX map5/map6 opcodes are
-        // allocated in AVX10.2) is exactly the drift this layer exists to notice, even though
-        // the policy stays skip-with-warning until the rev-1.15 opcode table is confirmed.
+        // an encoding aliasing an allocated x86 opcode is exactly the drift this layer
+        // exists to notice.
         let upper = text.to_ascii_uppercase();
         if upper.contains(g.mnemonic) {
             matched += 1;

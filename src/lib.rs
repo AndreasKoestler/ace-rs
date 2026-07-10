@@ -157,7 +157,10 @@ mod detect;
 pub(crate) mod fp4;
 pub(crate) mod fp6;
 pub(crate) mod fp8;
+// In the non-test lib build the group-4 `_hw` wrappers are referenced only by native.rs's
+// own differential test layer, so allow the resulting dead-code lint outside tests.
 #[cfg(all(target_arch = "x86_64", feature = "native"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod native;
 pub mod tcvtrow;
 pub mod tile;
