@@ -169,13 +169,17 @@ jobs:
         # either way). The group-3 (AVX10_V2_AUX) differentials DISCARD for now
         # (intrinsics absent from current GCC/Clang headers, OQ-5).
         #
-        # ACE group 4 (iteration 3, OQ-6): the intrinsic families A / B-read / C
-        # (tile config lifecycle, tile->ZMM read moves, tile-row converts) EXECUTE
-        # under SDE, so their `prop_native_matches_oracle` differentials light up
-        # here; the `ACE`-only families (B write, D, E, F, G) are `.byte` raw
-        # encodings that are BUILT + encoding-asserted (`tests/encoding.rs`) but
-        # not executed — SDE 10.8 has no ACE emulation yet (R2), so their
-        # differentials DISCARD until a `sde64` ACE probe passes. The
+        # ACE group 4 (iteration 3, OQ-6): ALL group-4 differentials DISCARD under
+        # SDE for now. The intrinsic families A / B-read / C (tile config
+        # lifecycle, tile->ZMM read moves, tile-row converts) have instructions
+        # SDE can execute, but every group-4 shim first loads the palette-2 (ACE)
+        # tile descriptor and `-future`'s plain-AMX tile file is palette-1-only:
+        # LDTILECFG #GPs ("#GP XCR0 unsupported palette_id: 2", observed on SDE
+        # 10.8), so those differentials gate on `detect::has_palette2()` and
+        # discard here. The `ACE`-only families (B write, D, E, F, G) are `.byte`
+        # raw encodings that are BUILT + encoding-asserted (`tests/encoding.rs`)
+        # but not executed — SDE 10.8 has no ACE emulation (R2). All of group 4
+        # lights up once an ACE-capable (palette-2) SDE/hardware host runs. The
         # `ace_tile_native_runs_when_required` guard stays dormant for them
         # (documented, non-vacuous), exactly as the AVX10 C-shim families' guard
         # does. The core `test` gate above still covers the default oracle-only

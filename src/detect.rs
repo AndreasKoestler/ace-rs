@@ -306,6 +306,27 @@ fn ace_v1_present() -> bool {
     ace_bit && ace_vsn() >= 1
 }
 
+/// `true` when the tile file enumerates the palette-2 (ACE) descriptor.
+///
+/// `LDTILECFG` raises `#GP` on an unsupported palette id (spec section 15.2.2.3), and
+/// palette support above 0 is implementation-defined (section 15.2.2.4): the ACE tile file
+/// is enumerated solely through the ACE feature bit + `ACE_VSN` ([`ace_v1_present`],
+/// sections 3.1/15.5.1). A plain-AMX host — including Intel SDE's `-future` model — has
+/// AMX-TILE / AMX-AVX512 but only palette 1, so its `LDTILECFG` `#GP`s on the palette-2
+/// descriptor even though the family-A/B-read/C *instructions* themselves execute fine.
+/// Every native path that loads the palette-2 config must therefore gate on this IN
+/// ADDITION to its per-family capability probe (`has_amx_tile` / `has_amx_avx512`); this
+/// helper deliberately repeats none of the XSAVE/permission checks those probes do.
+///
+/// Only the `native`-feature differential layer loads the palette-2 config natively today,
+/// so the helper is compiled (and dead-code-allowed outside tests) exactly like
+/// `mod native` itself.
+#[cfg(all(target_arch = "x86_64", feature = "native"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn has_palette2() -> bool {
+    ace_v1_present()
+}
+
 /// Returns `true` when the running CPU supports the AMX-TILE capability with the AMX
 /// framework XSAVE state enabled and per-process tile permission granted — the native gate
 /// for family A (tile config lifecycle)
