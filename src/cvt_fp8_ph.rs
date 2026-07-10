@@ -33,7 +33,8 @@ pub fn cvthf8_ph(a: [u8; 32]) -> [u16; 32] {
     #[cfg(all(target_arch = "x86_64", feature = "native"))]
     {
         if detect::has_avx10_v1_aux() {
-            // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+            // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+            // translation unit is compiled for) plus OS XSAVE state immediately above.
             return unsafe { cvthf8_ph_hw(a) };
         }
     }

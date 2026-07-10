@@ -88,7 +88,10 @@ use crate::tile::{TileId, TileScope};
 
 /// Palette-2 tiles cap at `rows <= 16` and `colsb <= 64`, so an INT32 accumulator tile is at
 /// most `16` rows of `16` four-byte lanes. These bounds make `RANK * 16 == 64` the exact
-/// operand-array length, so every `A[RANK*m + k]` / `B[RANK*n + k]` index stays in range.
+/// operand-array length, so every `A[RANK*m + k]` / `B[RANK*n + k]` index stays in range:
+/// `A` is indexed by the row `m` (so its length uses `MAX_ACC_ROWS`), `B` by the lane `n`
+/// (`MAX_ACC_LANES`). The two constants are equal today; keep the pairing straight anyway so
+/// a future divergence resizes the right operand.
 const MAX_ACC_ROWS: usize = 16;
 const MAX_ACC_LANES: usize = 16;
 /// Bytes per INT32 accumulator lane.
@@ -152,8 +155,8 @@ macro_rules! define_top {
         pub fn $name(
             scope: &mut TileScope,
             dst: TileId,
-            a: [$a; $rank * MAX_ACC_LANES],
-            b: [$b; $rank * MAX_ACC_ROWS],
+            a: [$a; $rank * MAX_ACC_ROWS],
+            b: [$b; $rank * MAX_ACC_LANES],
         ) {
             let _ = detect::has_ace; // family G gate: full ACE [DETECT.1-3]
             $scalar(scope, dst, a, b);
@@ -170,8 +173,8 @@ macro_rules! define_top {
         pub fn $scalar(
             scope: &mut TileScope,
             dst: TileId,
-            a: [$a; $rank * MAX_ACC_LANES],
-            b: [$b; $rank * MAX_ACC_ROWS],
+            a: [$a; $rank * MAX_ACC_ROWS],
+            b: [$b; $rank * MAX_ACC_LANES],
         ) {
             let (rows, colsb) = scope.tile_shape(dst);
             // M = configured rows, N = four-byte INT32 lanes per row. Palette-2 bounds them to
@@ -404,11 +407,16 @@ fn mx_block_scale(exp: u8) -> f32 {
 /// before the multiply, and folds the `MX_RANK` products onto the prior `C[m][n]` left-to-right
 /// in FP32. `M`/`N` come from the destination tile's configured shape; the operands are read but
 /// not modified.
+///
+/// NOTE (pending rev-1.15 PDF confirmation): ONE shared BSR scale is applied to BOTH operands,
+/// so each product carries `s_k²` — the pinned transcription of §14/§12. Conventional OCP MX
+/// gives each operand tile its own block scale (`s_a·s_b` per product); if the PDF names a
+/// second BSR operand, this kernel (and the single-`bsr` public signatures) must grow one.
 fn mx_accumulate<T: Copy>(
     scope: &mut TileScope,
     dst: TileId,
-    a: [T; MX_RANK * MAX_ACC_LANES],
-    b: [T; MX_RANK * MAX_ACC_ROWS],
+    a: [T; MX_RANK * MAX_ACC_ROWS],
+    b: [T; MX_RANK * MAX_ACC_LANES],
     bsr: BsrId,
     decode_a: impl Fn(T) -> f32,
     decode_b: impl Fn(T) -> f32,
@@ -471,7 +479,12 @@ pub fn _tile_top4mxbf8ps_scalar(
 
 /// `TOP4MXBHF8PS` (`[ace-tile-instructions.MX_TOP.2]`): BF8×HF8 rank-4 outer-product accumulate
 /// into an FP32 tile (operand `a` E5M2, operand `b` E4M3), with the per-block BSR scale applied.
-/// Operand order is significant (the inverse of `TOP4MXHBF8PS`). Gates as [`_tile_top4mxbf8ps`].
+///
+/// WARNING — operand order is significant and the type system cannot catch a swap here: both
+/// operands are raw FP8 bytes (`[u8; 64]`, mirroring the eventual intrinsic signature, D5), so
+/// transposing `a` and `b` silently decodes each operand with the other's format. This is the
+/// inverse of [`_tile_top4mxhbf8ps`]; double-check the call site against the mnemonic (B = BF8
+/// first, H = HF8 second). Gates as [`_tile_top4mxbf8ps`].
 pub fn _tile_top4mxbhf8ps(
     scope: &mut TileScope,
     dst: TileId,
@@ -497,7 +510,12 @@ pub fn _tile_top4mxbhf8ps_scalar(
 
 /// `TOP4MXHBF8PS` (`[ace-tile-instructions.MX_TOP.3]`): HF8×BF8 rank-4 outer-product accumulate
 /// into an FP32 tile (operand `a` E4M3, operand `b` E5M2), with the per-block BSR scale applied.
-/// Operand order is significant (the inverse of `TOP4MXBHF8PS`). Gates as [`_tile_top4mxbf8ps`].
+///
+/// WARNING — operand order is significant and the type system cannot catch a swap here: both
+/// operands are raw FP8 bytes (`[u8; 64]`, mirroring the eventual intrinsic signature, D5), so
+/// transposing `a` and `b` silently decodes each operand with the other's format. This is the
+/// inverse of [`_tile_top4mxbhf8ps`]; double-check the call site against the mnemonic (H = HF8
+/// first, B = BF8 second). Gates as [`_tile_top4mxbf8ps`].
 pub fn _tile_top4mxhbf8ps(
     scope: &mut TileScope,
     dst: TileId,

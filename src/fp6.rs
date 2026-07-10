@@ -46,8 +46,8 @@ use crate::fp4::extract_field;
 /// (no masking/zeroing), the inverse of [`unpack`]. Thin `size = 6` wrapper over
 /// [`crate::fp4::pack_fields`].
 pub(crate) fn pack(values: &[u8], out: &mut [u8]) {
-    debug_assert_eq!((values.len() * 6) % 8, 0);
-    debug_assert_eq!(out.len(), values.len() * 6 / 8);
+    assert_eq!((values.len() * 6) % 8, 0);
+    assert_eq!(out.len(), values.len() * 6 / 8);
     crate::fp4::pack_fields(values, 6, out);
 }
 
@@ -57,7 +57,7 @@ pub(crate) fn pack(values: &[u8], out: &mut [u8]) {
 /// the inverse of [`pack`]: `out[i]` holds the lane's 6 bits in `[5:0]`. `out.len() * 6`
 /// must equal `buf.len() * 8`.
 pub(crate) fn unpack(buf: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len() * 6, buf.len() * 8);
+    assert_eq!(out.len() * 6, buf.len() * 8);
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = extract_field(buf, 6 * i, 6);
     }
@@ -96,7 +96,9 @@ pub(crate) fn fp8_e5m2_to_fp6_e3m2(byte: u8) -> u8 {
         e_o = 0x7;
         m_o = 0x3;
     } else if (e_i as i32 > exp_rebias + 7) || (e_i as i32 == exp_rebias + 7 && m_i > 0x3) {
-        // Overflow -> clamp to FP6 E3M2 max normal +/-28.0.
+        // Overflow -> clamp to FP6 E3M2 max normal +/-28.0. (The `m_i > 0x3` arm is
+        // unreachable since m_i is 2 bits, but transcribed verbatim from the spec — same
+        // as the E2M3 helper's `m_i > 0x7` arm.)
         e_o = 0x7;
         m_o = 0x3;
     } else if e_i == 0x00 {

@@ -8,26 +8,27 @@
 //! no MXCSR, raise no FP exceptions, and assume DAZ=0 / FTZ=0, per ACE v1 spec section
 //! 8.2.1 (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-3]`).
 //!
-//! OQ-4 (FP8 non-saturating overflow encoding): the oracle is grounded against AVX10.2
-//! hardware (verified under Intel SDE) and the section-2.4.1 format table. Non-saturating
-//! overflow of a finite/Inf magnitude maps to the format's OVERFLOW encoding, which differs
-//! by format: **E5M2 (BF8) has an IEEE infinity** `S.11111.00` (the section-2.4.1 NaN set is
-//! `S.11111.{01,10,11}`, so `S.11111.00` is Inf, not NaN), while **E4M3 (HF8) has no infinity**
-//! so its overflow is the sole all-ones NaN `S.1111.111`. Saturating clamps to the format max
-//! normal. An FP16 NaN *input* always propagates to a NaN regardless of mode. (An earlier
-//! oracle emitted a nonzero-mantissa NaN for E5M2 overflow; that disagreed with hardware and
-//! is corrected to the Inf encoding here.) (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-1]`,
+//! FP8 non-saturating overflow encoding (per the section-16.1/16.2 pseudocode and the
+//! section-9.2.1 behavior table): non-saturating overflow of a finite/Inf magnitude maps to
+//! the format's OVERFLOW encoding, which differs by format: **E5M2 (BF8)** uses `S.11111.00`
+//! (the section-2.4.1 OCP table lists infinities as N/A for FP8, but this encoding functions
+//! as the overflow code and section 16.3 decodes it to FP32 +/-Inf; the NaN set is
+//! `S.11111.{01,10,11}`), while **E4M3 (HF8) has no infinity** so its overflow is the sole
+//! all-ones NaN `S.1111.111`. Saturating clamps to the format max normal. An FP16 NaN *input*
+//! always propagates to a NaN regardless of mode.
+//! (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-1]`,
 //! `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-2]`).
 //!
-//! OQ-5 (family-C bias-source layout + rounding): per spec section 8.4.5 the per-lane bias
-//! term for output lane `i` is `bias = src1.byte[2 * i]` — the low byte of the i-th `u16`
-//! element of the bias operand. [`fp16_to_bf8_biased`] / [`fp16_to_hf8_biased`] take that
-//! already-extracted `u8` bias (the caller selects `bias_lane & 0xff`). The bias-rounding rule
-//! is grounded against hardware (verified under SDE): the bias is added into the discarded-
-//! fraction window and the result is then **truncated** (round toward zero). This is NOT
-//! "add-bias-then-RTNE": with `bias == 0` it truncates (so it differs from plain RTNE on
-//! above-half inputs), and `bias == 0x80` recovers round-to-nearest. (An earlier oracle modelled
-//! the bias as add-then-RTNE; that disagreed with hardware and is corrected here.)
+//! Family-C bias ("SR") rounding: per spec section 8.4.5 the per-lane bias term for output
+//! lane `i` is `bias = src1.byte[2 * i]` — the low byte of the i-th `u16` element of the bias
+//! operand. [`fp16_to_bf8_biased`] / [`fp16_to_hf8_biased`] take that already-extracted `u8`
+//! bias and transcribe the section-16.2 SR branches directly: the bias is added at a FIXED
+//! position — the lsb of the (normalized) 10-bit FP16 mantissa, unshifted for the E5M2 target
+//! and `>> 1` for the E4M3 target — with carry into the exponent, and the biased mantissa is
+//! then **truncated** (no further rounding in the SR path). For E4M3 every FP16 subnormal
+//! input flushes to signed zero in SR mode too (all are below the E4M3 minimum, spec section
+//! 16.2). With `bias == 0` the SR path truncates, so it differs from plain RTNE on above-half
+//! inputs; `bias == 0x80` recovers round-to-nearest (ties up) for normal-range results.
 //! (`[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`,
 //! `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`).
 //!
@@ -114,30 +115,15 @@ enum Fp16Class {
     },
 }
 
-/// Round a strictly-positive finite value `mantissa * 2^exp2` to the target FP8 format and
-/// return `(exp_field, mant_field, overflowed)`. `overflowed` is set when the rounded
-/// magnitude exceeds the format's max normal.
+/// Round a strictly-positive finite value `mantissa * 2^exp2` to the target FP8 format under
+/// round-to-nearest, ties-to-even (RTNE) and return `(exp_field, mant_field, overflowed)`.
+/// `overflowed` is set when the rounded magnitude exceeds the format's max normal.
 ///
-/// Two rounding modes, both grounded against AVX10.2 hardware (verified under Intel SDE):
-///
-/// * **`bias_mode == false` (families A/B/E plain converts)**: round-to-nearest, ties-to-even
-///   (RTNE) on the discarded fraction. `bias` is ignored.
-/// * **`bias_mode == true` (family C `VCVTBIASPH2*`, spec section 8.4.5 + 2.6.3)**: add the
-///   8-bit `bias` into the discarded-fraction window aligned so the bias byte's MSB sits
-///   immediately below the target lsb, then **truncate** (round toward zero) — i.e. the only
-///   way to round up is a carry out of the discarded window (`discarded + bias >= 2^shift`).
-///   This is NOT RTNE: with `bias == 0` it truncates (e.g. an FP16 value just above half an
-///   lsb rounds DOWN), and `bias == 0x80` recovers round-to-nearest-up. Hardware
-///   `VCVTBIASPH2BF8`/`HF8` implement exactly this add-bias-then-truncate rule. (The earlier
-///   oracle modelled bias as "add bias then RTNE", which disagreed with hardware and is
-///   corrected here.)
-fn round_finite_to_fp8(
-    fmt: &Fp8Format,
-    mantissa: u64,
-    exp2: i32,
-    bias: u32,
-    bias_mode: bool,
-) -> (u32, u32, bool) {
+/// Used by the family A/B/E plain converts; verified bit-exact against the section-16.2
+/// RTNE pseudocode over the full FP16 input domain. The family-C bias ("SR") rounding is a
+/// separate direct transcription of the section-16.2 SR branches (see
+/// [`fp16_to_bf8_biased`] / [`fp16_to_hf8_biased`]), not a mode of this rounder.
+fn round_finite_to_fp8(fmt: &Fp8Format, mantissa: u64, exp2: i32) -> (u32, u32, bool) {
     let max_exp_field: u32 = (1u32 << fmt.exp_bits) - 1;
     // Unbiased exponent of the most-significant set bit, treating the value as
     // `1.fffff * 2^e`.
@@ -163,7 +149,7 @@ fn round_finite_to_fp8(
     let shift = target_lsb_exp2 - exp2;
 
     let rounded: u64 = if shift <= 0 {
-        // No fractional bits discarded; exact left shift (bias/rounding cannot apply).
+        // No fractional bits discarded; exact left shift (rounding cannot apply).
         mantissa << (-shift) as u32
     } else if shift >= 64 {
         // Everything is below the rounding position.
@@ -172,24 +158,11 @@ fn round_finite_to_fp8(
         let s = shift as u32;
         let kept = mantissa >> s;
         let rem = mantissa & ((1u64 << s) - 1); // discarded fraction
-        if bias_mode {
-            // Add-bias-then-truncate (spec 2.6.3): align the 8-bit bias byte so its MSB sits
-            // just below the target lsb (top of the discarded window), then a round-up
-            // happens iff the addition carries out of the window. Truncation otherwise.
-            let bias_scaled = if s >= 8 {
-                (bias as u64) << (s - 8)
-            } else {
-                (bias as u64) >> (8 - s)
-            };
-            kept + ((rem + bias_scaled) >> s)
+        let half = 1u64 << (s - 1);
+        if rem > half || (rem == half && (kept & 1) == 1) {
+            kept + 1
         } else {
-            // Plain RTNE.
-            let half = 1u64 << (s - 1);
-            if rem > half || (rem == half && (kept & 1) == 1) {
-                kept + 1
-            } else {
-                kept
-            }
+            kept
         }
     };
 
@@ -296,29 +269,22 @@ fn fp8_assemble(fmt: &Fp8Format, sign: u32, exp_field: u32, mant_field: u32) -> 
     ((sign << 7) | (exp_field << fmt.mant_bits) | mant_field) as u8
 }
 
-/// Convert one FP16 lane (raw bits) to one FP8 byte in the given target format.
+/// Convert one FP16 lane (raw bits) to one FP8 byte in the given target format under plain
+/// RTNE (families A/B).
 ///
-/// `bias_mode` selects the rounding contract (see [`round_finite_to_fp8`]): `false` is plain
-/// RTNE (families A/B), `true` is family C's add-bias-then-truncate using the 8-bit `bias`
-/// term (spec 8.4.5 + 2.6.3). Decodes the FP16 pattern to an exact wide intermediate, rounds
-/// once to the target FP8 (no double-rounding), and encodes to `u8`. Subnormals, signed
-/// zeros, and NaNs are handled bit-exactly with no FTZ/DAZ. On magnitude overflow: when
-/// `saturating`, clamp to the format max normal; otherwise emit the format overflow encoding
-/// (E5M2 Inf, E4M3 NaN).
-fn fp16_to_fp8_biased(
-    fmt: &Fp8Format,
-    bits: u16,
-    saturating: bool,
-    bias: u32,
-    bias_mode: bool,
-) -> u8 {
+/// Decodes the FP16 pattern to an exact wide intermediate, rounds once to the target FP8
+/// (no double-rounding), and encodes to `u8`. Subnormals, signed zeros, and NaNs are handled
+/// bit-exactly with no FTZ/DAZ. On magnitude overflow: when `saturating`, clamp to the
+/// format max normal; otherwise emit the format overflow encoding (E5M2 `S.11111.00`,
+/// E4M3 NaN).
+fn fp16_to_fp8(fmt: &Fp8Format, bits: u16, saturating: bool) -> u8 {
     let (sign, class) = decode_fp16(bits);
     match class {
         Fp16Class::Zero => (sign << 7) as u8, // S.0...0.0...0
         Fp16Class::NaN => {
-            // Propagate as an FP8 NaN (always a NaN encoding, even saturating). Bias does
-            // not apply to a non-finite input. The full 10-bit FP16 mantissa is passed so
-            // the E5M2 payload mapping can read its top bits (hardware-matched).
+            // Propagate as an FP8 NaN (always a NaN encoding, even saturating). The full
+            // 10-bit FP16 mantissa is passed so the E5M2 payload mapping can read its
+            // top bits (spec section 16.2: `m_o = 0x2 | m_i[8]`).
             let fp16_mant = (bits & 0x3ff) as u32;
             fp8_nan_from_input(fmt, sign, fp16_mant)
         }
@@ -326,18 +292,17 @@ fn fp16_to_fp8_biased(
             if saturating {
                 fp8_max_normal(fmt, sign)
             } else {
-                // E5M2 -> Inf encoding; E4M3 (no Inf) -> its NaN slot. (Hardware-matched.)
+                // E5M2 -> the S.11111.00 overflow encoding; E4M3 (no Inf) -> its NaN slot.
                 fp8_overflow(fmt, sign)
             }
         }
         Fp16Class::Finite { mantissa, exp2 } => {
-            let (exp_field, mant_field, overflowed) =
-                round_finite_to_fp8(fmt, mantissa, exp2, bias, bias_mode);
+            let (exp_field, mant_field, overflowed) = round_finite_to_fp8(fmt, mantissa, exp2);
             if overflowed {
                 if saturating {
                     fp8_max_normal(fmt, sign)
                 } else {
-                    // Non-saturating finite overflow: E5M2 -> Inf, E4M3 -> NaN.
+                    // Non-saturating finite overflow: E5M2 -> S.11111.00, E4M3 -> NaN.
                     fp8_overflow(fmt, sign)
                 }
             } else {
@@ -347,16 +312,11 @@ fn fp16_to_fp8_biased(
     }
 }
 
-/// Convert one FP16 lane (raw bits) to one FP8 byte in the given target format under plain
-/// RTNE (no bias rounding).
-fn fp16_to_fp8(fmt: &Fp8Format, bits: u16, saturating: bool) -> u8 {
-    fp16_to_fp8_biased(fmt, bits, saturating, 0, false)
-}
-
 /// Convert one FP16 lane (raw bits) to one BF8 (E5M2) byte.
 ///
 /// On magnitude overflow: when `saturating`, clamp to the BF8 max normal `+/-57344`;
-/// otherwise emit the BF8 NaN/overflow encoding `S.11111.{01,10,11}`.
+/// otherwise emit the BF8 Inf encoding `S.11111.00` (E5M2 has an Inf; see the module
+/// header's OQ-4 correction — E4M3 overflows to NaN instead because it has none).
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_PH2FP8.1-2]`
@@ -377,30 +337,154 @@ pub(crate) fn fp16_to_hf8(bits: u16, saturating: bool) -> u8 {
     fp16_to_fp8(&HF8, bits, saturating)
 }
 
-/// Convert one FP16 lane (raw bits) to one BF8 (E5M2) byte using bias rounding.
+/// Convert one FP16 lane (raw bits) to one BF8 (E5M2) byte using bias ("SR") rounding,
+/// transcribing the ACE v1 spec section 16.2 `fp16_to_fp8_e5m2` SR branches directly.
 ///
 /// `bias` is the 8-bit bias rounding term for this lane — per spec section 8.4.5 the byte
-/// `src1.byte[2 * i]` (the low byte of the i-th `u16` of the bias operand). It is applied
-/// to the rounding function before the round (spec section 2.6.3) so `bias == 0` is exactly
-/// [`fp16_to_bf8`] and a nonzero bias nudges the rounded byte upward. Overflow handling
-/// (NaN encoding when non-saturating, clamp to +/-57344 when saturating) is identical to
-/// [`fp16_to_bf8`].
+/// `src1.byte[2 * i]` (the low byte of the i-th `u16` of the bias operand). Per section 16.2
+/// it is added at the lsb of the (normalized) 10-bit FP16 mantissa with no shift for the
+/// E5M2 target, the carry propagates into the exponent, and the biased mantissa is then
+/// TRUNCATED (no rounding in the SR path). FP16 subnormal inputs are normalized first, then
+/// biased/truncated over the widened subnormal window. `bias == 0` therefore truncates (it
+/// is NOT [`fp16_to_bf8`]'s RTNE). Overflow: `S.11111.00` when non-saturating, clamp to
+/// +/-57344 when saturating.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
 pub(crate) fn fp16_to_bf8_biased(bits: u16, bias: u8, saturating: bool) -> u8 {
-    fp16_to_fp8_biased(&BF8, bits, saturating, bias as u32, true)
+    let s_i = ((bits >> 15) & 1) as u32;
+    let e_i = ((bits >> 10) & 0x1f) as i32;
+    let m_i = (bits & 0x3ff) as u32;
+
+    let (e_o, m_o): (i32, u32) = if e_i == 0x1f {
+        // Inf or NaN (same for all rounding modes).
+        if m_i == 0 {
+            if saturating {
+                (0x1e, 0x3) // Inf -> clamp to max_normal
+            } else {
+                (0x1f, 0x0) // Inf -> overflow encoding
+            }
+        } else {
+            (0x1f, 0x2 | ((m_i >> 8) & 0x1)) // NaN -> preserve payload bit
+        }
+    } else if e_i == 0x00 {
+        if m_i == 0 {
+            (0, 0)
+        } else {
+            // FP16 subnormal: normalize, then add the bias at the lsb of the normalized
+            // 10-bit mantissa and truncate over the widened subnormal window.
+            let mut mant = m_i;
+            let mut exp_unbiased = -14i32;
+            while mant & 0x400 == 0 {
+                mant <<= 1;
+                exp_unbiased -= 1;
+            }
+            let m_n = mant & 0x3ff;
+            let e_n = exp_unbiased + 15; // virtual FP16-normal exponent field
+            let mut e_b = e_n;
+            let mut m_b = m_n + (bias as u32 & 0xff);
+            if m_b & 0xfc00 != 0 {
+                e_b += 1; // carry out of the 10-bit mantissa
+            }
+            m_b &= 0x3ff;
+            if e_b >= 0x1f {
+                if saturating {
+                    (0x1e, 0x3)
+                } else {
+                    (0x1f, 0x0)
+                }
+            } else if e_b <= 0 {
+                let mut m_o = 0u32;
+                if (9 - e_b) <= 11 {
+                    let mant_u = m_b | 0x400;
+                    let shift = 9 - e_b;
+                    m_o = mant_u >> shift; // truncate; no rounding in SR path
+                }
+                (0, m_o)
+            } else {
+                (e_b, m_b >> 8)
+            }
+        }
+    } else {
+        // FP16 normal: add the bias to the 10-bit mantissa, truncate.
+        let mut e_b = e_i;
+        let mut m_b = m_i + (bias as u32 & 0xff);
+        if m_b & 0xfc00 != 0 {
+            e_b += 1;
+        }
+        m_b &= 0x3ff;
+        if e_b >= 0x1f {
+            if saturating {
+                (0x1e, 0x3)
+            } else {
+                (0x1f, 0x0)
+            }
+        } else {
+            (e_b, m_b >> 8) // truncate to 2-bit mantissa
+        }
+    };
+
+    ((s_i << 7) | ((e_o as u32 & 0x1f) << 2) | (m_o & 0x3)) as u8
 }
 
-/// Convert one FP16 lane (raw bits) to one HF8 (E4M3) byte using bias rounding.
+/// Convert one FP16 lane (raw bits) to one HF8 (E4M3) byte using bias ("SR") rounding,
+/// transcribing the ACE v1 spec section 16.2 `fp16_to_fp8_e4m3` SR branches directly.
 ///
 /// `bias` is the 8-bit bias rounding term for this lane — per spec section 8.4.5 the byte
-/// `src1.byte[2 * i]`. Applied before the round (spec section 2.6.3) so `bias == 0` is
-/// exactly [`fp16_to_hf8`]. Overflow handling (NaN encoding when non-saturating, clamp to
-/// +/-448 when saturating) is identical to [`fp16_to_hf8`].
+/// `src1.byte[2 * i]`. Per section 16.2 the E4M3 target discards one fewer bit than E5M2,
+/// so the bias is applied shifted right by 1 (`(bias & 0xFF) >> 1`) at the lsb of the 10-bit
+/// FP16 mantissa, with carry into the exponent, then TRUNCATED. Every FP16 subnormal input
+/// flushes to signed zero (all are below the E4M3 minimum) — in SR mode too. `bias == 0`
+/// therefore truncates (it is NOT [`fp16_to_hf8`]'s RTNE). Overflow: NaN `S.1111.111` when
+/// non-saturating, clamp to +/-448 when saturating; a saturating in-binade truncation into
+/// the NaN slot clamps to max_normal.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1-1]`
 pub(crate) fn fp16_to_hf8_biased(bits: u16, bias: u8, saturating: bool) -> u8 {
-    fp16_to_fp8_biased(&HF8, bits, saturating, bias as u32, true)
+    let s_i = ((bits >> 15) & 1) as u32;
+    let e_i = ((bits >> 10) & 0x1f) as i32;
+    let m_i = (bits & 0x3ff) as u32;
+
+    let (e_o, m_o): (i32, u32) = if e_i == 0x1f {
+        // Inf or NaN -> NaN (E4M3 has no Inf); saturating Inf clamps to max_normal.
+        if saturating && m_i == 0 {
+            (0xf, 0x6)
+        } else {
+            (0xf, 0x7)
+        }
+    } else if e_i == 0x00 {
+        // Zero or FP16 subnormal -> zero (FP16 subnormals are all below the E4M3 minimum).
+        (0, 0)
+    } else {
+        // FP16 normal: add the shifted bias to the mantissa, truncate.
+        let mut e_b = e_i;
+        let mut m_b = m_i + ((bias as u32 & 0xff) >> 1);
+        if m_b & 0xfc00 != 0 {
+            e_b += 1; // carry out of the 10-bit mantissa
+        }
+        m_b &= 0x3ff;
+        let newexp = e_b - 15 + 7; // rebias after bias addition
+        if newexp >= 16 {
+            (0xf, if saturating { 0x6 } else { 0x7 })
+        } else if newexp <= 0 {
+            let mut m_o = 0u32;
+            if (8 - newexp) <= 11 {
+                let mant = m_b | 0x400;
+                let shift = 8 - newexp;
+                m_o = mant >> shift; // truncate; no rounding in SR path
+            }
+            (0, m_o)
+        } else {
+            let e_o = newexp;
+            let m_o = m_b >> 7; // truncate to 3-bit mantissa
+            if saturating && e_o == 0xf && m_o == 0x7 {
+                (e_o, 0x6)
+            } else {
+                (e_o, m_o)
+            }
+        }
+    };
+
+    ((s_i << 7) | ((e_o as u32 & 0xf) << 3) | (m_o & 0x7)) as u8
 }
 
 /// Exact lossless decode of one HF8 (E4M3) byte to the equivalent FP16 (E5M10) bit
@@ -591,15 +675,21 @@ pub(crate) fn fp32_to_fp16_rne(f: f32) -> u16 {
 /// of the mantissa correctly propagates into the exponent (and, at the top of the finite
 /// range, to +/-Inf), because the whole 32-bit pattern is incremented before truncation.
 ///
-/// Non-finite handling (matches the hardware BF16 narrowing convention):
+/// Special-case handling per the section-16.1 `fp32_to_bfloat16` pseudocode:
+/// * Zero and FP32 denormal inputs flush to signed zero (DAZ=1 implied by the pseudocode's
+///   leading `IF e == 0: RETURN (s << 15)`).
 /// * +/-Inf -> BF16 +/-Inf (top 16 bits: exp all ones, mantissa 0).
 /// * NaN -> a quiet BF16 NaN with the sign preserved. The raw top-16 bits of an FP32 NaN can
 ///   have a zero 7-bit mantissa (when the NaN's set payload bits live only in the discarded
-///   low 16), which would alias to Inf; and the round-bias add could likewise clear it, so
-///   the quiet bit (mantissa bit 6, `0x0040`) is forced on to guarantee the result stays a
-///   NaN rather than becoming Inf.
+///   low 16), which would alias to Inf, so the quiet bit (mantissa bit 6, `0x0040`) is
+///   forced on to guarantee the result stays a NaN rather than becoming Inf.
 pub(crate) fn fp32_to_bf16_rne(f: f32) -> u16 {
     let bits = f.to_bits();
+    let sign = ((bits >> 31) as u16) << 15;
+    if bits & 0x7f80_0000 == 0 {
+        // Zero or FP32 denormal -> signed zero (spec section 16.1: DAZ=1 implied).
+        return sign;
+    }
     if f.is_nan() {
         // Quiet NaN, sign preserved: top 16 bits with the quiet mantissa bit forced on so a
         // NaN can never collapse to the Inf encoding.
@@ -675,8 +765,10 @@ pub(crate) fn fp8_e5m2_to_fp32(byte: u8) -> f32 {
             // S.11111.00 = BF8 +/-Inf -> FP32 +/-Inf.
             return f32::from_bits(fp32_sign | (0xff << 23));
         }
-        // BF8 NaN S.11111.{01,10,11} -> quiet FP32 NaN (top mantissa bit set), sign kept.
-        return f32::from_bits(fp32_sign | (0xff << 23) | (1 << 22));
+        // BF8 NaN S.11111.{01,10,11} -> quiet FP32 NaN, payload preserved: the section-16.3
+        // pseudocode is `m_o = (m_i | 0x2) << 21` — the qBit (FP32 mantissa bit 22) is
+        // forced on and the low NaN payload bit lands in FP32 bit 21.
+        return f32::from_bits(fp32_sign | (0xff << 23) | ((mant | 0x2) << 21));
     }
 
     if exp == 0 {
@@ -725,9 +817,10 @@ pub(crate) fn fp8_e4m3_to_fp32(byte: u8) -> f32 {
     let fp32_sign = sign << 31;
 
     if exp == 0x0f && mant == 0x07 {
-        // Sole HF8 NaN S.1111.111 -> quiet FP32 NaN (top mantissa bit set), sign kept.
-        // (E4M3 has no infinity, so this is the only non-finite encoding.)
-        return f32::from_bits(fp32_sign | (0xff << 23) | (1 << 22));
+        // Sole HF8 NaN S.1111.111 -> quiet FP32 NaN, sign kept. The section-16.3 pseudocode
+        // is `m_o = (m_i | 0x4) << 20` — with m_i == 0x7 that sets FP32 mantissa bits
+        // 22:20 (0x700000). (E4M3 has no infinity, so this is the only non-finite encoding.)
+        return f32::from_bits(fp32_sign | (0xff << 23) | ((mant | 0x4) << 20));
     }
 
     if exp == 0 {
@@ -975,24 +1068,16 @@ pub(crate) fn fp32_to_fp8_e4m3_biased(
         if newexp >= 16 {
             (0xF, if saturating { 0x6 } else { 0x7 })
         } else if newexp <= 0 {
-            // Underflow: truncate the biased mantissa into the E4M3 subnormal range
-            // (FTZ=0), mirroring the E5M2 Bias branch. Magnitudes below the subnormal
-            // window truncate to zero.
-            let mut m_o = 0u32;
-            if (21 - newexp) <= 24 {
-                let mant = m_b | 0x800000;
-                let shift = 21 - newexp;
-                m_o = mant >> shift;
-            }
-            (0, m_o)
+            // Underflow: hard flush to signed zero. Unlike the E5M2 Bias branch, the
+            // section-16.1 E4M3 Bias pseudocode has NO subnormal-truncate block — the
+            // spec is deliberately asymmetric here.
+            (0, 0)
         } else {
-            let e_o = newexp;
-            let m_o = m_b >> 20;
-            if saturating && e_o == 0xF && m_o == 0x7 {
-                (e_o, 0x6) // clamp NaN slot -> max_normal, as in the RTNE/RTO branches
-            } else {
-                (e_o, m_o)
-            }
+            // Normal: truncate the biased mantissa. The section-16.1 E4M3 Bias branch has
+            // no saturating NaN-slot clamp (that clamp exists only in the RTNE/RTO
+            // branches); a truncation into `e_o == 0xF, m_o == 0x7` yields the NaN
+            // encoding even when saturating.
+            (newexp, m_b >> 20)
         }
     } else {
         // RTNE.
@@ -1255,9 +1340,9 @@ mod tests {
 
     #[test]
     fn bias_rounding_is_add_bias_then_truncate() {
-        // OQ-5, hardware-grounded (verified under SDE): family-C bias rounding is NOT
-        // "add-bias-then-RTNE". It adds the 8-bit bias into the discarded-fraction window and
-        // then TRUNCATES toward zero. Two consequences this test pins:
+        // Per the section-16.2 SR pseudocode, family-C bias rounding is NOT
+        // "add-bias-then-RTNE". It adds the 8-bit bias at the lsb of the 10-bit FP16
+        // mantissa and then TRUNCATES toward zero. Two consequences this test pins:
         //
         //  (1) bias == 0 is TRUNCATION, not RTNE. A value just above half an lsb (which RTNE
         //      rounds up) is rounded DOWN by the bias=0 converter.
@@ -1310,8 +1395,8 @@ mod tests {
             0b00,
             "plain RTNE keeps mant 0b00"
         );
-        // A bias byte of 0xff aligns its MSB at the half position (bit 7 of the 8 discarded
-        // bits): 1 + 0xff = 0x100 >= half (0x80), so the round goes up to mant 0b01.
+        // Bias 0xff added at the mantissa lsb (spec section 16.2, E5M2 target: no shift):
+        // 1 + 0xff = 0x100, which truncates (>> 8) to mant 0b01 — one lsb up.
         assert_eq!(
             fp16_to_bf8_biased(near_one, 0xff, false) & 0b11,
             0b01,
@@ -1326,15 +1411,45 @@ mod tests {
     }
 
     #[test]
+    fn bias_sr_subnormal_counterexamples_match_spec() {
+        // Section-16.2 SR pins in the subnormal regime — these distinguish the fixed-position
+        // bias add (spec) from a window-aligned bias add (which overweights the bias for
+        // subnormal results).
+        //
+        // E5M2, min FP16 subnormal 0x0001 (= 2^-24), bias 0xFF: normalize to m_n=0,
+        // e_n = -9; m_b = 0xFF (no carry), e_b = -9 <= 0; window (9 - (-9)) = 18 > 11, so
+        // m_o stays 0 -> +0. A window-aligned model returns 0x01.
+        assert_eq!(fp16_to_bf8_biased(0x0001, 0xff, false), 0x00);
+        // E5M2, normal 0x0201 (e_i=0, m_i=0x201 subnormal): normalize m=0x201 -> one shift
+        // (0x402), m_n = 0x2, e_n = 0 + 15 - 14... transcription: exp_unbiased=-15, e_n=0;
+        // m_b = 0x2 + 0xFF = 0x101, no carry; e_b = 0 <= 0; shift = 9, mant_u = 0x501,
+        // m_o = 0x501 >> 9 = 0x2 -> byte 0x02. Window-aligned model returns 0x03.
+        assert_eq!(fp16_to_bf8_biased(0x0201, 0xff, false), 0x02);
+        // E4M3: EVERY FP16 subnormal input flushes to signed zero in SR mode (all are below
+        // the E4M3 minimum, spec section 16.2) — even with the maximum bias.
+        assert_eq!(fp16_to_hf8_biased(0x0080, 0xff, false), 0x00);
+        assert_eq!(fp16_to_hf8_biased(0x8080, 0xff, false), 0x80);
+        // E4M3, normal source with subnormal result, bias 0x80 (applied >> 1 per spec):
+        // 0x1400 = 2^-10; m_b = 0 + 0x40, e_b = 5, newexp = -3 <= 0; shift = 11,
+        // mant = 0x440, m_o = 0x440 >> 11 = 0 -> +0. Window-aligned model returns 0x01.
+        assert_eq!(fp16_to_hf8_biased(0x1400, 0x80, false), 0x00);
+        // E4M3, 0x1CFF with bias 0xFF: m_b = 0xFF + 0x7F = 0x17E... e_i = 7, m_i = 0xFF;
+        // m_b = 0xFF + 0x7F = 0x17E (no carry), e_b = 7, newexp = -1 <= 0; shift = 9,
+        // mant = 0x57E, m_o = 0x57E >> 9 = 0x2 -> byte 0x02. Window model returns 0x03.
+        assert_eq!(fp16_to_hf8_biased(0x1cff, 0xff, false), 0x02);
+    }
+
+    #[test]
     fn bias_overflow_matches_plain_overflow_handling() {
-        // Bias on an already-overflowing magnitude still produces the format NaN/overflow
-        // (non-saturating) or clamps to max normal (saturating) — bias does not change the
-        // overflow handling (spec section 8.4.5 reuses the family-A saturation path).
+        // Bias on an already-overflowing magnitude still produces the format overflow
+        // encoding (Inf `S.11111.00` for BF8, NaN for HF8, non-saturating) or clamps to max
+        // normal (saturating) — bias does not change the overflow handling (spec section
+        // 8.4.5 reuses the family-A saturation path).
         let big = fp16_bits(0, 30, 0x3ff); // 65504, overflows both BF8 and HF8
         assert_eq!(
-            (fp16_to_bf8_biased(big, 0x40, false) >> 2) & 0x1f,
-            0b11111,
-            "bf8 nsat overflow stays NaN"
+            fp16_to_bf8_biased(big, 0x40, false),
+            bf8(0, 0b11111, 0b00),
+            "bf8 nsat overflow is the Inf encoding S.11111.00"
         );
         assert_eq!(
             fp16_to_bf8_biased(big, 0x40, true),
@@ -1592,13 +1707,19 @@ mod tests {
         // — this rules out a model that treats the whole max-exponent binade as NaN).
         assert_eq!(fp8_e5m2_to_fp32(bf8(0, 0b11111, 0b00)), f32::INFINITY);
         assert_eq!(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b00)), f32::NEG_INFINITY);
-        // S.11111.01 / .10 / .11 are BF8 NaN -> FP32 NaN, sign preserved.
+        // S.11111.01 / .10 / .11 are BF8 NaN -> FP32 NaN with the section-16.3 payload
+        // mapping `m_o = (m_i | 0x2) << 21`: the qBit (FP32 bit 22) is forced on and the
+        // low NaN payload bit lands in FP32 bit 21.
         for m in [0b01u8, 0b10, 0b11] {
             let v = fp8_e5m2_to_fp32(bf8(0, 0b11111, m));
             assert!(v.is_nan(), "mm={m:#04b} should be NaN");
             let (s, e, frac) = fp32_parts(v);
             assert_eq!((s, e), (0, 0xff));
-            assert!(frac != 0, "NaN mantissa nonzero");
+            assert_eq!(
+                frac,
+                ((m as u32) | 0x2) << 21,
+                "payload-preserving NaN mantissa per section 16.3"
+            );
         }
         assert!(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b10)).is_nan());
         assert_eq!(fp32_parts(fp8_e5m2_to_fp32(bf8(1, 0b11111, 0b10))).0, 1);
@@ -1636,6 +1757,9 @@ mod tests {
         let nan = fp8_e4m3_to_fp32(hf8(0, 0b1111, 0b111));
         assert!(nan.is_nan());
         assert_eq!(fp32_parts(nan).1, 0xff);
+        // Section-16.3 payload mapping `m_o = (m_i | 0x4) << 20` with m_i = 0x7: FP32
+        // mantissa bits 22:20 all set.
+        assert_eq!(fp32_parts(nan).2, 0x70_0000);
         assert!(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111)).is_nan());
         assert_eq!(fp32_parts(fp8_e4m3_to_fp32(hf8(1, 0b1111, 0b111))).0, 1);
     }
@@ -1709,10 +1833,10 @@ mod tests {
         );
     }
 
-    /// `bf16_to_fp32` is the exact left-shift decode and the inverse of the RNE rounder on
-    /// every BF16 pattern. Exhaustive over all 65536 encodings (fast, deterministic): each
-    /// non-NaN pattern round-trips bit-for-bit through decode-then-encode, and each NaN
-    /// pattern decodes to an FP32 NaN that re-encodes to a BF16 NaN.
+    /// `bf16_to_fp32` is the exact left-shift decode, and the RNE rounder inverts it on
+    /// every BF16 pattern except the subnormals, which the section-16.1 `fp32_to_bfloat16`
+    /// DAZ flush maps to signed zero. Exhaustive over all 65536 encodings (fast,
+    /// deterministic).
     /// `fp8::fp32_bf16_round_trip`
     #[test]
     fn fp32_bf16_round_trip() {
@@ -1725,6 +1849,7 @@ mod tests {
                 (b) << 16,
                 "bf16_to_fp32 is an exact left shift"
             );
+            let is_subnormal = (bits >> 7) & 0xff == 0 && (bits & 0x7f) != 0;
             if f.is_nan() {
                 assert!(
                     bf16_is_nan(bits),
@@ -1734,11 +1859,19 @@ mod tests {
                     bf16_is_nan(fp32_to_bf16_rne(f)),
                     "NaN re-encodes to a BF16 NaN"
                 );
+            } else if is_subnormal {
+                // BF16 subnormal decodes to an FP32 denormal, which the spec's DAZ flush
+                // (section 16.1) re-encodes as the same-signed zero, NOT the original bits.
+                assert_eq!(
+                    fp32_to_bf16_rne(f),
+                    bits & 0x8000,
+                    "subnormal flushes to signed zero on re-encode (DAZ=1)"
+                );
             } else {
                 assert_eq!(
                     fp32_to_bf16_rne(f),
                     bits,
-                    "non-NaN BF16 round-trips exactly (decode then RNE encode)"
+                    "non-NaN, non-subnormal BF16 round-trips exactly"
                 );
             }
         }

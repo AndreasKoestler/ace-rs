@@ -60,6 +60,12 @@ use std::sync::Arc;
 /// Number of addressable tiles in a palette-2 configuration (`TMM0..=TMM7`).
 pub const MAX_TILES: usize = 8;
 
+/// Monotonic source of per-scope tokens: every [`TileScope`] gets a distinct token, and the
+/// handles it mints ([`TileId`], [`BsrId`]) carry it, so a handle used against a *different*
+/// live scope is caught at the accessor (a programmer error the lifetime system alone cannot
+/// express — two scopes in one block share a region).
+static NEXT_SCOPE_TOKEN: AtomicUsize = AtomicUsize::new(0);
+
 // Forward-reference the rest of the group-4 detection + codec surface this feature delivers
 // in phase 1 but whose consumers arrive in later phases (crate idiom for
 // delivered-but-not-yet-consumed items, cf. the gate markers in `src/cvt_fp8_ps.rs`). A
@@ -81,9 +87,9 @@ const _: () = {
 /// The only palette this family supports.
 const PALETTE_2: u8 = 2;
 /// Palette-2 per-tile row limit.
-const MAX_ROWS: u8 = 16;
+pub(crate) const MAX_ROWS: u8 = 16;
 /// Palette-2 per-tile bytes-per-row (`colsb`) limit.
-const MAX_COLSB: u16 = 64;
+pub(crate) const MAX_COLSB: u16 = 64;
 
 /// A palette-2 tile configuration descriptor.
 ///
@@ -100,9 +106,11 @@ const MAX_COLSB: u16 = 64;
 pub struct TileConfig {
     /// Palette identifier; must equal `2`.
     pub palette_id: u8,
-    /// Per-tile row counts; each must be `<= 16`. A `0` entry is an unconfigured tile.
+    /// Per-tile row counts; each must be `<= 16`. A `0` entry is an unconfigured tile and
+    /// requires the matching `colsb` entry to also be `0` (see [`TileConfig::validate`]).
     pub rows: [u8; MAX_TILES],
-    /// Per-tile bytes-per-row; each must be `<= 64`. A `0` entry is an unconfigured tile.
+    /// Per-tile bytes-per-row; each must be `<= 64`. A `0` entry is an unconfigured tile and
+    /// requires the matching `rows` entry to also be `0` (see [`TileConfig::validate`]).
     pub colsb: [u16; MAX_TILES],
 }
 
@@ -119,12 +127,17 @@ pub enum TileConfigError {
     RowsOutOfRange,
     /// Some tile's `colsb` entry exceeded `64`.
     ColsbOutOfRange,
+    /// Some tile had exactly one of `rows`/`colsb` zero. A tile is either configured
+    /// (both nonzero) or unconfigured (both zero); `LDTILECFG` raises `#GP` on a
+    /// half-configured descriptor entry.
+    HalfConfiguredTile,
 }
 
 impl TileConfig {
     /// Validate the palette-2 descriptor limits, checking palette id first, then `rows`, then
-    /// `colsb`. Returns the first violation; a palette error takes priority over a
-    /// row/column error so an all-bad descriptor reports [`TileConfigError::InvalidPalette`].
+    /// `colsb`, then per-tile configuration consistency. Returns the first violation; a
+    /// palette error takes priority over a row/column error so an all-bad descriptor reports
+    /// [`TileConfigError::InvalidPalette`].
     fn validate(&self) -> Result<(), TileConfigError> {
         if self.palette_id != PALETTE_2 {
             return Err(TileConfigError::InvalidPalette);
@@ -134,6 +147,16 @@ impl TileConfig {
         }
         if self.colsb.iter().any(|&c| c > MAX_COLSB) {
             return Err(TileConfigError::ColsbOutOfRange);
+        }
+        // A tile is configured (rows and colsb both nonzero) or unconfigured (both zero);
+        // `LDTILECFG` `#GP`s on a half-configured entry, so the model rejects it too.
+        if self
+            .rows
+            .iter()
+            .zip(self.colsb.iter())
+            .any(|(&r, &c)| (r == 0) != (c == 0))
+        {
+            return Err(TileConfigError::HalfConfiguredTile);
         }
         Ok(())
     }
@@ -165,10 +188,12 @@ impl Tile {
 /// A handle addressing one configured tile of a [`TileScope`].
 ///
 /// A `TileId` is minted only by [`TileScope::tile`] — it has no public constructor, so it
-/// cannot be forged to bypass the guard (OQ-2). Because every tile operation takes the
-/// scope, a handle is useless once the guard has released its configuration: dropping the
-/// scope and then using the handle does not compile (INV-2,
-/// `[ace-tile-instructions.TILE_LIFECYCLE.6]`):
+/// cannot be forged to bypass the guard (OQ-2). It is bound to the scope that minted it: it
+/// carries that scope's token, and every accessor panics if the handle is presented to a
+/// *different* scope (a programmer error; two live scopes in one block defeat a purely
+/// lifetime-based check). Because every tile operation takes the scope, a handle is also
+/// useless once the guard has released its configuration: dropping the scope and then using
+/// the handle does not compile (INV-2, `[ace-tile-instructions.TILE_LIFECYCLE.6]`):
 ///
 /// ```compile_fail
 /// use ace::{_tile_loadconfig, _tile_zero, TileConfig};
@@ -185,6 +210,8 @@ impl Tile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TileId {
     index: usize,
+    /// Token of the [`TileScope`] that minted this handle (see [`NEXT_SCOPE_TOKEN`]).
+    scope_token: usize,
 }
 
 /// The RAII tile lifecycle guard (`[ace-tile-instructions.TILE_LIFECYCLE.5]`).
@@ -215,6 +242,9 @@ pub struct TileScope {
     /// confirm the RAII `TILERELEASE` fired — including across a panic unwind, where the
     /// released guard's own state is gone but the ledger survives. `None` in ordinary use.
     release_ledger: Option<Arc<AtomicUsize>>,
+    /// This scope's distinct token; stamped into every handle it mints (see
+    /// [`NEXT_SCOPE_TOKEN`]).
+    token: usize,
 }
 
 impl TileScope {
@@ -223,10 +253,32 @@ impl TileScope {
     /// to the `&mut self`-style lifecycle ops.
     pub fn tile(&self, index: usize) -> Option<TileId> {
         if index < MAX_TILES {
-            Some(TileId { index })
+            Some(TileId {
+                index,
+                scope_token: self.token,
+            })
         } else {
             None
         }
+    }
+
+    /// Panic unless `id` was minted by this scope — the cross-scope guard every tile
+    /// accessor runs (see [`TileId`]).
+    fn check_tile(&self, id: TileId) {
+        assert_eq!(
+            id.scope_token, self.token,
+            "TileId used with a TileScope other than the one that minted it"
+        );
+    }
+
+    /// Panic unless `id` was minted by this scope — the cross-scope guard every BSR
+    /// accessor runs (see [`TileId`]).
+    fn check_bsr(&self, id: BsrId) {
+        assert_eq!(
+            id.scope_token(),
+            self.token,
+            "BsrId used with a TileScope other than the one that minted it"
+        );
     }
 
     /// Mint a handle to block-scale register `index` (`0..NUM_BSR`), or `None` if out of range.
@@ -234,7 +286,7 @@ impl TileScope {
     /// whole tile + `BSR` register model.
     pub fn bsr(&self, index: usize) -> Option<BsrId> {
         if index < NUM_BSR {
-            Some(BsrId::new(index))
+            Some(BsrId::new(index, self.token))
         } else {
             None
         }
@@ -245,18 +297,21 @@ impl TileScope {
     /// storage interface the family-D tests and the MX outer products (phase 7) read the block
     /// scale back through (INV-5).
     pub(crate) fn bsr_scale(&self, id: BsrId, block: usize) -> Option<u8> {
+        self.check_bsr(id);
         self.bsr[id.index()].scale(block)
     }
 
     /// Shared read accessor for the whole addressed block-scale register, used by the MX-FP8
     /// outer products (phase 7) to read every per-block scale the `BSR` ops wrote (INV-5).
     pub(crate) fn bsr_reg(&self, id: BsrId) -> &BsrReg {
+        self.check_bsr(id);
         &self.bsr[id.index()]
     }
 
     /// Mutable register-model accessor for the addressed block-scale register, used by the
     /// family-D `BSRINIT` / `BSRMOV{F,H,L}` oracles to seed / move its per-block exponents.
     pub(crate) fn bsr_reg_mut(&mut self, id: BsrId) -> &mut BsrReg {
+        self.check_bsr(id);
         &mut self.bsr[id.index()]
     }
 
@@ -265,6 +320,7 @@ impl TileScope {
     /// tiles land in later phases; family A's own tests use it to inspect register state.
     #[cfg(test)]
     fn tile_bytes(&self, id: TileId) -> &[u8] {
+        self.check_tile(id);
         &self.tiles[id.index].bytes
     }
 
@@ -273,6 +329,7 @@ impl TileScope {
     /// (`[ace-tile-instructions.TILE_MOVE.1-1]`). A `(0, 0)` shape denotes an unconfigured
     /// tile, for which every index is out of range.
     pub(crate) fn tile_shape(&self, id: TileId) -> (u8, u16) {
+        self.check_tile(id);
         let tile = &self.tiles[id.index];
         (tile.rows, tile.colsb)
     }
@@ -280,12 +337,14 @@ impl TileScope {
     /// Shared read-back accessor for the addressed tile's raw backing bytes (the register-model
     /// storage interface), used by the family-B move oracles to extract a row/column.
     pub(crate) fn tile_bytes_ref(&self, id: TileId) -> &[u8] {
+        self.check_tile(id);
         &self.tiles[id.index].bytes
     }
 
     /// Mutable register-model accessor for the addressed tile's raw backing bytes, used by the
     /// family-B write-form move oracles to insert a row/column.
     pub(crate) fn tile_bytes_mut(&mut self, id: TileId) -> &mut [u8] {
+        self.check_tile(id);
         &mut self.tiles[id.index].bytes
     }
 
@@ -353,6 +412,7 @@ pub fn _tile_loadconfig_scalar(config: &TileConfig) -> Result<TileScope, TileCon
         bsr,
         released: false,
         release_ledger: None,
+        token: NEXT_SCOPE_TOKEN.fetch_add(1, Ordering::Relaxed),
     })
 }
 
@@ -378,7 +438,7 @@ pub fn _tile_zero(scope: &mut TileScope, dst: TileId) {
 /// Portable `TILEZERO` oracle — zeroes the addressed tile's bytes and leaves every other
 /// tile untouched.
 pub fn _tile_zero_scalar(scope: &mut TileScope, dst: TileId) {
-    scope.tiles[dst.index].bytes.iter_mut().for_each(|b| *b = 0);
+    scope.tile_bytes_mut(dst).iter_mut().for_each(|b| *b = 0);
 }
 
 #[cfg(test)]
@@ -392,6 +452,51 @@ mod tests {
             rows: [4, 2, 0, 0, 0, 0, 0, 0],
             colsb: [16, 8, 0, 0, 0, 0, 0, 0],
         }
+    }
+
+    /// A half-configured descriptor entry (`rows` and `colsb` not both zero / both nonzero)
+    /// is rejected the way `LDTILECFG` `#GP`s on one, and no tile state is established.
+    /// `tile::half_configured_descriptor_rejected`
+    #[test]
+    fn half_configured_descriptor_rejected() {
+        let rows_without_colsb = TileConfig {
+            palette_id: 2,
+            rows: [5, 0, 0, 0, 0, 0, 0, 0],
+            colsb: [0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            _tile_loadconfig(&rows_without_colsb).unwrap_err(),
+            TileConfigError::HalfConfiguredTile
+        );
+        let colsb_without_rows = TileConfig {
+            palette_id: 2,
+            rows: [0, 0, 0, 0, 0, 0, 0, 0],
+            colsb: [0, 32, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            _tile_loadconfig(&colsb_without_rows).unwrap_err(),
+            TileConfigError::HalfConfiguredTile
+        );
+        // The all-zero (fully unconfigured) descriptor remains valid.
+        let all_zero = TileConfig {
+            palette_id: 2,
+            rows: [0; MAX_TILES],
+            colsb: [0; MAX_TILES],
+        };
+        assert!(_tile_loadconfig(&all_zero).is_ok());
+    }
+
+    /// A `TileId` presented to a scope other than the one that minted it is a programmer
+    /// error and panics at the accessor instead of silently addressing the wrong register
+    /// file.
+    /// `tile::cross_scope_handle_panics`
+    #[test]
+    #[should_panic(expected = "TileId used with a TileScope other than the one that minted it")]
+    fn cross_scope_handle_panics() {
+        let scope_a = _tile_loadconfig(&two_tile_config()).unwrap();
+        let mut scope_b = _tile_loadconfig(&two_tile_config()).unwrap();
+        let id_from_a = scope_a.tile(0).unwrap();
+        _tile_zero(&mut scope_b, id_from_a);
     }
 
     /// STTILECFG round-trips the descriptor LDTILECFG loaded, and Acquire zeroes the tiles

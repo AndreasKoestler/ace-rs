@@ -49,10 +49,34 @@ use crate::detect;
 /// Signedness of a VNNI byte operand: whether each byte is sign-extended (`Signed`) or
 /// zero-extended (`Unsigned`) to the product width before multiplication
 /// (spec section 8.6.5 `extend = sign_extend8 if signed else zero_extend8`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sign {
     Signed,
     Unsigned,
+}
+
+/// How one accumulated dword total is written back (spec sections 8.6.5 / 8.7.5): the
+/// non-saturating forms wrap, the `...DS` forms saturate — signed unless BOTH operands are
+/// unsigned (`UU`), where the destination is the spec's unsigned accumulator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Finalize {
+    /// INT32 truncation == wrap modulo 2^32.
+    Wrap,
+    /// Signed-saturate to `[-2^31, 2^31-1]`.
+    SatSigned,
+    /// Unsigned-saturate to `[0, 2^32-1]`, stored as the `i32` bit pattern.
+    SatUnsigned,
+}
+
+impl Finalize {
+    /// Pick the write-back rule from a variant's saturation flag and operand sign pair.
+    fn from_variant(saturating: bool, both_unsigned: bool) -> Self {
+        match (saturating, both_unsigned) {
+            (false, _) => Finalize::Wrap,
+            (true, false) => Finalize::SatSigned,
+            (true, true) => Finalize::SatUnsigned,
+        }
+    }
 }
 
 /// Widen one raw operand byte to its `i32` value per its signedness (spec section 8.6.5,
@@ -102,7 +126,8 @@ fn dpb_oracle(
     b_sign: Sign,
     saturating: bool,
 ) -> [i32; 16] {
-    let both_unsigned = matches!((a_sign, b_sign), (Sign::Unsigned, Sign::Unsigned));
+    let both_unsigned = a_sign == Sign::Unsigned && b_sign == Sign::Unsigned;
+    let finalize = Finalize::from_variant(saturating, both_unsigned);
     core::array::from_fn(|i| {
         // total accumulates in i64 so dst + four byte-products never overflows the
         // intermediate before the saturate/wrap decision (spec section 8.6.5). For the
@@ -118,7 +143,7 @@ fn dpb_oracle(
             let p = widen_byte(a[4 * i + k], a_sign) * widen_byte(b[4 * i + k], b_sign);
             total += p as i64;
         }
-        finalize_dword(total, saturating, both_unsigned)
+        finalize_dword(total, finalize)
     })
 }
 
@@ -149,7 +174,8 @@ fn dpw_oracle(
     b_sign: Sign,
     saturating: bool,
 ) -> [i32; 16] {
-    let both_unsigned = matches!((a_sign, b_sign), (Sign::Unsigned, Sign::Unsigned));
+    let both_unsigned = a_sign == Sign::Unsigned && b_sign == Sign::Unsigned;
+    let finalize = Finalize::from_variant(saturating, both_unsigned);
     core::array::from_fn(|i| {
         // Same widening discipline as the byte oracle: the UU form reads the destination
         // dword as the unsigned accumulator (spec section 8.7.5 `unsigned_dword_saturate`).
@@ -159,33 +185,27 @@ fn dpw_oracle(
             dst[i] as i64
         };
         for k in 0..2 {
-            // Each product fits in i32 (a 16-bit*16-bit extension), accumulated in i64.
+            // Products MUST form in i64 (`widen_word` returns i64): the UU product
+            // 65535*65535 = 4294836225 exceeds i32::MAX, so an i32 intermediate would
+            // overflow. Accumulated in i64 alongside dst.
             let p = widen_word(a[2 * i + k], a_sign) * widen_word(b[2 * i + k], b_sign);
             total += p;
         }
-        finalize_dword(total, saturating, both_unsigned)
+        finalize_dword(total, finalize)
     })
 }
 
 /// Apply the shared VNNI saturation/wrap rule to one accumulated dword (spec sections 8.6.5 /
 /// 8.7.5, identical for byte and word groups). `total` is the wider-type (`i64`) accumulation
-/// `dst + sum-of-products`; the result is the `i32` bit pattern the hardware writes back:
-///
-/// * non-saturating: INT32 truncation == wrap modulo 2^32;
-/// * saturating + `both_unsigned` (`UU`): unsigned-saturate to `[0, 2^32-1]` (stored as the
-///   `i32` bit pattern, e.g. `2^32-1 -> -1`);
-/// * saturating otherwise: signed-saturate to `[-2^31, 2^31-1]`.
+/// `dst + sum-of-products`; the result is the `i32` bit pattern the hardware writes back per
+/// the [`Finalize`] rule (e.g. unsigned-saturated `2^32-1 -> -1`).
 #[inline]
-fn finalize_dword(total: i64, saturating: bool, both_unsigned: bool) -> i32 {
-    if saturating {
-        if both_unsigned {
-            total.clamp(0, u32::MAX as i64) as u32 as i32
-        } else {
-            total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-        }
-    } else {
+fn finalize_dword(total: i64, finalize: Finalize) -> i32 {
+    match finalize {
         // INT32 truncation == wrap modulo 2^32, matching dpbssd_scalar.
-        total as i32
+        Finalize::Wrap => total as i32,
+        Finalize::SatSigned => total.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        Finalize::SatUnsigned => total.clamp(0, u32::MAX as i64) as u32 as i32,
     }
 }
 
@@ -199,7 +219,8 @@ macro_rules! dispatch {
         #[cfg(all(target_arch = "x86_64", feature = "native"))]
         {
             if detect::has_avx10_v1_aux() {
-                // SAFETY: `AVX10_V1_AUX` confirmed present immediately above.
+                // SAFETY: `has_avx10_v1_aux()` confirmed full AVX10.2 (the feature set this shim's
+                // translation unit is compiled for) plus OS XSAVE state immediately above.
                 return unsafe { $hw($dst, $a, $b) };
             }
         }

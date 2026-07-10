@@ -687,39 +687,39 @@ mod tests {
         );
     }
 
-    /// Regression: the E4M3 Bias branch must TRUNCATE underflow into the subnormal range
-    /// (FTZ=0), not flush to zero — mirroring the E5M2 Bias branch and the E4M3 RTNE/RTO
-    /// branches. `2^-7 = 4 * 2^-9` is exactly representable as the E4M3 subnormal
-    /// `S.0000.100` (0x04); a flush-to-zero model returns 0x00.
+    /// Regression: the section-16.1 E4M3 Bias branch FLUSHES underflow (`newexp <= 0`) to
+    /// signed zero — it has NO subnormal-truncate block, unlike the E5M2 Bias branch and
+    /// the E4M3 RTNE/RTO branches. The spec is deliberately asymmetric here: even a value
+    /// exactly representable as an E4M3 subnormal (e.g. `2^-7 = 4 * 2^-9` = `S.0000.100`)
+    /// flushes to zero under Bias rounding.
     #[test]
-    fn known_value_bias_hf8_underflow_truncates_to_subnormal() {
+    fn known_value_bias_hf8_underflow_flushes_to_zero() {
         let mut a = [0.0f32; 16];
-        a[0] = f32::from_bits(120u32 << 23); // +2^-7, exact E4M3 subnormal 4*2^-9
+        a[0] = f32::from_bits(120u32 << 23); // +2^-7, exact E4M3 subnormal — still flushes
         a[1] = -a[0];
-        a[2] = f32::from_bits((119u32 << 23) | 0x40_0000); // +3*2^-9 = 1.5*2^-8, exact
-        a[3] = f32::from_bits(117u32 << 23); // +2^-10, below the subnormal window -> 0
+        a[2] = f32::from_bits((119u32 << 23) | 0x40_0000); // +3*2^-9, exact — still flushes
+        a[3] = f32::from_bits(117u32 << 23); // +2^-10, far below the window
         let zero = [0i32; 16];
 
         let out = cvtbiasps_hf8(a, zero);
-        assert_eq!(out[0], hf8(0, 0b0000, 0b100), "+2^-7 -> subnormal 0x04");
-        assert_eq!(out[1], hf8(1, 0b0000, 0b100), "-2^-7 -> subnormal 0x84");
-        assert_eq!(out[2], hf8(0, 0b0000, 0b011), "+3*2^-9 -> subnormal 0x03");
-        assert_eq!(out[3], hf8(0, 0b0000, 0b000), "+2^-10 truncates to zero");
+        assert_eq!(out[0], hf8(0, 0b0000, 0b000), "+2^-7 -> +0 (no subnormal block)");
+        assert_eq!(out[1], hf8(1, 0b0000, 0b000), "-2^-7 -> -0 (sign kept)");
+        assert_eq!(out[2], hf8(0, 0b0000, 0b000), "+3*2^-9 -> +0");
+        assert_eq!(out[3], hf8(0, 0b0000, 0b000), "+2^-10 -> +0");
         // Saturating variant shares the underflow path.
         assert_eq!(
             cvtbiaspss_hf8(a, zero)[0],
-            hf8(0, 0b0000, 0b100),
-            "saturating variant truncates into the subnormal range too"
+            hf8(0, 0b0000, 0b000),
+            "saturating variant flushes to zero too"
         );
     }
 
-    /// Regression: the SATURATING E4M3 Bias convert must clamp the finite in-binade overflow
-    /// slot (truncated `e_o = 0xF`, `m_o = 0x7`, i.e. inputs in `[480, 512)`) to
-    /// `±max_E4M3 = ±448` (`S.1111.110`), never emit the NaN encoding `S.1111.111` for a
-    /// non-NaN input — matching the RTNE/RTO branches. The NON-saturating variant maps the
-    /// same slot to NaN per the section-9.2.1 overflow rule.
+    /// Regression: the section-16.1 E4M3 Bias branch has NO saturating NaN-slot clamp —
+    /// that clamp exists only in the RTNE/RTO branches. A finite input whose biased
+    /// mantissa truncates into `e_o = 0xF, m_o = 0x7` (inputs in `[480, 512)`) yields the
+    /// NaN encoding `S.1111.111` in BOTH the saturating and non-saturating Bias variants.
     #[test]
-    fn known_value_bias_hf8_saturating_nan_slot_clamps() {
+    fn known_value_bias_hf8_nan_slot_is_not_clamped() {
         let mut a = [0.0f32; 16];
         a[0] = 480.0;
         a[1] = -480.0;
@@ -727,9 +727,9 @@ mod tests {
         let zero = [0i32; 16];
 
         let sat = cvtbiaspss_hf8(a, zero);
-        assert_eq!(sat[0], hf8(0, 0b1111, 0b110), "sat +480 -> +448, not NaN");
-        assert_eq!(sat[1], hf8(1, 0b1111, 0b110), "sat -480 -> -448, not NaN");
-        assert_eq!(sat[2], hf8(0, 0b1111, 0b110), "sat +500 -> +448, not NaN");
+        assert_eq!(sat[0], hf8(0, 0b1111, 0b111), "sat +480 -> NaN-coded (no clamp)");
+        assert_eq!(sat[1], hf8(1, 0b1111, 0b111), "sat -480 -> NaN-coded (no clamp)");
+        assert_eq!(sat[2], hf8(0, 0b1111, 0b111), "sat +500 -> NaN-coded (no clamp)");
 
         let nsat = cvtbiasps_hf8(a, zero);
         assert_eq!(nsat[0], hf8(0, 0b1111, 0b111), "nsat +480 -> NaN-coded");
@@ -852,11 +852,12 @@ mod proptests {
                 .all(|(pub_fn, ora_fn)| pub_fn(input.a, input.bias) == ora_fn(input.a, input.bias))
         }
 
-        /// A **zero bias** family-B convert equals the section-9.2.5 truncate-toward-zero
-        /// conversion on every input (`[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`). The
-        /// truncate reference here re-derives the BIAS branch directly (mask to 21/20 bits and
-        /// `>>`), so this asserts the public bias path with `bias == 0` reproduces the spec's
-        /// pure-truncate behaviour bit-for-bit, for both targets and both saturating flags.
+        /// A **zero bias** family-B convert through the public dispatchers equals the shared
+        /// `crate::fp8` Bias-branch oracle called directly with `bias == 0`
+        /// (`[avx10-v2-aux-ocp-conversions.CVT_BIAS_PS_FP8.4]`). NOTE: this pins the
+        /// dispatcher wiring (lane mapping, bias-word extraction, saturation flag routing)
+        /// against the oracle — it is NOT an independent re-derivation of the section-16.1
+        /// truncate rule; the known-value tests above pin that rule with literal bytes.
         fn prop_zero_bias_equals_truncate(input: Inputs) -> bool {
             let zero = [0i32; 16];
             (0..16).all(|i| {

@@ -37,6 +37,21 @@ fn compile_native() {
     if arch != "x86_64" {
         return;
     }
+
+    // Probe the ISA flags up front so an unsupporting toolchain (MSVC rejects `-m` flags
+    // outright; GCC/Clang before AVX10.2 support reject `-mavx10.2`) fails with a clear
+    // message instead of an opaque cc error from the middle of the build.
+    let probe = cc::Build::new();
+    for flag in ["-mavx10.2", "-mamx-tile", "-mamx-avx512"] {
+        if !probe.is_flag_supported(flag).unwrap_or(false) {
+            panic!(
+                "the `native` feature needs a C compiler that accepts `{flag}` \
+                 (GCC/Clang with AVX10.2 + AMX support); this toolchain does not. \
+                 Build without `--features native` to use the pure-Rust scalar oracle."
+            );
+        }
+    }
+
     cc::Build::new()
         .file("src/native/avx10_v1_aux.c")
         .flag("-mavx10.2")

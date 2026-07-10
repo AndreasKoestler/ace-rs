@@ -8,8 +8,11 @@
 //!     (family B write forms, D, E, F, G) it asserts the emitted byte sequence equals its
 //!     spec-derived golden constant. It reconstructs the EVEX encoding from the documented ACE
 //!     v1 §6 fields (prefix / map / pp / W / opcode / ModRM) and asserts the reconstruction
-//!     equals the recorded golden bytes, plus the EVEX structural invariants. This ALWAYS runs
-//!     and needs NO external tool, so a `.byte` transcription error is caught on every
+//!     equals the recorded golden bytes, plus the EVEX structural invariants; then
+//!     [`c_shim_bytes_match_golden`] parses the actual `.byte` sequences out of
+//!     `src/native/ace_tile.c` and asserts they are exactly the golden set — so a
+//!     transcription error IN THE C FILE (not merely in this table) is caught. Both ALWAYS
+//!     run and need NO external tool, so a `.byte` transcription error is caught on every
 //!     `cargo test` (R3 mitigation).
 //!
 //!  2. [`disassembly_mnemonic_operands_or_skip`] — when a system disassembler (`llvm-mc` or
@@ -237,8 +240,9 @@ fn golden_bytes_match_per_byte_primitive() {
 
     let mut seen = Vec::new();
     for g in GOLDEN {
-        // 1. The golden constant equals the reconstruction from the documented §6 fields — this
-        //    is the transcription check against the `.byte` shims in src/native/ace_tile.c.
+        // 1. The golden constant equals the reconstruction from the documented §6 fields.
+        //    (The transcription check against the `.byte` shims in src/native/ace_tile.c is
+        //    `c_shim_bytes_match_golden`, which parses that file.)
         assert_eq!(
             g.bytes,
             g.reconstruct(),
@@ -294,6 +298,80 @@ fn golden_bytes_match_per_byte_primitive() {
     println!(
         "encoding: {} ACE .byte golden encodings verified against ACE v1 §6 (no external tool)",
         GOLDEN.len()
+    );
+}
+
+/// Extract every 6-byte `.byte` sequence (`0x62,0x..,0x..,0x..,0x..,0x..`) from C source
+/// text. Every ACE `.byte` shim spells its bytes as one comma-separated literal beginning
+/// with the EVEX prefix `0x62`, so scanning for that prefix and parsing six `0xNN` tokens
+/// recovers the shims' exact encodings without a C parser.
+fn extract_byte_sequences(c_source: &str) -> Vec<[u8; 6]> {
+    let mut found = Vec::new();
+    for (start, _) in c_source.match_indices("0x62,") {
+        let rest = &c_source[start..];
+        let tokens: Vec<&str> = rest.splitn(7, ',').take(6).collect();
+        if tokens.len() != 6 {
+            continue;
+        }
+        let mut bytes = [0u8; 6];
+        let mut ok = true;
+        for (i, tok) in tokens.iter().enumerate() {
+            // The final token runs on to the rest of the line (`0xc8" ::: "memory"...`), so
+            // parse exactly the leading `0xNN` of each token.
+            let tok = tok.trim();
+            match tok
+                .get(..4)
+                .and_then(|t| t.strip_prefix("0x"))
+                .map(|h| u8::from_str_radix(h, 16))
+            {
+                Some(Ok(b)) => bytes[i] = b,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            found.push(bytes);
+        }
+    }
+    found
+}
+
+/// The `.byte` sequences actually present in `src/native/ace_tile.c` are exactly the golden
+/// set — same sequences, same multiplicities. This is the real transcription check: editing a
+/// byte in either the C shim or the golden table (but not both) fails this test, with no
+/// external tool and regardless of whether the `native` feature is enabled
+/// (`[ace-tile-instructions.TESTING.5]`, R3 mitigation).
+///
+/// `encoding::c_shim_bytes_match_golden`
+#[test]
+fn c_shim_bytes_match_golden() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/native/ace_tile.c");
+    let source = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {path} (the .byte shim source): {e}"));
+
+    let mut in_c = extract_byte_sequences(&source);
+    let mut in_golden: Vec<[u8; 6]> = GOLDEN.iter().map(|g| g.bytes).collect();
+    in_c.sort_unstable();
+    in_golden.sort_unstable();
+
+    for g in GOLDEN {
+        assert!(
+            in_c.contains(&g.bytes),
+            "{}: golden bytes {:02X?} not found in ace_tile.c — the .byte shim drifted or is missing",
+            g.mnemonic,
+            g.bytes
+        );
+    }
+    assert_eq!(
+        in_c, in_golden,
+        "ace_tile.c .byte sequences must be exactly the golden set (a sequence in the C file \
+         has no golden entry, or multiplicities differ)"
+    );
+    println!(
+        "encoding: {} .byte sequences parsed from ace_tile.c match the golden table exactly",
+        in_c.len()
     );
 }
 
@@ -390,10 +468,27 @@ fn disassembly_mnemonic_operands_or_skip() {
             }
         };
         // ACE mnemonics are not in current binutils/LLVM tables, so the tool typically emits
-        // `(bad)` / a non-ACE decode. Where it DOES surface the spec mnemonic, assert it.
-        if text.to_ascii_uppercase().contains(g.mnemonic) {
+        // `(bad)` / `.byte`-style output. Where it DOES surface the spec mnemonic, assert it;
+        // where it decodes the bytes as some OTHER valid instruction, surface that loudly —
+        // a golden encoding aliasing an allocated x86 opcode (real EVEX map5/map6 opcodes are
+        // allocated in AVX10.2) is exactly the drift this layer exists to notice, even though
+        // the policy stays skip-with-warning until the rev-1.15 opcode table is confirmed.
+        let upper = text.to_ascii_uppercase();
+        if upper.contains(g.mnemonic) {
             matched += 1;
         } else {
+            if !upper.contains("(BAD)") && !upper.contains(".BYTE") {
+                let decode: Vec<&str> = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('.'))
+                    .take(3)
+                    .collect();
+                eprintln!(
+                    "warning: {name} decoded {} ({:02X?}) as a DIFFERENT valid instruction — \
+                     possible opcode collision with an allocated x86 encoding: {decode:?}",
+                    g.mnemonic, g.bytes
+                );
+            }
             unrecognized += 1;
         }
     }

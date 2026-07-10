@@ -229,48 +229,66 @@ pub(crate) fn encode_tilecfg(palette: u8, rows: &[u8; 8], colsb: &[u16; 8]) -> [
     cfg
 }
 
-/// `_hw` wrappers: marshal fixed-size Rust buffers into the C shims. Every wrapper is `unsafe`
-/// and may be called only once the matching capability check has confirmed the running CPU
-/// supports the form (`detect::has_amx_tile` / `has_amx_avx512` / `has_ace`) with the tile +
-/// BSR XSAVE state enabled — otherwise the tile / EVEX instruction would fault (`#UD`). Callers
-/// go through the differential properties, which gate on those probes.
-///
-/// # Safety
-/// The CPU must support the relevant tile capability and OS tile-state enablement; the input
-/// buffers must be the documented lengths.
+// `_hw` wrappers: marshal fixed-size Rust buffers into the C shims. Every wrapper is `unsafe`
+// and may be called only once the matching capability check has confirmed the running CPU
+// supports the form (`detect::has_amx_tile` / `has_amx_avx512` / `has_ace`) with the tile +
+// BSR XSAVE state enabled — otherwise the tile / EVEX instruction would fault (`#UD`). Callers
+// go through the differential properties, which gate on those probes. Each wrapper carries its
+// own `# Safety` section (macro-generated wrappers get it from their macro).
 
 /// Family A: STTILECFG round-trip of a 64-byte descriptor (INV-3).
+///
+/// # Safety
+/// The CPU must support AMX-TILE with the tile XSAVE state enabled
+/// ([`crate::detect::has_amx_tile`]), otherwise the tile instructions fault (`#UD`).
 pub(crate) unsafe fn tile_cfg_roundtrip_hw(cfg: &[u8; 64]) -> [u8; 64] {
     let mut out = [0u8; 64];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers; the
+    // caller upholds the capability precondition above.
     ace_tile_cfg_roundtrip(cfg.as_ptr(), out.as_mut_ptr());
     out
 }
 
 /// Family A: TILEZERO of tile 0.
+///
+/// # Safety
+/// The CPU must support AMX-TILE with the tile XSAVE state enabled
+/// ([`crate::detect::has_amx_tile`]), otherwise the tile instructions fault (`#UD`).
 pub(crate) unsafe fn tile_zero_hw(cfg: &[u8; 64], data: &[u8; TILE_BYTES]) -> [u8; TILE_BYTES] {
     let mut out = [0u8; TILE_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
     ace_tile_zero(cfg.as_ptr(), data.as_ptr(), out.as_mut_ptr());
     out
 }
 
 /// Family B read: TILEMOVROW read form (tile row -> ZMM).
+///
+/// # Safety
+/// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+/// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
 pub(crate) unsafe fn tile_movrow_read_hw(
     cfg: &[u8; 64],
     data: &[u8; TILE_BYTES],
     row: u32,
 ) -> [u8; TILE_BYTES] {
     let mut out = [0u8; TILE_BYTES];
+    // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
     ace_tile_movrow_read(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
     out
 }
 
 /// Family C: TCVTROWD2PS (tile row INT32 -> FP32 ZMM).
+///
+/// # Safety
+/// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+/// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
 pub(crate) unsafe fn tcvtrowd2ps_hw(
     cfg: &[u8; 64],
     data: &[u8; TILE_BYTES],
     row: u32,
 ) -> [f32; 16] {
     let mut out = [0f32; 16];
+    // SAFETY (FFI): the 64-byte inputs and 16-lane f32 output match the shim's contract.
     ace_tile_tcvtrowd2ps(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
     out
 }
@@ -278,8 +296,13 @@ pub(crate) unsafe fn tcvtrowd2ps_hw(
 macro_rules! tcvtrow_word_hw {
     ($name:ident, $shim:ident) => {
         /// Family C tile-row FP32 -> narrow (BF16 / FP16) convert (ZMM word lanes out).
+        ///
+        /// # Safety
+        /// The CPU must support AMX-AVX512 (or full ACE) with the tile XSAVE state enabled
+        /// ([`crate::detect::has_amx_avx512`]), otherwise the instruction faults (`#UD`).
         pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; TILE_BYTES], row: u32) -> [u16; 32] {
             let mut out = [0u16; 32];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented buffer lengths.
             $shim(cfg.as_ptr(), data.as_ptr(), row, out.as_mut_ptr());
             out
         }
@@ -293,8 +316,14 @@ tcvtrow_word_hw!(tcvtrowps2phl_hw, ace_tile_tcvtrowps2phl);
 macro_rules! move_write_hw {
     ($name:ident, $shim:ident) => {
         /// Family B write / family D single-tile `.byte` shim (ZMM/data -> tile, stored back).
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + BSR XSAVE state enabled
+        /// ([`crate::detect::has_ace`]), otherwise the `.byte`-encoded instruction faults
+        /// (`#UD`).
         pub(crate) unsafe fn $name(cfg: &[u8; 64], data: &[u8; TILE_BYTES]) -> [u8; TILE_BYTES] {
             let mut out = [0u8; TILE_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(cfg.as_ptr(), data.as_ptr(), out.as_mut_ptr());
             out
         }
@@ -310,6 +339,11 @@ move_write_hw!(bsrmovl_hw, ace_tile_bsrmovl);
 macro_rules! top_hw {
     ($name:ident, $shim:ident) => {
         /// Family G / F rank-N outer-product `.byte` shim: `C += A (x) B`, dst tile stored back.
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + BSR XSAVE state enabled
+        /// ([`crate::detect::has_ace`]), otherwise the `.byte`-encoded instruction faults
+        /// (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
             c: &[u8; TILE_BYTES],
@@ -317,6 +351,7 @@ macro_rules! top_hw {
             b: &[u8; TILE_BYTES],
         ) -> [u8; TILE_BYTES] {
             let mut out = [0u8; TILE_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(
                 cfg.as_ptr(),
                 c.as_ptr(),
@@ -337,6 +372,11 @@ top_hw!(top2bf16ps_hw, ace_tile_top2bf16ps);
 macro_rules! mx_top_hw {
     ($name:ident, $shim:ident) => {
         /// Family E MX-FP8 rank-4 outer-product `.byte` shim with a per-block BSR scale.
+        ///
+        /// # Safety
+        /// The CPU must support full ACE with the tile + BSR XSAVE state enabled
+        /// ([`crate::detect::has_ace`]), otherwise the `.byte`-encoded instruction faults
+        /// (`#UD`).
         pub(crate) unsafe fn $name(
             cfg: &[u8; 64],
             c: &[u8; TILE_BYTES],
@@ -345,6 +385,7 @@ macro_rules! mx_top_hw {
             bsr: &[u8; TILE_BYTES],
         ) -> [u8; TILE_BYTES] {
             let mut out = [0u8; TILE_BYTES];
+            // SAFETY (FFI): fixed-size borrows match the shim's documented 64-byte buffers.
             $shim(
                 cfg.as_ptr(),
                 c.as_ptr(),

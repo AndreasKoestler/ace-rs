@@ -77,23 +77,32 @@ pub struct BsrReg {
 /// A handle addressing one block-scale register of a [`TileScope`].
 ///
 /// A `BsrId` is minted only by [`TileScope::bsr`] — it has no public constructor, so it cannot
-/// be forged to bypass the guard (OQ-3), mirroring [`crate::tile::TileId`]. It is the handle
-/// the MX-FP8 outer products (phase 7) accept to read the block scale these ops wrote (INV-5).
+/// be forged to bypass the guard (OQ-3), mirroring [`crate::tile::TileId`]. Like `TileId` it
+/// carries the minting scope's token, and every accessor panics if it is presented to a
+/// different scope. It is the handle the MX-FP8 outer products (phase 7) accept to read the
+/// block scale these ops wrote (INV-5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BsrId {
     index: usize,
+    /// Token of the [`TileScope`] that minted this handle (see [`crate::tile::TileId`]).
+    scope_token: usize,
 }
 
 impl BsrId {
-    /// Mint a handle for register `index`; called only by [`TileScope::bsr`], which bounds
-    /// `index` to `0..NUM_BSR` (no public constructor).
-    pub(crate) fn new(index: usize) -> Self {
-        BsrId { index }
+    /// Mint a handle for register `index` bound to the scope with `scope_token`; called only
+    /// by [`TileScope::bsr`], which bounds `index` to `0..NUM_BSR` (no public constructor).
+    pub(crate) fn new(index: usize, scope_token: usize) -> Self {
+        BsrId { index, scope_token }
     }
 
     /// The addressed register's index into the guard-owned file.
     pub(crate) fn index(&self) -> usize {
         self.index
+    }
+
+    /// Token of the minting scope, checked by every [`TileScope`] BSR accessor.
+    pub(crate) fn scope_token(&self) -> usize {
+        self.scope_token
     }
 }
 

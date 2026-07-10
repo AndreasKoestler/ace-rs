@@ -48,6 +48,15 @@ use crate::tile::{TileId, TileScope};
 /// the first `colsb` bytes; a column uses the first `rows` bytes; the rest are zero.
 pub const ZMM_BYTES: usize = 64;
 
+// The move oracles copy a full row (`colsb` bytes) or column (`rows` bytes) into a ZMM-sized
+// buffer with `out[..colsb]` / `take(rows)` — sound only while a palette-2 row/column fits in
+// one ZMM. These limits live in `tile.rs`; couple them at compile time so bumping one without
+// the other cannot silently reintroduce a panic path.
+const _: () = {
+    assert!(crate::tile::MAX_COLSB as usize <= ZMM_BYTES);
+    assert!(crate::tile::MAX_ROWS as usize <= ZMM_BYTES);
+};
+
 // ---------------------------------------------------------------------------------------------
 // Read forms (tile -> ZMM vector)
 // ---------------------------------------------------------------------------------------------

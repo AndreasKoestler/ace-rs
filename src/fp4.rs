@@ -39,7 +39,7 @@
 /// the buffer. This is the inverse of the packers in this module and in [`crate::fp6`], and
 /// the field-read primitive the section-9.9.4 `vunpackb` decode is defined in terms of.
 pub(crate) fn extract_field(buf: &[u8], bit_offset: usize, size: usize) -> u8 {
-    debug_assert!((1..=8).contains(&size));
+    assert!((1..=8).contains(&size));
     let mut acc: u16 = 0;
     let mut got = 0;
     let mut pos = bit_offset;
@@ -240,8 +240,8 @@ pub(crate) fn fp4_e2m1_to_fp8_e4m3(nibble: u8) -> u8 {
 /// `out` must hold at least `values.len() * size` bits; it is zeroed first, so bits past the
 /// last lane stay zero.
 pub(crate) fn pack_fields(values: &[u8], size: usize, out: &mut [u8]) {
-    debug_assert!((1..=8).contains(&size));
-    debug_assert!(values.len() * size <= out.len() * 8);
+    assert!((1..=8).contains(&size));
+    assert!(values.len() * size <= out.len() * 8);
     for byte in out.iter_mut() {
         *byte = 0;
     }
@@ -267,8 +267,8 @@ pub(crate) fn pack_fields(values: &[u8], size: usize, out: &mut [u8]) {
 /// `nibbles.len() / 2` bytes. Every nibble is written (no masking/zeroing), the inverse of
 /// [`unpack_nibbles`]. Thin `size = 4` wrapper over [`pack_fields`].
 pub(crate) fn pack_nibbles(nibbles: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(nibbles.len() % 2, 0);
-    debug_assert_eq!(out.len(), nibbles.len() / 2);
+    assert_eq!(nibbles.len() % 2, 0);
+    assert_eq!(out.len(), nibbles.len() / 2);
     pack_fields(nibbles, 4, out);
 }
 
@@ -281,7 +281,7 @@ pub(crate) fn pack_nibbles(nibbles: &[u8], out: &mut [u8]) {
 /// pack/unpack round-trip test, so it is gated `#[cfg(test)]` to stay dead-code-clean.
 #[cfg(test)]
 pub(crate) fn unpack_nibbles(buf: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), 2 * buf.len());
+    assert_eq!(out.len(), 2 * buf.len());
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = extract_field(buf, 4 * i, 4);
     }
@@ -295,7 +295,7 @@ pub(crate) fn unpack_nibbles(buf: &[u8], out: &mut [u8]) {
 /// 9.5.5, `[avx10-v2-aux-ocp-conversions.CVT_FP4_FP8.3]`). The inverse pack step (FP8->FP4
 /// nibble pack) is [`pack_nibbles`]; this is the family-E read-and-widen primitive.
 pub(crate) fn unpack_nibbles_to_fp8_e4m3(buf: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), 2 * buf.len());
+    assert_eq!(out.len(), 2 * buf.len());
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = fp4_e2m1_to_fp8_e4m3(extract_field(buf, 4 * i, 4));
     }

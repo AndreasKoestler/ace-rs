@@ -119,14 +119,15 @@ void ace_tile_tcvtrowps2phl(const uint8_t *cfg, const uint8_t *data, uint32_t ro
 /* `.byte` RAW-ENCODING shims (ACE-only: family B write, D, E, F, G).                          */
 /*                                                                                             */
 /* Each marshals operands through memory: `_tile_loadconfig` sets the palette-2 shape,          */
-/* `_tile_loadd` loads the operand tiles into fixed tmm registers (tmm0 = A / value / dst-in,    */
-/* tmm2 = B), the ACE instruction runs via its `.byte` encoding over those tmm operands, and     */
-/* the destination tile 1 is stored back with `_tile_stored`. Built, not executed, until SDE     */
-/* ACE emulation lands (OQ-6, R2). The `.byte` constants match tests/encoding.rs::golden.        */
+/* `_tile_loadd` loads the operand tiles into fixed tmm registers (tmm0 = A / source value,      */
+/* tmm1 = C / destination, tmm2 = B), the ACE instruction runs via its `.byte` encoding over     */
+/* those tmm operands, and the destination tile 1 is stored back with `_tile_stored`. Built,     */
+/* not executed, until SDE ACE emulation lands (OQ-6, R2). The `.byte` constants match           */
+/* tests/encoding.rs::golden, which parses THIS FILE and asserts the sequences are identical.    */
 /* ------------------------------------------------------------------------------------------- */
 
-/* Load config + the (up to) three tile operands used by the outer-product shims. tmm0=A(dst-in
- * for moves), tmm1=C(dst accumulator), tmm2=B. */
+/* Load config + the (up to) three tile operands used by the outer-product shims. tmm0=A(source
+ * value for moves/BSR), tmm1=C(dst accumulator), tmm2=B. */
 __attribute__((target("amx-tile"))) static inline
 void ace_tile_load3(const uint8_t *cfg, const uint8_t *c, const uint8_t *a, const uint8_t *b) {
     _tile_loadconfig(cfg);
@@ -135,100 +136,70 @@ void ace_tile_load3(const uint8_t *cfg, const uint8_t *c, const uint8_t *a, cons
     if (b) _tile_loadd(2, b, ACE_TILE_STRIDE);
 }
 
-/* Family B write — TILEMOVROW (write form): ZMM -> tile row. .byte: 62 F5 7E 48 6C C8 */
-__attribute__((target("amx-tile")))
-void ace_tile_movrow_write(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0x7e,0x48,0x6c,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
+/* Family B write and family D shims share one operand shape: the pinned 6-byte encodings are
+ * register-register `dst(tmm1) <- src(tmm0)` (ModRM 0xC8: reg=001, rm=000), so the source
+ * value MUST be marshalled into tmm0 — the register the instruction reads — and the
+ * destination tmm1 starts zeroed (matching the oracle, which writes into a fresh register),
+ * then tmm1 is stored back. NOTE (pending rev-1.15 PDF confirmation, OQ-6): the real write-form
+ * moves presumably also carry a row/column index (imm8) and BSR is presumably its own register
+ * file; the pinned §6-shaped encodings model both operands as fixed tmm registers, and this
+ * marshalling is consistent with exactly that model. */
+#define ACE_MOV_SHIM(fn, bytes)                                                                 \
+    __attribute__((target("amx-tile")))                                                         \
+    void fn(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {                           \
+        ace_tile_load3(cfg, NULL, data, NULL); /* src value -> tmm0 (encoding rm=000) */        \
+        _tile_zero(1);                         /* dst tmm1 starts zeroed, like the oracle */    \
+        __asm__ volatile(".byte " bytes ::: "memory");                                          \
+        _tile_stored(1, out, ACE_TILE_STRIDE);                                                  \
+        _tile_release();                                                                        \
+    }
 
-/* Family B write — TILEMOVCOL (write form): ZMM -> tile column. .byte: 62 F5 7E 48 6D C8 */
-__attribute__((target("amx-tile")))
-void ace_tile_movcol_write(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0x7e,0x48,0x6d,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
+/* Family B write — TILEMOVROW / TILEMOVCOL (write forms): ZMM -> tile row / column. */
+ACE_MOV_SHIM(ace_tile_movrow_write, "0x62,0xf5,0x7e,0x48,0x6c,0xc8")
+ACE_MOV_SHIM(ace_tile_movcol_write, "0x62,0xf5,0x7e,0x48,0x6d,0xc8")
 
-/* Family D — BSRINIT: seed a block-scale register. .byte: 62 F5 FC 48 50 C8 */
-__attribute__((target("amx-tile")))
-void ace_tile_bsrinit(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0xfc,0x48,0x50,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
-
-/* Family D — BSRMOVF / BSRMOVH / BSRMOVL: move the full / high / low block-scale factor.
- * .byte: 62 F5 FC 48 {51,52,53} C8 */
-__attribute__((target("amx-tile")))
-void ace_tile_bsrmovf(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0xfc,0x48,0x51,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
-
-__attribute__((target("amx-tile")))
-void ace_tile_bsrmovh(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0xfc,0x48,0x52,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
-
-__attribute__((target("amx-tile")))
-void ace_tile_bsrmovl(const uint8_t *cfg, const uint8_t *data, uint8_t *out) {
-    ace_tile_load3(cfg, data, NULL, NULL);
-    __asm__ volatile(".byte 0x62,0xf5,0xfc,0x48,0x53,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
+/* Family D — BSRINIT: seed a block-scale register; BSRMOVF / BSRMOVH / BSRMOVL: move the
+ * full / high / low block-scale factor. */
+ACE_MOV_SHIM(ace_tile_bsrinit, "0x62,0xf5,0xfc,0x48,0x50,0xc8")
+ACE_MOV_SHIM(ace_tile_bsrmovf, "0x62,0xf5,0xfc,0x48,0x51,0xc8")
+ACE_MOV_SHIM(ace_tile_bsrmovh, "0x62,0xf5,0xfc,0x48,0x52,0xc8")
+ACE_MOV_SHIM(ace_tile_bsrmovl, "0x62,0xf5,0xfc,0x48,0x53,0xc8")
 
 /* Family G — INT8 rank-4 outer products TOP4B{SS,SU,US,UU}D: C(tmm1) += A(tmm0) (x) B(tmm2).
- * .byte: 62 F6 {7F,7E,7D,7C} 48 60 C8 (pp encodes the signedness pair). */
-#define ACE_TOP_SHIM(fn, p1)                                                                    \
+ * (P1 encodes the signedness pair in pp.) */
+#define ACE_TOP_SHIM(fn, bytes)                                                                 \
     __attribute__((target("amx-tile")))                                                         \
     void fn(const uint8_t *cfg, const uint8_t *c, const uint8_t *a, const uint8_t *b,           \
             uint8_t *out) {                                                                     \
         ace_tile_load3(cfg, c, a, b);                                                           \
-        __asm__ volatile(".byte 0x62,0xf6," #p1 ",0x48,0x60,0xc8" ::: "memory");                \
+        __asm__ volatile(".byte " bytes ::: "memory");                                          \
         _tile_stored(1, out, ACE_TILE_STRIDE);                                                  \
         _tile_release();                                                                        \
     }
-ACE_TOP_SHIM(ace_tile_top4bssd, 0x7f)
-ACE_TOP_SHIM(ace_tile_top4bsud, 0x7e)
-ACE_TOP_SHIM(ace_tile_top4busd, 0x7d)
-ACE_TOP_SHIM(ace_tile_top4buud, 0x7c)
+ACE_TOP_SHIM(ace_tile_top4bssd, "0x62,0xf6,0x7f,0x48,0x60,0xc8")
+ACE_TOP_SHIM(ace_tile_top4bsud, "0x62,0xf6,0x7e,0x48,0x60,0xc8")
+ACE_TOP_SHIM(ace_tile_top4busd, "0x62,0xf6,0x7d,0x48,0x60,0xc8")
+ACE_TOP_SHIM(ace_tile_top4buud, "0x62,0xf6,0x7c,0x48,0x60,0xc8")
 
-/* Family F — TOP2BF16PS: BF16 rank-2 outer product into FP32, no block scale.
- * .byte: 62 F6 7E 48 61 C8 */
-__attribute__((target("amx-tile")))
-void ace_tile_top2bf16ps(const uint8_t *cfg, const uint8_t *c, const uint8_t *a, const uint8_t *b,
-                         uint8_t *out) {
-    ace_tile_load3(cfg, c, a, b);
-    __asm__ volatile(".byte 0x62,0xf6,0x7e,0x48,0x61,0xc8" ::: "memory");
-    _tile_stored(1, out, ACE_TILE_STRIDE);
-    _tile_release();
-}
+/* Family F — TOP2BF16PS: BF16 rank-2 outer product into FP32, no block scale. */
+ACE_TOP_SHIM(ace_tile_top2bf16ps, "0x62,0xf6,0x7e,0x48,0x61,0xc8")
 
-/* Family E — MX-FP8 rank-4 outer products with per-block BSR scale (BSR in tmm3).
- * .byte: 62 F6 {FC,FD,FE,FF} 48 70 C8 for the four mixed-format forms; 71 for TOP4MXBSSPS. */
-#define ACE_MX_SHIM(fn, p1, op)                                                                 \
-    __attribute__((target("amx-tile")))                                                         \
+/* Family E — MX-FP8 rank-4 outer products with a per-block BSR scale. The BSR operand is
+ * marshalled through tmm3 as a stand-in: no assembler/intrinsic can address the real BSR
+ * register file yet (it is `ACE`-only, OQ-6), and the pinned encodings name only tmm0/tmm1;
+ * revisit the marshalling when the rev-1.15 PDF pins the BSR operand encoding. */
+#define ACE_MX_SHIM(fn, bytes)                                                                  \
+    __attribute__((target("amx-tile")))                                                        \
     void fn(const uint8_t *cfg, const uint8_t *c, const uint8_t *a, const uint8_t *b,           \
             const uint8_t *bsr, uint8_t *out) {                                                 \
         ace_tile_load3(cfg, c, a, b);                                                           \
         if (bsr) _tile_loadd(3, bsr, ACE_TILE_STRIDE);                                          \
-        __asm__ volatile(".byte 0x62,0xf6," #p1 ",0x48," #op ",0xc8" ::: "memory");             \
+        __asm__ volatile(".byte " bytes ::: "memory");                                          \
         _tile_stored(1, out, ACE_TILE_STRIDE);                                                  \
         _tile_release();                                                                        \
     }
-ACE_MX_SHIM(ace_tile_top4mxbf8ps,  0xfc, 0x70)
-ACE_MX_SHIM(ace_tile_top4mxbhf8ps, 0xfd, 0x70)
-ACE_MX_SHIM(ace_tile_top4mxhbf8ps, 0xfe, 0x70)
-ACE_MX_SHIM(ace_tile_top4mxhf8ps,  0xff, 0x70)
-ACE_MX_SHIM(ace_tile_top4mxbssps,  0xfc, 0x71)
+ACE_MX_SHIM(ace_tile_top4mxbf8ps,  "0x62,0xf6,0xfc,0x48,0x70,0xc8")
+ACE_MX_SHIM(ace_tile_top4mxbhf8ps, "0x62,0xf6,0xfd,0x48,0x70,0xc8")
+ACE_MX_SHIM(ace_tile_top4mxhbf8ps, "0x62,0xf6,0xfe,0x48,0x70,0xc8")
+ACE_MX_SHIM(ace_tile_top4mxhf8ps,  "0x62,0xf6,0xff,0x48,0x70,0xc8")
+ACE_MX_SHIM(ace_tile_top4mxbssps,  "0x62,0xf6,0xfc,0x48,0x71,0xc8")
