@@ -396,8 +396,9 @@ fn bias_byte(bias: [u16; 32], i: usize) -> u8 {
 /// Biased FP16 -> BF8 (E5M2) convert, non-saturating.
 ///
 /// Converts `a` to BF8 applying the per-lane bias rounding term from `bias`
-/// (`bias = bias[i].byte[0]`, spec section 8.4.5), added at the mantissa lsb and then
-/// truncated per the section-16.2 SR pseudocode. NOTE: a zero bias TRUNCATES — it is NOT
+/// (`bias = bias[i].byte[0]`, spec section 8.4.5), added window-aligned into the 8 bits
+/// below the destination lsb and then truncated per the section-16.2 SR pseudocode (see
+/// [`fp8::fp16_to_bf8_biased`]). NOTE: a zero bias TRUNCATES — it is NOT
 /// [`cvtph_bf8`]'s RTNE (they agree only when no discarded bits round up). Overflow yields
 /// the BF8 overflow encoding `S.11111.00`.
 /// `[avx10-v1-aux-fp16-fp8-evex-vnni.CVT_BIAS_PH2FP8.1]`
