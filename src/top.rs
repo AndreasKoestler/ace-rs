@@ -962,4 +962,261 @@ mod tests {
         _tile_top4mxbf8ps(&mut sc, idc, a, b, 0);
         assert_eq!(f32::from_bits(tile_dword(&sc, idc, 0, 0)), 1.0);
     }
+
+    // ---- convert_fixpoint128_scaled_to_fp32_ftz_rne edge cases (finding #2) ----
+
+    /// Rounding CARRY-INTO-EXPONENT (the `ovf` path): a value whose 24-bit mantissa is all
+    /// ones and whose guard bit forces +1 overflows into the next binade, so the exponent
+    /// must increment. `x = 2^25 - 1 = 0x1FFFFFF` normalizes to mantissa 0xFFFFFF with
+    /// G=1, L=1 -> rnd_mantissa = 0x1000000, ovf = 1, biased 151 -> 152 -> exactly 2^25.
+    /// `top::fixpoint_to_fp32_carry_into_exponent`
+    #[test]
+    fn fixpoint_to_fp32_carry_into_exponent() {
+        let bits = convert_fixpoint128_scaled_to_fp32_ftz_rne((1i128 << 25) - 1, 0);
+        // Exponent field is 152 (2^25), NOT 151: the rounding carry bumped the binade.
+        assert_eq!(bits, 0x4C00_0000, "ovf carry increments the exponent");
+        assert_eq!(f32::from_bits(bits), 2f32.powi(25));
+        // Sanity: the raw magnitude (2^25 - 1) truly rounds to 2^25 in IEEE f32.
+        assert_eq!(f32::from_bits(bits), 33_554_431.0f32);
+    }
+
+    /// FTZ / overflow sign handling on NEGATIVE inputs, plus the exact 254/255 exponent
+    /// boundary for overflow.
+    /// `top::fixpoint_to_fp32_negative_and_boundary`
+    #[test]
+    fn fixpoint_to_fp32_negative_and_boundary() {
+        // NEGATIVE subnormal -> -0.0 (FTZ), sign of zero preserved.
+        let z = convert_fixpoint128_scaled_to_fp32_ftz_rne(-1, -127); // biased 0 -> FTZ
+        assert_eq!(z, 0x8000_0000, "negative subnormal flushes to -0.0");
+        assert!(f32::from_bits(z).is_sign_negative());
+        // Positive counterpart flushes to +0.0.
+        assert_eq!(convert_fixpoint128_scaled_to_fp32_ftz_rne(1, -127), 0);
+
+        // NEGATIVE overflow -> -Inf.
+        let ninf = convert_fixpoint128_scaled_to_fp32_ftz_rne(-1, 128); // biased 255
+        assert_eq!(ninf, 0xFF80_0000);
+        assert_eq!(f32::from_bits(ninf), f32::NEG_INFINITY);
+
+        // Exact exponent boundary: biased == 254 is the largest finite; biased == 255 Infs.
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(1, 127)),
+            2f32.powi(127),
+            "biased 254 stays finite"
+        );
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(-1, 127)),
+            -2f32.powi(127),
+            "biased 254, negative"
+        );
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(1, 128)),
+            f32::INFINITY,
+            "biased 255 overflows to +Inf"
+        );
+    }
+
+    /// WIDE i128 magnitudes (> 64-bit): the whole point of the 128-bit accumulator. The
+    /// left-normalize loop must find the J-bit high in the word and produce the correct
+    /// fp32. Expected values are built by independent exact reasoning (powers of two and an
+    /// exactly-representable 24-bit mantissa scaled by a power of two).
+    /// `top::fixpoint_to_fp32_wide_magnitude`
+    #[test]
+    fn fixpoint_to_fp32_wide_magnitude() {
+        // Pure power of two well beyond 64 bits.
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(1i128 << 100, 0)),
+            2f32.powi(100),
+        );
+        // 24-bit mantissa 0xC00001 (exactly representable) shifted to bit 123: exact fp32.
+        let m24: i128 = 0xC0_0001; // = 12_582_913, < 2^24 so exact as f32
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(m24 << 100, 0)),
+            12_582_913.0f32 * 2f32.powi(100),
+        );
+        // 126 significant bits (2^126 - 1): normalize + RNE + carry all at once -> 2^126.
+        assert_eq!(
+            f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(
+                (1i128 << 126) - 1,
+                0
+            )),
+            2f32.powi(126),
+        );
+    }
+
+    /// RNE tie handling beyond the two existing cases. Near 2^25 the ULP is 4, so the guard
+    /// bit is `x`-bit-1 and there are real sticky bits below it: this exercises tie-to-even
+    /// UP, tie-to-even DOWN, sticky-only-forces-up, guard-clear-rounds-down, and sign
+    /// symmetry of ties.
+    /// `top::fixpoint_to_fp32_rne_ties`
+    #[test]
+    fn fixpoint_to_fp32_rne_ties() {
+        let f = |x: i128| f32::from_bits(convert_fixpoint128_scaled_to_fp32_ftz_rne(x, 0));
+        let base = 1i128 << 25; // 33_554_432, ULP here is 4
+                                // Exact half, L=0 -> round DOWN to even.
+        assert_eq!(f(base + 2), 33_554_432.0, "tie, L=0 -> down to even");
+        // Exact half, L=1 -> round UP to even.
+        assert_eq!(f(base + 6), 33_554_440.0, "tie, L=1 -> up to even");
+        // G=1 with sticky set (not a tie) -> round UP regardless of L.
+        assert_eq!(f(base + 3), 33_554_436.0, "sticky-only sets round up");
+        // G=0 with sticky set -> below half -> round DOWN.
+        assert_eq!(f(base + 1), 33_554_432.0, "guard clear rounds down");
+        // Sign symmetry: negated ties round to the negated even neighbor.
+        assert_eq!(f(-(base + 2)), -33_554_432.0, "tie sign symmetry (down)");
+        assert_eq!(f(-(base + 6)), -33_554_440.0, "tie sign symmetry (up)");
+    }
+
+    // ---- float32_add exceptional / DAZ / FTZ paths (finding #6) ----
+
+    /// Exceptional-value collapse to QNaN_Indefinite and Inf arithmetic. QNAN_INDEFINITE is
+    /// the module constant `0xFFC0_0000` (top.rs).
+    /// `top::float32_add_exceptional`
+    #[test]
+    fn float32_add_exceptional() {
+        assert_eq!(QNAN_INDEFINITE, 0xFFC0_0000, "canonical QNaN bit pattern");
+
+        // +Inf + -Inf -> QNaN_Indefinite (opposite-sign-Inf branch).
+        assert_eq!(
+            float32_add(f32::INFINITY, f32::NEG_INFINITY, false, false, false).to_bits(),
+            QNAN_INDEFINITE,
+        );
+        assert_eq!(
+            float32_add(f32::NEG_INFINITY, f32::INFINITY, false, false, false).to_bits(),
+            QNAN_INDEFINITE,
+        );
+
+        // A direct NaN operand canonicalizes to QNaN_Indefinite regardless of its payload,
+        // for either operand position and for both quiet and signaling NaN inputs.
+        let qnan = f32::from_bits(0x7FC0_1234);
+        let snan = f32::from_bits(0x7F80_0001);
+        assert_eq!(
+            float32_add(qnan, 1.0, false, false, false).to_bits(),
+            QNAN_INDEFINITE,
+        );
+        assert_eq!(
+            float32_add(1.0, snan, false, false, false).to_bits(),
+            QNAN_INDEFINITE,
+        );
+
+        // Same-sign Inf sums stay Inf; finite + Inf -> Inf.
+        assert_eq!(
+            float32_add(f32::INFINITY, f32::INFINITY, false, false, false),
+            f32::INFINITY,
+        );
+        assert_eq!(
+            float32_add(3.5, f32::INFINITY, false, false, false),
+            f32::INFINITY,
+        );
+        assert_eq!(
+            float32_add(3.5, f32::NEG_INFINITY, false, false, false),
+            f32::NEG_INFINITY,
+        );
+    }
+
+    /// Per-operand DAZ flush applies to BOTH operands independently (the existing coverage
+    /// only exercises the accumulator / operand-a path via the instruction).
+    /// `top::float32_add_daz_both_operands`
+    #[test]
+    fn float32_add_daz_both_operands() {
+        let sub = f32::from_bits(0x0000_0001); // smallest positive subnormal
+                                               // daz_b flushes operand b: 0 + sub -> 0, but WITHOUT daz_b it would be `sub`.
+        assert_eq!(
+            float32_add(0.0, sub, false, true, false).to_bits(),
+            0,
+            "daz_b flushes operand b to zero"
+        );
+        assert_eq!(
+            float32_add(0.0, sub, false, false, false).to_bits(),
+            sub.to_bits(),
+            "without daz_b the subnormal survives (contrast)"
+        );
+        // daz_a flushes operand a.
+        assert_eq!(
+            float32_add(sub, 0.0, true, false, false).to_bits(),
+            0,
+            "daz_a flushes operand a to zero"
+        );
+        // Both operands flushed.
+        assert_eq!(
+            float32_add(sub, f32::from_bits(0x8000_0001), true, true, false).to_bits(),
+            0,
+            "both operands flushed -> +0.0"
+        );
+    }
+
+    /// FTZ on a result that would be subnormal flushes it to a SIGNED zero. Inputs are
+    /// chosen (with DAZ off) so the exact IEEE sum is a subnormal, which FTZ then zeroes.
+    /// `top::float32_add_ftz_result`
+    #[test]
+    fn float32_add_ftz_result() {
+        let min_normal = f32::from_bits(0x0080_0000); // 2^-126
+        let half = f32::from_bits(0x0040_0000); // 2^-127 (subnormal)
+                                                // 2^-126 - 2^-127 = 2^-127 (subnormal) -> FTZ -> +0.0.
+        assert_eq!(
+            float32_add(min_normal, -half, false, false, true).to_bits(),
+            0,
+            "subnormal result flushed to +0.0"
+        );
+        // Negative subnormal result -> -0.0 (sign preserved).
+        assert_eq!(
+            float32_add(-min_normal, half, false, false, true).to_bits(),
+            0x8000_0000,
+            "subnormal result flushed to -0.0"
+        );
+        // Without FTZ the subnormal survives (contrast).
+        assert_eq!(
+            float32_add(min_normal, -half, false, false, false).to_bits(),
+            half.to_bits(),
+        );
+    }
+
+    // ---- flush_subnormal / bf16_to_fp32_daz direct tests (finding #11) ----
+
+    /// `flush_subnormal`: signed-zero flush for subnormals, no-op at/above MIN_POSITIVE, and
+    /// NaN / Inf must pass through UNCHANGED (they are neither zero nor below MIN_POSITIVE).
+    /// `top::flush_subnormal_direct`
+    #[test]
+    fn flush_subnormal_direct() {
+        // Negative subnormal -> -0.0.
+        let neg = flush_subnormal(f32::from_bits(0x8000_0001));
+        assert_eq!(neg.to_bits(), 0x8000_0000);
+        assert!(neg.is_sign_negative());
+        // Positive subnormal -> +0.0.
+        assert_eq!(flush_subnormal(f32::from_bits(0x0000_0001)).to_bits(), 0);
+        // Largest subnormal still flushes.
+        assert_eq!(flush_subnormal(f32::from_bits(0x007F_FFFF)).to_bits(), 0);
+
+        // Boundary: MIN_POSITIVE is the smallest NORMAL -> unchanged.
+        assert_eq!(flush_subnormal(f32::MIN_POSITIVE), f32::MIN_POSITIVE);
+        assert_eq!(flush_subnormal(-f32::MIN_POSITIVE), -f32::MIN_POSITIVE);
+
+        // Zeros pass straight through, keeping their sign.
+        assert_eq!(flush_subnormal(0.0).to_bits(), 0);
+        assert_eq!(flush_subnormal(-0.0).to_bits(), 0x8000_0000);
+
+        // NaN / Inf must NOT be altered.
+        let nan = flush_subnormal(f32::from_bits(0x7FC1_2345));
+        assert_eq!(nan.to_bits(), 0x7FC1_2345, "NaN passes through untouched");
+        assert_eq!(flush_subnormal(f32::INFINITY), f32::INFINITY);
+        assert_eq!(flush_subnormal(f32::NEG_INFINITY), f32::NEG_INFINITY);
+    }
+
+    /// `bf16_to_fp32_daz`: BF16 denormals (exp == 0, frac != 0) flush to signed zero; a
+    /// normal BF16 widens exactly.
+    /// `top::bf16_to_fp32_daz_denormal`
+    #[test]
+    fn bf16_to_fp32_daz_denormal() {
+        // Negative BF16 denormal -> -0.0.
+        assert_eq!(bf16_to_fp32_daz(0x8001).to_bits(), 0x8000_0000);
+        assert!(bf16_to_fp32_daz(0x8001).is_sign_negative());
+        // Positive BF16 denormal -> +0.0.
+        assert_eq!(bf16_to_fp32_daz(0x0001).to_bits(), 0);
+        assert_eq!(
+            bf16_to_fp32_daz(0x007F).to_bits(),
+            0,
+            "largest BF16 denormal"
+        );
+        // A normal BF16 (1.0 = 0x3F80) widens exactly, not flushed.
+        assert_eq!(bf16_to_fp32_daz(0x3F80), 1.0);
+        assert_eq!(bf16_to_fp32_daz(0xBF80), -1.0);
+    }
 }

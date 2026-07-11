@@ -15,3 +15,4 @@
 
 # Local-only run artifacts and scratch diagrams
 /.qrspi/
+lcov.info

@@ -526,4 +526,57 @@ mod tests {
             assert_eq!(ace, super::has_ace());
         }
     }
+
+    /// Exercises the Linux `request_xcomp_perm` inline-asm `arch_prctl` path end to end:
+    /// the syscall block assembles, executes, and returns a `bool` without panicking or
+    /// aborting the process, for both dynamic XSTATE components the crate ever requests
+    /// (18 = TILEDATA for the plain AMX families, 20 = SCALEDATA for the ACE families).
+    ///
+    /// Why this is safe to call on ANY x86_64 Linux host (including this scalar-only one):
+    /// `arch_prctl` is syscall 158, present on every x86_64 Linux kernel, so the raw
+    /// `syscall` instruction never faults on ABI grounds. The `ARCH_GET_XCOMP_PERM` /
+    /// `ARCH_REQ_XCOMP_PERM` subcommands (and an unsupported feature number) merely return a
+    /// negative errno on a kernel/CPU without AMX dynamic XSTATE, which the function reports
+    /// as `false`. No signal (`SIGSYS`) is raised outside a seccomp sandbox.
+    ///
+    /// HARDWARE-ONLY CAVEAT: the TRUE / permission-GRANTED result of this function is
+    /// reachable only on real AMX-capable Linux silicon (or Intel SDE), where the kernel
+    /// actually owns the TILEDATA / SCALEDATA dynamic XSTATE components and grants the
+    /// per-process `IA32_XFD` permission. That positive path CANNOT be verified from this
+    /// unit test on a scalar-only host — it is validated on real hardware / SDE, not here.
+    /// This test therefore only proves the asm assembles and the syscall entry / early
+    /// (fast-path GET + fallback REQ) path runs cleanly and yields a `bool`; on this host
+    /// the returned value is expected to be `false`, but the test does not assert its value
+    /// because a genuine AMX host running the suite would legitimately return `true`.
+    /// `detect::request_xcomp_perm_linux_asm_runs`
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn request_xcomp_perm_linux_asm_runs() {
+        // Both feature numbers the production gates ever pass (has_amx_tile => 18,
+        // has_ace => 20). Each returns a plain bool; the syscall does not crash.
+        let tiledata: bool = super::request_xcomp_perm(18);
+        let scaledata: bool = super::request_xcomp_perm(20);
+        // Consume the values so the calls can't be optimized away; any bool is acceptable
+        // (false on scalar-only hosts, true on real AMX silicon / SDE).
+        let _ = tiledata | scaledata;
+    }
+
+    /// The non-Linux x86_64 stub of `request_xcomp_perm` unconditionally reports `true`:
+    /// those OSes enable the XCR0 tile bits without a per-process userspace opt-in, so there
+    /// is no `arch_prctl` equivalent to gate on (see the stub's docs at
+    /// `#[cfg(all(target_arch = "x86_64", not(target_os = "linux")))]`). Compiled and run
+    /// only on those platforms; documents intent everywhere.
+    /// `detect::request_xcomp_perm_stub_returns_true`
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "linux")))]
+    fn request_xcomp_perm_stub_returns_true() {
+        assert!(
+            super::request_xcomp_perm(18),
+            "non-Linux x86_64 stub grants permission unconditionally"
+        );
+        assert!(
+            super::request_xcomp_perm(20),
+            "non-Linux x86_64 stub grants permission unconditionally"
+        );
+    }
 }

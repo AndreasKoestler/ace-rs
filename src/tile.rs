@@ -529,6 +529,129 @@ mod tests {
         _tile_zero(&mut scope_b, id_from_a);
     }
 
+    /// `TileConfig::from_bytes` parses byte 0 as the palette id and bytes 1-63 verbatim into
+    /// the reserved field, with no validation (validation is `LDTILECFG`'s job). A known
+    /// 64-byte descriptor round-trips into exactly the expected fields.
+    /// `tile::from_bytes_parses_fields`
+    #[test]
+    fn from_bytes_parses_fields() {
+        // Byte 0 = palette id (2 = ACE); bytes 1..64 carry distinct sentinel values so a
+        // mis-indexed copy (off-by-one, wrong slice) would be caught.
+        let mut bytes = [0u8; 64];
+        bytes[0] = PALETTE_ACE;
+        for (i, b) in bytes[1..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1); // 1, 2, ..., 63
+        }
+        let cfg = TileConfig::from_bytes(&bytes);
+        assert_eq!(cfg.palette_id, PALETTE_ACE, "byte 0 is the palette id");
+        let mut expected_reserved = [0u8; 63];
+        for (i, b) in expected_reserved.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        assert_eq!(
+            cfg.reserved, expected_reserved,
+            "bytes 1-63 map verbatim to the reserved field, in order"
+        );
+        // from_bytes does not validate: a non-zero-reserved / bogus-palette descriptor still
+        // parses (the #GP model lives in `validate`, exercised separately).
+        assert_eq!(cfg, TileConfig::from_bytes(&cfg.to_bytes()));
+    }
+
+    /// `to_bytes` <-> `from_bytes` is a lossless round-trip in both directions across the
+    /// representative constructors and hand-built descriptors: `from_bytes(to_bytes(c)) == c`
+    /// (config identity) and `to_bytes(from_bytes(b)) == b` (byte-layout identity).
+    /// `tile::config_bytes_roundtrip`
+    #[test]
+    fn config_bytes_roundtrip() {
+        // A dense reserved pattern so a truncated / shifted copy would be observable.
+        let dense_reserved = core::array::from_fn::<u8, 63, _>(|i| (i as u8).wrapping_mul(3));
+
+        let configs = [
+            TileConfig::ace(),
+            TileConfig::init(),
+            // Unvalidated shapes still round-trip: from_bytes/to_bytes never inspect meaning.
+            TileConfig {
+                palette_id: 1, // palette 1 (unsupported by LDTILECFG) still round-trips
+                reserved: [0; 63],
+            },
+            TileConfig {
+                palette_id: 0xFF,
+                reserved: dense_reserved,
+            },
+            TileConfig {
+                palette_id: PALETTE_ACE,
+                reserved: dense_reserved,
+            },
+        ];
+        for cfg in &configs {
+            assert_eq!(
+                &TileConfig::from_bytes(&cfg.to_bytes()),
+                cfg,
+                "from_bytes(to_bytes(cfg)) == cfg for {cfg:?}"
+            );
+        }
+
+        // Reverse direction: every valid 64-byte layout survives from_bytes -> to_bytes.
+        let byte_layouts: [[u8; 64]; 3] = [
+            [0u8; 64],
+            {
+                let mut b = [0u8; 64];
+                b[0] = PALETTE_ACE;
+                b
+            },
+            core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1)),
+        ];
+        for bytes in &byte_layouts {
+            assert_eq!(
+                &TileConfig::from_bytes(bytes).to_bytes(),
+                bytes,
+                "to_bytes(from_bytes(bytes)) == bytes for {bytes:?}"
+            );
+        }
+    }
+
+    /// `TileScope::tile` mints a handle for every in-range index (`0..MAX_TILES`) and returns
+    /// `None` past the last architected tile — the bounds guard at the only [`TileId`]
+    /// constructor (spec section 10.2.1: exactly eight tile registers).
+    /// `tile::tile_index_bounds`
+    #[test]
+    fn tile_index_bounds() {
+        let scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+        // Every in-range index yields a handle addressing that index.
+        for i in 0..MAX_TILES {
+            let id = scope.tile(i).expect("in-range index mints a handle");
+            assert_eq!(id.index, i, "handle addresses the requested tile");
+        }
+        // The first out-of-range index and beyond yield None.
+        assert!(scope.tile(MAX_TILES).is_none(), "index 8 is out of range");
+        assert!(scope.tile(MAX_TILES + 1).is_none());
+        assert!(scope.tile(usize::MAX).is_none());
+    }
+
+    /// `TileScope::release` is idempotent: an explicit `release()` followed by the `Drop`-run
+    /// `TILERELEASE` bumps the attached ledger exactly ONCE — the `released` guard stops Drop
+    /// from double-counting (spec section 11.4: release fires exactly once).
+    /// `tile::release_then_drop_counts_once`
+    #[test]
+    fn release_then_drop_counts_once() {
+        let ledger = Arc::new(AtomicUsize::new(0));
+        {
+            let mut scope = _tile_loadconfig(&TileConfig::ace()).unwrap();
+            scope.set_release_ledger(ledger.clone());
+            scope.release();
+            assert_eq!(
+                ledger.load(Ordering::SeqCst),
+                1,
+                "explicit release() bumps the ledger once"
+            );
+        } // Drop runs TILERELEASE here; the `released` guard must make it a no-op.
+        assert_eq!(
+            ledger.load(Ordering::SeqCst),
+            1,
+            "Drop after a manual release does NOT double-count"
+        );
+    }
+
     /// Nested and sequential guards do not leak configuration: each owns an independent
     /// register model, and each Acquire starts from clean, zeroed tiles
     /// (`[ace-tile-instructions.TILE_LIFECYCLE.7]`).
@@ -564,5 +687,40 @@ mod tests {
                 .all(|&b| b == 0x11),
             "the outer guard is unaffected by the inner guard's lifetime"
         );
+    }
+
+    use quickcheck::{quickcheck, Arbitrary, Gen};
+
+    /// A random 64-byte descriptor. `quickcheck` does not derive `Arbitrary` for `[u8; 64]`,
+    /// so we wrap it and fill each byte independently — every palette id and every reserved
+    /// bit-pattern (including the invalid ones `from_bytes`/`to_bytes` must still round-trip)
+    /// is reachable.
+    #[derive(Clone, Debug)]
+    struct RawDescriptor {
+        bytes: [u8; 64],
+    }
+
+    impl Arbitrary for RawDescriptor {
+        fn arbitrary(g: &mut Gen) -> Self {
+            RawDescriptor {
+                bytes: core::array::from_fn(|_| u8::arbitrary(g)),
+            }
+        }
+    }
+
+    quickcheck! {
+        /// Over arbitrary 64-byte descriptors, `to_bytes(from_bytes(bytes)) == bytes`: the
+        /// parse/encode pair is a lossless bijection on raw layouts, with no validation.
+        fn prop_bytes_config_bytes_roundtrip(d: RawDescriptor) -> bool {
+            TileConfig::from_bytes(&d.bytes).to_bytes() == d.bytes
+        }
+
+        /// Over arbitrary descriptors, `from_bytes(to_bytes(from_bytes(bytes))) ==
+        /// from_bytes(bytes)`: the config parsed from any layout re-encodes to a layout that
+        /// parses back to the identical config.
+        fn prop_config_bytes_config_roundtrip(d: RawDescriptor) -> bool {
+            let cfg = TileConfig::from_bytes(&d.bytes);
+            TileConfig::from_bytes(&cfg.to_bytes()) == cfg
+        }
     }
 }

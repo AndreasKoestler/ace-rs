@@ -643,4 +643,336 @@ mod tests {
         assert_eq!(fp6_e3m2_to_fp8_e4m3(bf6(1, 0b000, 0b00)), 0x80);
         assert_eq!(fp6_e2m3_to_fp8_e4m3(hf6(1, 0b00, 0b000)), 0x80);
     }
+
+    // ============================================================================================
+    // FINDING #7b — exhaustive forward-rounding coverage for the two saturating-RTNE FP8->FP6
+    // helpers. Each helper takes an 8-bit FP8 byte, so the source domain is only 256 values; we
+    // test ALL 256 for each against an INDEPENDENT oracle (below). The oracle never calls the
+    // production codec: it decodes the FP8 byte to an exact f64, then rounds that number onto the
+    // FP6 target grid by nearest-neighbour search over the format's own representable value set,
+    // ties-to-EVEN, with production's saturation and DAZ policies applied explicitly. A shared
+    // bug therefore cannot hide.
+    //
+    // GROUND-TRUTH NOTE: production is the SDE-verified ground truth. Any 256-way disagreement
+    // would mean the oracle here is wrong, not the codec.
+    // ============================================================================================
+
+    // ---- FP6 target grids (magnitude only; sign is applied separately). Each grid is the full
+    // set of the format's non-negative representable magnitudes, indexed by its 5-bit magnitude
+    // code (exp<<mbits | mant), which is monotonically ascending in magnitude (sign-magnitude
+    // layout). Reuses the independent section-2.4.2 decoders `e3m2_value` / `e2m3_value` above.
+
+    // (magnitude_code, magnitude_value) for every E3M2 magnitude: code 0..32, value ascending,
+    // code 0 = +0, code 31 (0b11111 = e=7,m=3) = max normal 28.0.
+    fn e3m2_grid() -> Vec<(u8, f64)> {
+        (0u8..32).map(|c| (c, e3m2_value(c))).collect()
+    }
+    // Same for E2M3: code 0 = +0, code 31 (0b11111 = e=3,m=7) = max normal 7.5.
+    fn e2m3_grid() -> Vec<(u8, f64)> {
+        (0u8..32).map(|c| (c, e2m3_value(c))).collect()
+    }
+
+    // Round a non-negative magnitude `v` onto `grid` (ascending) with round-to-nearest,
+    // ties-to-EVEN, returning the winning 5-bit magnitude code. Values at or above the grid's
+    // top clamp to the max-normal code (the grid has no Inf, so the nearest representable to any
+    // larger finite magnitude IS the max normal — this is exactly the saturating policy). The
+    // tie rule picks the neighbour whose mantissa LSB (= code & 1) is 0.
+    fn round_to_fp6_grid(v: f64, grid: &[(u8, f64)]) -> u8 {
+        let last = grid.len() - 1;
+        if v >= grid[last].1 {
+            return grid[last].0; // saturate to max normal
+        }
+        if v <= 0.0 {
+            return grid[0].0; // +0
+        }
+        for i in 0..last {
+            let (lo_code, lo) = grid[i];
+            let (hi_code, hi) = grid[i + 1];
+            if v >= lo && v <= hi {
+                let dlo = v - lo;
+                let dhi = hi - v;
+                if dlo < dhi {
+                    return lo_code;
+                }
+                if dhi < dlo {
+                    return hi_code;
+                }
+                // Exact halfway -> ties to even mantissa LSB.
+                return if lo_code & 1 == 0 { lo_code } else { hi_code };
+            }
+        }
+        grid[last].0
+    }
+
+    // Independent oracle: FP8 E5M2 (BF8) byte -> expected FP6 E3M2 code. Decodes the byte per
+    // spec section 2.4.1 (sign, 5-bit exp bias 15, 2-bit mantissa), then applies production
+    // policy: NaN/Inf (e==0x1F) clamp to same-signed max normal; DAZ=1 flushes every
+    // zero/subnormal (e==0) to same-signed FP6 zero; every finite normal is rounded onto the
+    // E3M2 grid (which naturally reaches the subnormal-output region and saturation).
+    fn oracle_e5m2_to_e3m2(byte: u8) -> u8 {
+        let s = ((byte >> 7) & 1) as u8;
+        let e = (byte >> 2) & 0x1F;
+        let m = byte & 0x03;
+        let grid = e3m2_grid();
+        let mag = if e == 0x1F {
+            31 // NaN/Inf -> max normal 28.0
+        } else if e == 0 {
+            0 // DAZ: zero/subnormal -> +/-0
+        } else {
+            let v = (1.0 + m as f64 / 4.0) * 2f64.powi(e as i32 - 15);
+            round_to_fp6_grid(v, &grid)
+        };
+        (s << 5) | mag
+    }
+
+    // Independent oracle: FP8 E4M3 (HF8) byte -> expected FP6 E2M3 code. Decodes per spec
+    // section 2.4.1 (sign, 4-bit exp bias 7, 3-bit mantissa). Production clamps the ENTIRE
+    // e==0xF binade (E4M3 max normal 448 AND the NaN slot) to the same-signed FP6 max normal,
+    // DAZ-flushes e==0, and rounds every other finite normal onto the E2M3 grid.
+    fn oracle_e4m3_to_e2m3(byte: u8) -> u8 {
+        let s = ((byte >> 7) & 1) as u8;
+        let e = (byte >> 3) & 0x0F;
+        let m = byte & 0x07;
+        let grid = e2m3_grid();
+        let mag = if e == 0x0F {
+            31 // whole top binade (incl. 448 and NaN) -> max normal 7.5
+        } else if e == 0 {
+            0 // DAZ: zero/subnormal -> +/-0
+        } else {
+            let v = (1.0 + m as f64 / 8.0) * 2f64.powi(e as i32 - 7);
+            round_to_fp6_grid(v, &grid)
+        };
+        (s << 5) | mag
+    }
+
+    /// EXHAUSTIVE forward coverage of `fp8_e5m2_to_fp6_e3m2` over ALL 256 FP8 E5M2 bytes,
+    /// checked against the independent nearest-ties-to-even oracle. This sweep necessarily hits
+    /// the SUBNORMAL-OUTPUT RTNE branch (fp6.rs ~110-124) — normal BF8 inputs whose value
+    /// underflows into a nonzero FP6 E3M2 subnormal — as well as the NaN/Inf clamp, DAZ flush,
+    /// saturation, exact-max-normal, and signed-zero paths.
+    #[test]
+    fn exhaustive_e5m2_to_fp6_e3m2_all_256() {
+        for byte in 0u8..=255 {
+            let got = fp8_e5m2_to_fp6_e3m2(byte);
+            let want = oracle_e5m2_to_e3m2(byte);
+            assert_eq!(
+                got,
+                want,
+                "BF8 byte {byte:#04x} (decoded={:?}): production={got:#04x}, oracle={want:#04x}",
+                {
+                    let e = (byte >> 2) & 0x1F;
+                    let m = byte & 0x03;
+                    if e == 0x1F {
+                        f64::NAN
+                    } else if e == 0 {
+                        (m as f64 / 4.0) * 2f64.powi(1 - 15)
+                    } else {
+                        (1.0 + m as f64 / 4.0) * 2f64.powi(e as i32 - 15)
+                    }
+                }
+            );
+        }
+    }
+
+    /// EXHAUSTIVE forward coverage of `fp8_e4m3_to_fp6_e2m3` over ALL 256 FP8 E4M3 bytes,
+    /// checked against the independent oracle. Necessarily hits the SUBNORMAL-OUTPUT RTNE branch
+    /// (fp6.rs ~177-191) plus the whole-e==0xF clamp, DAZ flush, saturation, exact-max-normal,
+    /// and signed-zero paths.
+    #[test]
+    fn exhaustive_e4m3_to_fp6_e2m3_all_256() {
+        for byte in 0u8..=255 {
+            let got = fp8_e4m3_to_fp6_e2m3(byte);
+            let want = oracle_e4m3_to_e2m3(byte);
+            assert_eq!(
+                got,
+                want,
+                "HF8 byte {byte:#04x} (decoded={:?}): production={got:#04x}, oracle={want:#04x}",
+                {
+                    let e = (byte >> 3) & 0x0F;
+                    let m = byte & 0x07;
+                    if e == 0x0F {
+                        f64::NAN
+                    } else if e == 0 {
+                        (m as f64 / 8.0) * 2f64.powi(1 - 7)
+                    } else {
+                        (1.0 + m as f64 / 8.0) * 2f64.powi(e as i32 - 7)
+                    }
+                }
+            );
+        }
+    }
+
+    /// EXPLICIT hand assertions for the flagged, likely-unexercised SUBNORMAL-OUTPUT branch:
+    /// NORMAL FP8 inputs that underflow into a NONZERO FP6 subnormal. Expected FP6 codes are
+    /// computed here independently from the real numbers, NOT from the production helper.
+    #[test]
+    fn subnormal_output_branch_hand_computed() {
+        // ---- E5M2 -> E3M2. E3M2 subnormals (e=0): m/4 * 2^-2, i.e. 0.0625, 0.125, 0.1875.
+        //
+        // BF8 +2^-4 = S.01011.00 (e_i=11, normal, value exactly 1.0*2^-4 = 0.0625). This is a
+        // *normal* FP8 whose value equals the E3M2 min subnormal 0.0625 = S.000.01. So it takes
+        // the underflow branch and produces a NONZERO subnormal (not the DAZ flush).
+        assert_eq!(
+            fp8_e5m2_to_fp6_e3m2(bf8(0, 0b01011, 0b00)),
+            bf6(0, 0b000, 0b01),
+            "normal BF8 2^-4 underflows to NONZERO E3M2 subnormal 0.0625 (S.000.01)"
+        );
+        // BF8 +1.5*2^-3 = S.01100.10 (e_i=12, normal, value = 1.5 * 0.125 = 0.1875). Equals the
+        // E3M2 subnormal 0.1875 = 3/4 * 2^-2 = S.000.11 exactly (no rounding needed).
+        assert_eq!(
+            fp8_e5m2_to_fp6_e3m2(bf8(0, 0b01100, 0b10)),
+            bf6(0, 0b000, 0b11),
+            "normal BF8 0.1875 underflows to NONZERO E3M2 subnormal 0.1875 (S.000.11)"
+        );
+        // BF8 +1.75*2^-4 = S.01011.11 (e_i=11, value = 1.75 * 0.0625 = 0.109375). Between E3M2
+        // 0.0625 and 0.125; nearest is 0.125 (dist 0.0156 < 0.0469) -> S.000.10. Sign carried.
+        assert_eq!(
+            fp8_e5m2_to_fp6_e3m2(bf8(1, 0b01011, 0b11)),
+            bf6(1, 0b000, 0b10),
+            "negative normal BF8 -0.109375 rounds to NONZERO E3M2 subnormal -0.125 (S.000.10)"
+        );
+
+        // ---- E4M3 -> E2M3. E2M3 subnormals (e=0): m/8, i.e. 0.125, 0.25, ..., 0.875.
+        //
+        // HF8 +2^-1 = S.0110.000 (e_i=6, normal, value = 1.0*2^-1 = 0.5). Equals E2M3 subnormal
+        // 0.5 = 4/8 = S.00.100 exactly. Normal FP8 -> NONZERO FP6 subnormal.
+        assert_eq!(
+            fp8_e4m3_to_fp6_e2m3(hf8(0, 0b0110, 0b000)),
+            hf6(0, 0b00, 0b100),
+            "normal HF8 0.5 underflows to NONZERO E2M3 subnormal 0.5 (S.00.100)"
+        );
+        // HF8 +2^-2 = S.0101.000 (e_i=5, normal, value = 0.25). Equals E2M3 subnormal 0.25 =
+        // 2/8 = S.00.010 exactly.
+        assert_eq!(
+            fp8_e4m3_to_fp6_e2m3(hf8(0, 0b0101, 0b000)),
+            hf6(0, 0b00, 0b010),
+            "normal HF8 0.25 underflows to NONZERO E2M3 subnormal 0.25 (S.00.010)"
+        );
+        // HF8 +1.75*2^-1 = S.0110.110 (e_i=6, value = 1.75*0.5 = 0.875). Equals E2M3 subnormal
+        // 0.875 = 7/8 = S.00.111 exactly (max subnormal). Sign carried on the negative twin.
+        assert_eq!(
+            fp8_e4m3_to_fp6_e2m3(hf8(1, 0b0110, 0b110)),
+            hf6(1, 0b00, 0b111),
+            "negative normal HF8 -0.875 underflows to NONZERO E2M3 subnormal -0.875 (S.00.111)"
+        );
+    }
+
+    // ---- Oracle-free structural properties over all 256 inputs (no reference decoder needed).
+
+    /// Every production output is a valid 6-bit FP6 code: bits [7:6] are zero.
+    #[test]
+    fn prop_output_is_valid_6bit_code() {
+        for byte in 0u8..=255 {
+            assert_eq!(
+                fp8_e5m2_to_fp6_e3m2(byte) & 0xC0,
+                0,
+                "E5M2->E3M2 byte {byte:#04x} produced non-6-bit code"
+            );
+            assert_eq!(
+                fp8_e4m3_to_fp6_e2m3(byte) & 0xC0,
+                0,
+                "E4M3->E2M3 byte {byte:#04x} produced non-6-bit code"
+            );
+        }
+    }
+
+    /// Sign is always preserved (including the NaN/Inf clamp and the signed-zero flush): the
+    /// FP6 sign bit [5] equals the FP8 sign bit [7].
+    #[test]
+    fn prop_sign_preserved() {
+        for byte in 0u8..=255 {
+            let s = byte >> 7;
+            assert_eq!(
+                (fp8_e5m2_to_fp6_e3m2(byte) >> 5) & 1,
+                s,
+                "E5M2->E3M2 byte {byte:#04x} did not preserve sign"
+            );
+            assert_eq!(
+                (fp8_e4m3_to_fp6_e2m3(byte) >> 5) & 1,
+                s,
+                "E4M3->E2M3 byte {byte:#04x} did not preserve sign"
+            );
+        }
+    }
+
+    /// Monotonicity: over the finite, non-clamped FP8 inputs of a fixed sign, taken in ascending
+    /// magnitude order (ascending magnitude code, since FP8 is monotonic in its code), the FP6
+    /// output MAGNITUDE is non-decreasing. Excludes the FP8 top binade (E5M2 e==0x1F Inf/NaN;
+    /// E4M3 e==0xF NaN slot) which carries no ordered value. DAZ-flushed small inputs produce a
+    /// leading run of zeros, which is still non-decreasing before the values ramp up.
+    #[test]
+    fn prop_magnitude_monotonic() {
+        // E5M2: finite non-clamped magnitude codes are e in 0..=0x1E (0x1F is Inf/NaN).
+        let mut prev = 0u8;
+        for e in 0u8..=0x1E {
+            for m in 0u8..=0x03 {
+                let byte = (e << 2) | m; // sign 0
+                let out_mag = fp8_e5m2_to_fp6_e3m2(byte) & 0x1F;
+                assert!(
+                    out_mag >= prev,
+                    "E5M2->E3M2 not monotonic at byte {byte:#04x}: {out_mag} < {prev}"
+                );
+                prev = out_mag;
+            }
+        }
+        // E4M3: finite non-clamped magnitude codes are e in 0..=0x0E (0x0F is the clamp binade).
+        let mut prev = 0u8;
+        for e in 0u8..=0x0E {
+            for m in 0u8..=0x07 {
+                let byte = (e << 3) | m; // sign 0
+                let out_mag = fp8_e4m3_to_fp6_e2m3(byte) & 0x1F;
+                assert!(
+                    out_mag >= prev,
+                    "E4M3->E2M3 not monotonic at byte {byte:#04x}: {out_mag} < {prev}"
+                );
+                prev = out_mag;
+            }
+        }
+    }
+
+    /// `prop_subnormal_to_zero` and its complement. FORWARD: every FP8 zero/subnormal input
+    /// (exp field == 0, the DAZ=1 domain) maps to the same-signed FP6 zero (magnitude bits 0).
+    /// COMPLEMENT: there exist NORMAL FP8 inputs (exp field != 0) that produce a NONZERO FP6
+    /// output, so the codec is not degenerately flushing everything — this is the very
+    /// subnormal-output/normal ramp the exhaustive sweep exercises.
+    #[test]
+    fn prop_subnormal_to_zero_and_complement() {
+        let mut e5m2_nonzero_from_normal = 0usize;
+        let mut e4m3_nonzero_from_normal = 0usize;
+        for byte in 0u8..=255 {
+            let s = byte >> 7;
+
+            let e5 = (byte >> 2) & 0x1F;
+            let out5 = fp8_e5m2_to_fp6_e3m2(byte);
+            if e5 == 0 {
+                assert_eq!(
+                    out5,
+                    s << 5,
+                    "E5M2 subnormal/zero byte {byte:#04x} must flush to same-signed FP6 zero"
+                );
+            } else if out5 & 0x1F != 0 {
+                e5m2_nonzero_from_normal += 1;
+            }
+
+            let e4 = (byte >> 3) & 0x0F;
+            let out4 = fp8_e4m3_to_fp6_e2m3(byte);
+            if e4 == 0 {
+                assert_eq!(
+                    out4,
+                    s << 5,
+                    "E4M3 subnormal/zero byte {byte:#04x} must flush to same-signed FP6 zero"
+                );
+            } else if out4 & 0x1F != 0 {
+                e4m3_nonzero_from_normal += 1;
+            }
+        }
+        assert!(
+            e5m2_nonzero_from_normal > 0,
+            "complement: expected some normal BF8 inputs to yield nonzero FP6"
+        );
+        assert!(
+            e4m3_nonzero_from_normal > 0,
+            "complement: expected some normal HF8 inputs to yield nonzero FP6"
+        );
+    }
 }

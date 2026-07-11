@@ -471,6 +471,157 @@ mod tests {
             "size-4 unpack recovers the FP4 nibbles family E decodes"
         );
     }
+
+    /// A fixed, representative packed input whose bytes exercise the field MSB (sign bit) at
+    /// every field size 2..=7. The palette mixes bytes with the top bit set (`0x80`, `0xFF`,
+    /// `0xF0`, `0xCC`, ...), the low nibble set (`0x0F`), alternating patterns (`0x55`/`0xAA`),
+    /// mid-values and zero, so that — whatever the size/start window lands on — some lanes read
+    /// a field with its size-1 MSB set (driving sign-extension) and some with it clear.
+    fn representative_input() -> [u8; 64] {
+        const PALETTE: [u8; 16] = [
+            0x80, 0xFF, 0x0F, 0x55, 0xAA, 0x3C, 0xC3, 0x00, 0x01, 0x7F, 0xF0, 0x33, 0xCC, 0x99,
+            0x66, 0xBD,
+        ];
+        core::array::from_fn(|i| PALETTE[i % PALETTE.len()])
+    }
+
+    /// Independently widen a `size`-bit `field` to a byte per the `(size, sign_ex)` rule, written
+    /// inline here (NOT via any production helper): zero-extend leaves bits `[7:size]` clear;
+    /// sign-extend replicates the field MSB (bit `size-1`) into `[7:size]`.
+    /// `[avx10-v2-aux-ocp-conversions.UNPACKB.6]` `[avx10-v2-aux-ocp-conversions.UNPACKB.7]`
+    fn widen_independent(field: u8, size: usize, sign_ex: bool) -> u8 {
+        if sign_ex {
+            let msb = (field >> (size - 1)) & 0x1;
+            if msb != 0 {
+                field | (0xffu8 << size) // set bits [7:size]
+            } else {
+                field
+            }
+        } else {
+            field // bits [7:size] already clear
+        }
+    }
+
+    /// Read the `size`-bit field at bit offset `j` from `buf`, LSB-from-bit-0, straddling byte
+    /// boundaries — an INDEPENDENT little-endian bit read that does NOT call
+    /// `crate::fp4::extract_field`. Mirrors the spec section-9.9.4 field-offset semantics
+    /// (`[avx10-v2-aux-ocp-conversions.UNPACKB.5]`).
+    fn read_field_independent(buf: &[u8; 64], j: usize, size: usize) -> u8 {
+        let mut field = 0u8;
+        for k in 0..size {
+            let bit = j + k;
+            let b = (buf[bit >> 3] >> (bit & 7)) & 0x1;
+            field |= b << k;
+        }
+        field
+    }
+
+    /// EXHAUSTIVE over all 256 `imm8` values (`[avx10-v2-aux-ocp-conversions.UNPACKB.1]` .. `.8`).
+    ///
+    /// Closes FINDING #12's sampled-only gap: the existing quickcheck only *randomly* samples the
+    /// size × start × sign control space, and its start-conditioning proptest recomputes `start`
+    /// with the SAME production `decode_imm8` (so a shared decode bug would be invisible). This
+    /// test walks EVERY `imm8` and:
+    ///
+    ///  1. Pins `unpackb(input, imm8) == unpackb_scalar(input, imm8)` across the FULL imm8 space
+    ///     (the public==scalar wiring, no longer sampled-only).
+    ///  2. Computes the expected output with a decode written INLINE here — deliberately NOT
+    ///     calling the production `decode_imm8`/`unpackb_scalar`: `size = max((imm8>>2)&7, 2)`,
+    ///     `sign_ex = (imm8>>5)&1`, and the start-conditioning (`size 2 -> 0..=3`,
+    ///     `size 3/4 -> min(start,1)`, `size 5/6/7 -> 0`) all re-derived by hand. Each output
+    ///     field is gathered bit-by-bit via [`read_field_independent`] and widened via
+    ///     [`widen_independent`], then asserted equal to production. This makes any shared decode
+    ///     bug visible, because the oracle here is an independent transcription of the spec.
+    ///
+    /// Exhaustiveness covers sizes 5 and 7 (with sign-extend, and with start bits set that must
+    /// force to 0); those cases are additionally pinned by hand in
+    /// [`size5_size7_signext_start_forced_zero`].
+    #[test]
+    fn exhaustive_imm8_independent_decode() {
+        let input = representative_input();
+
+        for imm8 in 0..=255u8 {
+            // (1) public dispatcher == scalar oracle across the FULL imm8 space.
+            let got = unpackb(input, imm8);
+            let scalar = unpackb_scalar(input, imm8);
+            assert_eq!(
+                got, scalar,
+                "imm8={imm8:#04x}: public dispatcher must equal scalar oracle"
+            );
+
+            // (2) INDEPENDENT decode — NOT via production decode_imm8.
+            let size = (((imm8 >> 2) & 0x7) as usize).max(2);
+            let sign_ex = ((imm8 >> 5) & 0x1) != 0;
+            let raw_start = (imm8 & 0x3) as usize;
+            // start-conditioning re-derived inline (the crux: written here, not called):
+            let start = match size {
+                2 => raw_start,            // 0..=3, unclamped
+                3 | 4 => raw_start.min(1), // clamp to 0..=1
+                _ => 0,                    // size 5, 6, 7 -> forced to 0
+            };
+
+            for i in 0..KL {
+                let j = (start * KL + i) * size;
+                let field = read_field_independent(&input, j, size);
+                let expected = widen_independent(field, size, sign_ex);
+                assert_eq!(
+                    got[i], expected,
+                    "imm8={imm8:#04x} lane {i}: size={size} start={start} sign_ex={sign_ex} \
+                     (raw_start={raw_start})"
+                );
+            }
+        }
+    }
+
+    /// Named hand-assertion companion to the exhaustive walk: sizes 5 and 7, sign-extend ON, and
+    /// start bits deliberately set (`imm8[1:0] = 3`) which MUST force the decoded start to 0
+    /// (`size 5/6/7 -> start = 0`, `[avx10-v2-aux-ocp-conversions.UNPACKB.4]`). Also verifies the
+    /// sign replicates from the field MSB (bit `size-1`) into `[7:size]`
+    /// (`[avx10-v2-aux-ocp-conversions.UNPACKB.7]`).
+    #[test]
+    fn size5_size7_signext_start_forced_zero() {
+        let input = representative_input();
+
+        for &size in &[5usize, 7usize] {
+            // imm8 with size field, sign-extend, and start bits = 3 (must be ignored/forced 0).
+            let imm8_start3 =
+                ACE_UNPACKB_SIZE(size as u8) | ACE_UNPACKB_SEXT | ACE_UNPACKB_START(3);
+            let imm8_start0 = ACE_UNPACKB_SIZE(size as u8) | ACE_UNPACKB_SEXT; // start bits clear
+            let got3 = unpackb(input, imm8_start3);
+            let got0 = unpackb(input, imm8_start0);
+
+            // start bits are ignored for size >= 5: both imm8 give the identical result.
+            assert_eq!(
+                got3, got0,
+                "size {size}: start bits (imm8[1:0]=3) forced to 0 — result must match start=0"
+            );
+
+            // Independently confirm the value with size, start=0, sign-extend (inline decode).
+            let mut saw_sign_set = false;
+            for i in 0..KL {
+                let j = i * size; // start forced to 0
+                let field = read_field_independent(&input, j, size);
+                let expected = widen_independent(field, size, /* sign_ex = */ true);
+                assert_eq!(
+                    got3[i], expected,
+                    "size {size} lane {i}: sign-extend, start forced 0"
+                );
+                if (field >> (size - 1)) & 0x1 != 0 {
+                    saw_sign_set = true;
+                    // A lane whose field MSB is set must have high bits [7:size] all set.
+                    assert_eq!(
+                        got3[i] & (0xffu8 << size),
+                        0xffu8 << size,
+                        "size {size} lane {i}: field MSB set -> bits [7:{size}] all 1"
+                    );
+                }
+            }
+            assert!(
+                saw_sign_set,
+                "size {size}: representative input must exercise at least one MSB-set field"
+            );
+        }
+    }
 }
 
 /// Property-based tests for family I (`VUNPACKB`). The hand-rolled tests above pin specific

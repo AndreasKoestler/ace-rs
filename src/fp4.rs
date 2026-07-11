@@ -532,4 +532,266 @@ mod tests {
             "-6.0"
         );
     }
+
+    // ---------------------------------------------------------------------------------------
+    // FINDING #7a — exhaustive forward-rounding coverage for the two FP8->FP4 saturating-RTNE
+    // converters. Each takes an 8-bit FP8 code, so the input domain is exactly 256 values;
+    // both functions are tested over ALL 256 codes against an independent scalar oracle.
+    //
+    // The oracle is fully independent of production: it decodes each FP8 code to the EXACT
+    // real value it denotes (every finite FP8 magnitude is exact in f64), then rounds that
+    // real value to the FP4 E2M1 magnitude grid {0, 0.5, 1, 1.5, 2, 3, 4, 6} with
+    // round-to-nearest-ties-to-EVEN and always-saturating semantics (spec section 9.4.1,
+    // `[avx10-v2-aux-ocp-conversions.CVT_FP8_FP4.*]`). GROUND-TRUTH: production is
+    // SDE-verified; if the oracle disagreed, the oracle would be wrong.
+    // ---------------------------------------------------------------------------------------
+
+    // The eight FP4 E2M1 magnitudes, indexed by the 3-bit magnitude code `(exp<<1)|mant`
+    // (spec section 2.4.2). The mantissa bit (`code & 1`) is what "ties to even" selects on.
+    const FP4_MAG: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+    /// Round a non-negative real value to the FP4 E2M1 magnitude grid, RTNE + saturating,
+    /// returning the 3-bit magnitude code `(exp<<1)|mant`. Because 6.0 is the largest grid
+    /// point and nothing lies above it, "nearest grid point" already yields 6.0 for every
+    /// value above 6.0 — that IS the saturation behaviour (spec section 9.4.1). Exact ties
+    /// (equidistant between two adjacent grid points) resolve to the neighbour whose FP4
+    /// mantissa bit is 0 (even).
+    fn fp4_round_mag(v: f64) -> u32 {
+        debug_assert!(v >= 0.0);
+        let mut best: u32 = 0;
+        let mut best_d = f64::INFINITY;
+        for (code, &mag) in FP4_MAG.iter().enumerate() {
+            let d = (v - mag).abs();
+            if d < best_d {
+                best_d = d;
+                best = code as u32;
+            } else if d == best_d {
+                // Exact tie between two adjacent grid points (one even, one odd mantissa):
+                // ties-to-even picks the one with mantissa bit 0.
+                if (code as u32 & 1) == 0 {
+                    best = code as u32;
+                }
+            }
+        }
+        best
+    }
+
+    /// Independent oracle for `fp8_e4m3_to_fp4_e2m1`. Decodes the E4M3 byte (sign / 4-bit
+    /// exp bias 7 / 3-bit mantissa) to its exact real magnitude, applies the conversion
+    /// policy (NaN -> saturate; zero/subnormal -> zero under DAZ=1; normal -> RTNE round),
+    /// then reassembles the FP4 nibble with the carried sign.
+    fn oracle_e4m3_to_fp4(byte: u8) -> u8 {
+        let s_i = (byte >> 7) & 1;
+        let e_i = (byte >> 3) & 0x0f;
+        let m_i = byte & 0x07;
+        let mag_code = if e_i == 0x0f && m_i == 0x07 {
+            // Sole E4M3 NaN -> saturate to FP4 max normal 6.0 (FP4 has no NaN).
+            7
+        } else if e_i == 0x00 {
+            // Zero (m_i==0) or subnormal (m_i!=0, flushed under DAZ=1) -> FP4 zero.
+            0
+        } else {
+            // Normal finite value (includes e_i==0x0f, m_i<7, e.g. +/-256..448).
+            let v = (1.0 + m_i as f64 / 8.0) * 2f64.powi(e_i as i32 - 7);
+            fp4_round_mag(v)
+        };
+        ((s_i as u32) << 3 | mag_code) as u8
+    }
+
+    /// Independent oracle for `fp8_e5m2_to_fp4_e2m1`. Decodes the E5M2 byte (sign / 5-bit
+    /// exp bias 15 / 2-bit mantissa) to its exact real magnitude and applies the same policy;
+    /// E5M2 additionally has +/-Inf (all-ones exp, zero mantissa) which, like NaN, saturates.
+    fn oracle_e5m2_to_fp4(byte: u8) -> u8 {
+        let s_i = (byte >> 7) & 1;
+        let e_i = (byte >> 2) & 0x1f;
+        let m_i = byte & 0x03;
+        let mag_code = if e_i == 0x1f {
+            // Inf (m_i==0) or NaN (m_i!=0) -> saturate to FP4 max normal 6.0.
+            7
+        } else if e_i == 0x00 {
+            // Zero or subnormal (flushed under DAZ=1) -> FP4 zero.
+            0
+        } else {
+            let v = (1.0 + m_i as f64 / 4.0) * 2f64.powi(e_i as i32 - 15);
+            fp4_round_mag(v)
+        };
+        ((s_i as u32) << 3 | mag_code) as u8
+    }
+
+    /// Map an FP4 E2M1 nibble to its signed real value, for oracle-free monotonicity checks.
+    fn fp4_nibble_value(nibble: u8) -> f64 {
+        let mag = FP4_MAG[(nibble & 0x07) as usize];
+        if (nibble & 0x08) != 0 {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// True (signed) real value an E4M3 byte denotes, or `None` for the sole NaN code. Used
+    /// only to order inputs for the monotonicity property (subnormals use their un-flushed
+    /// value; DAZ flushing happens in the converter, not here).
+    fn e4m3_true_value(byte: u8) -> Option<f64> {
+        let s = if (byte & 0x80) != 0 { -1.0 } else { 1.0 };
+        let e_i = (byte >> 3) & 0x0f;
+        let m_i = byte & 0x07;
+        if e_i == 0x0f && m_i == 0x07 {
+            None // NaN
+        } else if e_i == 0x00 {
+            Some(s * (m_i as f64 * 2f64.powi(-9))) // zero or subnormal mmm * 2^-9
+        } else {
+            Some(s * (1.0 + m_i as f64 / 8.0) * 2f64.powi(e_i as i32 - 7))
+        }
+    }
+
+    /// True (signed) real value an E5M2 byte denotes, or `None` for NaN. Inf is kept as
+    /// `+/-inf` (the ordering extreme; it saturates to +/-6.0, consistent with monotonicity).
+    fn e5m2_true_value(byte: u8) -> Option<f64> {
+        let s = if (byte & 0x80) != 0 { -1.0 } else { 1.0 };
+        let e_i = (byte >> 2) & 0x1f;
+        let m_i = byte & 0x03;
+        if e_i == 0x1f {
+            if m_i == 0 {
+                Some(s * f64::INFINITY) // +/-Inf
+            } else {
+                None // NaN
+            }
+        } else if e_i == 0x00 {
+            Some(s * (m_i as f64 * 2f64.powi(-16))) // zero or subnormal mm * 2^-16
+        } else {
+            Some(s * (1.0 + m_i as f64 / 4.0) * 2f64.powi(e_i as i32 - 15))
+        }
+    }
+
+    /// EXHAUSTIVE: all 256 E4M3 input codes vs the independent oracle. By covering the whole
+    /// 8-bit input space this necessarily includes every RTNE tie-to-even case (e.g. +5.0 =
+    /// S.1001.010 ties 4.0/6.0 -> even 4.0; +0.25 = S.0101.000 ties 0/0.5 -> even 0) and
+    /// every subnormal-OUTPUT rounding case (e.g. +0.5 = S.0110.000 -> FP4 subnormal S.00.1,
+    /// and small normals that round down into the 0 / 0.5 subnormal band).
+    #[test]
+    fn exhaustive_e4m3_to_fp4_matches_oracle() {
+        let mut n = 0;
+        for byte in 0u8..=255 {
+            let got = fp8_e4m3_to_fp4_e2m1(byte);
+            let want = oracle_e4m3_to_fp4(byte);
+            assert_eq!(
+                got, want,
+                "E4M3 byte {byte:#04x}: production {got:#x} != oracle {want:#x}"
+            );
+            n += 1;
+        }
+        assert_eq!(n, 256, "must exercise all 256 E4M3 codes");
+    }
+
+    /// EXHAUSTIVE: all 256 E5M2 input codes vs the independent oracle. Includes every tie
+    /// (e.g. +5.0 = S.10001.01 ties 4.0/6.0 -> even 4.0) and every Inf/NaN saturation and
+    /// subnormal-flush and subnormal-output case by exhaustiveness.
+    #[test]
+    fn exhaustive_e5m2_to_fp4_matches_oracle() {
+        let mut n = 0;
+        for byte in 0u8..=255 {
+            let got = fp8_e5m2_to_fp4_e2m1(byte);
+            let want = oracle_e5m2_to_fp4(byte);
+            assert_eq!(
+                got, want,
+                "E5M2 byte {byte:#04x}: production {got:#x} != oracle {want:#x}"
+            );
+            n += 1;
+        }
+        assert_eq!(n, 256, "must exercise all 256 E5M2 codes");
+    }
+
+    /// Oracle-free invariant over all 256 inputs of BOTH converters: every output is a valid
+    /// 4-bit E2M1 code (no stray high bits) whose magnitude never exceeds the FP4 max normal
+    /// 6.0 — the always-saturating guarantee (complements the exhaustive equality tests and
+    /// the `prop_always_saturating_le_6` intent from the report). Additionally, any input
+    /// whose true magnitude exceeds 6.0 must land EXACTLY on the max-normal magnitude code 7.
+    #[test]
+    fn prop_always_valid_e2m1_and_saturating() {
+        for byte in 0u8..=255 {
+            for (name, got, tv) in [
+                ("e4m3", fp8_e4m3_to_fp4_e2m1(byte), e4m3_true_value(byte)),
+                ("e5m2", fp8_e5m2_to_fp4_e2m1(byte), e5m2_true_value(byte)),
+            ] {
+                // Valid nibble: only bits [3:0] set.
+                assert_eq!(
+                    got & 0xf0,
+                    0,
+                    "{name} {byte:#04x}: stray high bits in {got:#x}"
+                );
+                // Magnitude never exceeds FP4 max normal 6.0 (code 7 == 6.0 is the ceiling).
+                let mag = got & 0x07;
+                assert!(
+                    mag <= 7,
+                    "{name} {byte:#04x}: magnitude code {mag} out of range"
+                );
+                assert!(
+                    FP4_MAG[mag as usize] <= 6.0,
+                    "{name} {byte:#04x}: magnitude {} exceeds 6.0",
+                    FP4_MAG[mag as usize]
+                );
+                // Saturation: |input| > 6.0 (incl. Inf) must produce exactly the max code.
+                if let Some(v) = tv {
+                    if v.abs() > 6.0 {
+                        assert_eq!(
+                            got & 0x07,
+                            7,
+                            "{name} {byte:#04x}: |value| {} > 6.0 must saturate to code 7",
+                            v.abs()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Oracle-free SIGN PRESERVATION over all 256 inputs of both converters: the FP4 sign bit
+    /// (bit 3) always equals the FP8 sign bit (bit 7), including for zero/flush and NaN/Inf
+    /// (production carries `s_i` unconditionally).
+    #[test]
+    fn prop_sign_preserved_all_inputs() {
+        for byte in 0u8..=255 {
+            let in_sign = (byte >> 7) & 1;
+            let e4 = (fp8_e4m3_to_fp4_e2m1(byte) >> 3) & 1;
+            let e5 = (fp8_e5m2_to_fp4_e2m1(byte) >> 3) & 1;
+            assert_eq!(e4, in_sign, "E4M3 {byte:#04x}: sign not preserved");
+            assert_eq!(e5, in_sign, "E5M2 {byte:#04x}: sign not preserved");
+        }
+    }
+
+    /// Oracle-free MONOTONICITY over the ordered input values (both converters): sorting the
+    /// non-NaN inputs by their true real value, the converter output (as an FP4 real value)
+    /// must be non-decreasing. A correct saturating round-to-nearest is monotone; a sign or
+    /// rounding-direction bug would break the order.
+    #[test]
+    fn prop_monotonic_across_ordered_inputs() {
+        for (name, conv, decode) in [
+            (
+                "e4m3",
+                fp8_e4m3_to_fp4_e2m1 as fn(u8) -> u8,
+                e4m3_true_value as fn(u8) -> Option<f64>,
+            ),
+            (
+                "e5m2",
+                fp8_e5m2_to_fp4_e2m1 as fn(u8) -> u8,
+                e5m2_true_value as fn(u8) -> Option<f64>,
+            ),
+        ] {
+            // (true input value, FP4 output value); NaN inputs excluded (unordered).
+            let mut pts: Vec<(f64, f64)> = (0u8..=255)
+                .filter_map(|b| decode(b).map(|v| (v, fp4_nibble_value(conv(b)))))
+                .collect();
+            pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            for w in pts.windows(2) {
+                assert!(
+                    w[1].1 >= w[0].1,
+                    "{name}: monotonicity broken: input {} -> {}, then input {} -> {}",
+                    w[0].0,
+                    w[0].1,
+                    w[1].0,
+                    w[1].1
+                );
+            }
+        }
+    }
 }
