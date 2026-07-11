@@ -710,7 +710,7 @@ mod tests {
     // zero/subnormal (e==0) to same-signed FP6 zero; every finite normal is rounded onto the
     // E3M2 grid (which naturally reaches the subnormal-output region and saturation).
     fn oracle_e5m2_to_e3m2(byte: u8) -> u8 {
-        let s = ((byte >> 7) & 1) as u8;
+        let s = (byte >> 7) & 1;
         let e = (byte >> 2) & 0x1F;
         let m = byte & 0x03;
         let grid = e3m2_grid();
@@ -730,7 +730,7 @@ mod tests {
     // e==0xF binade (E4M3 max normal 448 AND the NaN slot) to the same-signed FP6 max normal,
     // DAZ-flushes e==0, and rounds every other finite normal onto the E2M3 grid.
     fn oracle_e4m3_to_e2m3(byte: u8) -> u8 {
-        let s = ((byte >> 7) & 1) as u8;
+        let s = (byte >> 7) & 1;
         let e = (byte >> 3) & 0x0F;
         let m = byte & 0x07;
         let grid = e2m3_grid();
