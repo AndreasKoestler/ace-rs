@@ -844,6 +844,104 @@ pub(crate) fn fp32_to_fp8_e5m2(f: f32, mode: Fp8RoundMode, saturating: bool) -> 
     fp32_to_fp8_e5m2_biased(f, mode, saturating, 0)
 }
 
+/// E5M2 Inf/NaN handling (`e_i == 0xFF`). Extracted from [`fp32_to_fp8_e5m2_biased`].
+fn e5m2_special(saturating: bool, m_i: u32) -> (i32, u32) {
+    if saturating {
+        if m_i == 0 {
+            (0x1E, 0x3) // Inf -> clamp to max_normal
+        } else {
+            (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN -> coded NaN (kept even when sat)
+        }
+    } else if m_i != 0 {
+        (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN
+    } else {
+        (0x1F, 0x0) // Inf -> Inf/overflow-coded
+    }
+}
+
+/// E5M2 BIAS branch (spec section 16.1). With `bias == 0` this is add-then-truncate.
+/// Extracted from [`fp32_to_fp8_e5m2_biased`].
+fn e5m2_bias(e_i: i32, m_i: u32, bias: u32, saturating: bool) -> (i32, u32) {
+    let mut e_b = e_i;
+    let mut m_b = m_i + (bias & 0x1FFFFF);
+    if m_b & 0xFF800000 != 0 {
+        e_b += 1;
+    }
+    m_b &= 0x7FFFFF;
+    let newexp = e_b - 127 + 15;
+    if newexp >= 31 {
+        if saturating {
+            (0x1E, 0x3)
+        } else {
+            (0x1F, 0x0)
+        }
+    } else if newexp <= 0 {
+        let mut m_o = 0u32;
+        if (22 - newexp) <= 24 {
+            let mant = m_b | 0x800000;
+            let shift = 22 - newexp;
+            m_o = mant >> shift;
+        }
+        (0, m_o)
+    } else {
+        (newexp, m_b >> 21)
+    }
+}
+
+/// E5M2 RTNE underflow (`newexp <= 0`) -> subnormal or zero. Extracted from
+/// [`fp32_to_fp8_e5m2_biased`].
+fn e5m2_rtne_subnormal(m_i: u32, newexp: i32) -> (i32, u32) {
+    let mut e_o = 0i32;
+    let mut m_o = 0u32;
+    if (22 - newexp) <= 24 {
+        let mant = m_i | 0x800000;
+        let shift = 22 - newexp;
+        m_o = mant >> shift;
+        let low = mant & mask(shift);
+        let half = 1u32 << (shift - 1);
+        if low > half || (low == half && (m_o & 0x1) == 1) {
+            m_o += 1;
+            if (m_o & 0x3) == 0 {
+                e_o += 1;
+            }
+        }
+    }
+    (e_o, m_o)
+}
+
+/// E5M2 RTNE normal (`0 < newexp < 31`). Extracted from [`fp32_to_fp8_e5m2_biased`].
+fn e5m2_rtne_normal(newexp: i32, m_i: u32, saturating: bool) -> (i32, u32) {
+    let mut e_o = newexp;
+    let mut m_o = m_i >> 21;
+    if m_i & 0x100000 != 0
+        && ((m_i & 0x1FFFFF) > 0x100000 || (m_o & 0x1) == 1)
+        && !(saturating && e_o == 0x1E && m_o == 0x3)
+    {
+        m_o += 1;
+        if (m_o & 0x3) == 0 {
+            e_o += 1;
+        }
+    }
+    (e_o, m_o)
+}
+
+/// E5M2 RTNE branch (RTO is not an E5M2 form; folded into RTNE). Extracted from
+/// [`fp32_to_fp8_e5m2_biased`].
+fn e5m2_rtne(e_i: i32, m_i: u32, saturating: bool) -> (i32, u32) {
+    let newexp = e_i - 127 + 15;
+    if newexp >= 31 {
+        if saturating {
+            (0x1E, 0x3)
+        } else {
+            (0x1F, 0x0)
+        }
+    } else if newexp <= 0 {
+        e5m2_rtne_subnormal(m_i, newexp)
+    } else {
+        e5m2_rtne_normal(newexp, m_i, saturating)
+    }
+}
+
 /// E5M2 front-end with an explicit 21-bit `bias` term for the `Fp8RoundMode::Bias` branch
 /// (spec section 16.1). `Rtne`/`Rto` ignore `bias`; RTO is not an E5M2 form and is folded
 /// into RTNE.
@@ -859,89 +957,14 @@ pub(crate) fn fp32_to_fp8_e5m2_biased(
     let m_i = i & 0x7FFFFF;
 
     let (e_o, m_o): (i32, u32) = if e_i == 0xFF {
-        // Inf or NaN.
-        if saturating {
-            if m_i == 0 {
-                (0x1E, 0x3) // Inf -> clamp to max_normal
-            } else {
-                (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN -> coded NaN (kept even when sat)
-            }
-        } else if m_i != 0 {
-            (0x1F, 0x2 | ((m_i >> 21) & 0x1)) // NaN
-        } else {
-            (0x1F, 0x0) // Inf -> Inf/overflow-coded
-        }
+        e5m2_special(saturating, m_i)
     } else if e_i == 0x00 {
         // Zero or denorm (DAZ=1) -> same-signed zero.
         (0, 0)
     } else if mode == Fp8RoundMode::Bias {
-        // BIAS branch (spec section 16.1 E5M2). With bias == 0 this is add-then-truncate.
-        let mut e_b = e_i;
-        let mut m_b = m_i + (bias & 0x1FFFFF);
-        if m_b & 0xFF800000 != 0 {
-            e_b += 1;
-        }
-        m_b &= 0x7FFFFF;
-        let newexp = e_b - 127 + 15;
-        if newexp >= 31 {
-            if saturating {
-                (0x1E, 0x3)
-            } else {
-                (0x1F, 0x0)
-            }
-        } else if newexp <= 0 {
-            let mut m_o = 0u32;
-            if (22 - newexp) <= 24 {
-                let mant = m_b | 0x800000;
-                let shift = 22 - newexp;
-                m_o = mant >> shift;
-            }
-            (0, m_o)
-        } else {
-            (newexp, m_b >> 21)
-        }
+        e5m2_bias(e_i, m_i, bias, saturating)
     } else {
-        // RTNE (RTO is not an E5M2 form; folded into RTNE).
-        let newexp = e_i - 127 + 15;
-        if newexp >= 31 {
-            if saturating {
-                (0x1E, 0x3)
-            } else {
-                (0x1F, 0x0)
-            }
-        } else if newexp <= 0 {
-            // underflow -> subnormal or zero
-            let mut e_o = 0i32;
-            let mut m_o = 0u32;
-            if (22 - newexp) <= 24 {
-                let mant = m_i | 0x800000;
-                let shift = 22 - newexp;
-                m_o = mant >> shift;
-                let low = mant & mask(shift);
-                let half = 1u32 << (shift - 1);
-                if low > half || (low == half && (m_o & 0x1) == 1) {
-                    m_o += 1;
-                    if (m_o & 0x3) == 0 {
-                        e_o += 1;
-                    }
-                }
-            }
-            (e_o, m_o)
-        } else {
-            // normal
-            let mut e_o = newexp;
-            let mut m_o = m_i >> 21;
-            if m_i & 0x100000 != 0
-                && ((m_i & 0x1FFFFF) > 0x100000 || (m_o & 0x1) == 1)
-                && !(saturating && e_o == 0x1E && m_o == 0x3)
-            {
-                m_o += 1;
-                if (m_o & 0x3) == 0 {
-                    e_o += 1;
-                }
-            }
-            (e_o, m_o)
-        }
+        e5m2_rtne(e_i, m_i, saturating)
     };
 
     ((s_i & 0x1) << 7 | ((e_o as u32) & 0x1F) << 2 | (m_o & 0x3)) as u8
@@ -969,6 +992,126 @@ pub(crate) fn fp32_to_fp8_e4m3(f: f32, mode: Fp8RoundMode, saturating: bool) -> 
     fp32_to_fp8_e4m3_biased(f, mode, saturating, 0)
 }
 
+/// E4M3 Inf/NaN handling (`e_i == 0xFF`) -> NaN-coded; saturating Inf clamps to
+/// max_normal. Extracted from [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_special(saturating: bool, m_i: u32) -> (i32, u32) {
+    if saturating && m_i == 0 {
+        (0xF, 0x6) // Inf -> clamp to max_normal
+    } else {
+        (0xF, 0x7)
+    }
+}
+
+/// E4M3 RTO (round-to-odd) branch, E4M3 only. Extracted from
+/// [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_rto(e_i: i32, m_i: u32, saturating: bool) -> (i32, u32) {
+    let newexp = e_i - 127 + 7;
+    if newexp >= 16 {
+        (0xF, if saturating { 0x6 } else { 0x7 })
+    } else if newexp <= 0 {
+        if (21 - newexp) <= 24 {
+            let mant = m_i | 0x800000;
+            let shift = 21 - newexp;
+            let mut m_o = mant >> shift;
+            let sticky = if mant & mask(shift) != 0 { 1 } else { 0 };
+            m_o |= sticky;
+            (0, m_o)
+        } else {
+            // magnitude < 2^-10: J-bit below the subnormal lsb -> odd smallest subnormal.
+            (0, 1)
+        }
+    } else {
+        let e_o = newexp;
+        let mut m_o = m_i >> 20;
+        let sticky = if m_i & 0xFFFFF != 0 { 1 } else { 0 };
+        m_o |= sticky;
+        if saturating && e_o == 0xF && m_o == 0x7 {
+            (e_o, 0x6) // clamp NaN -> max_normal
+        } else {
+            (e_o, m_o)
+        }
+    }
+}
+
+/// E4M3 BIAS branch (spec section 16.1). With `bias == 0` this is add-then-truncate.
+/// Extracted from [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_bias(e_i: i32, m_i: u32, bias: u32, saturating: bool) -> (i32, u32) {
+    let mut e_b = e_i;
+    let mut m_b = m_i + (bias & 0xFFFFF);
+    if m_b & 0xFF800000 != 0 {
+        e_b += 1;
+    }
+    m_b &= 0x7FFFFF;
+    let newexp = e_b - 127 + 7;
+    if newexp >= 16 {
+        (0xF, if saturating { 0x6 } else { 0x7 })
+    } else if newexp <= 0 {
+        // Underflow: hard flush to signed zero. Unlike the E5M2 Bias branch, the
+        // section-16.1 E4M3 Bias pseudocode has NO subnormal-truncate block — the
+        // spec is deliberately asymmetric here.
+        (0, 0)
+    } else {
+        // Normal: truncate the biased mantissa. The section-16.1 E4M3 Bias branch has
+        // no saturating NaN-slot clamp (that clamp exists only in the RTNE/RTO
+        // branches); a truncation into `e_o == 0xF, m_o == 0x7` yields the NaN
+        // encoding even when saturating.
+        (newexp, m_b >> 20)
+    }
+}
+
+/// E4M3 RTNE underflow (`newexp <= 0`) -> subnormal or zero. Extracted from
+/// [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_rtne_subnormal(m_i: u32, newexp: i32) -> (i32, u32) {
+    let mut e_o = 0i32;
+    let mut m_o = 0u32;
+    if (21 - newexp) <= 24 {
+        let mant = m_i | 0x800000;
+        let shift = 21 - newexp;
+        m_o = mant >> shift;
+        let low = mant & mask(shift);
+        let half = 1u32 << (shift - 1);
+        if low > half || (low == half && (m_o & 0x1) == 1) {
+            m_o += 1;
+            if (m_o & 0x7) == 0 {
+                e_o += 1;
+            }
+        }
+    }
+    (e_o, m_o)
+}
+
+/// E4M3 RTNE normal (`0 < newexp < 16`). Extracted from [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_rtne_normal(newexp: i32, m_i: u32, saturating: bool) -> (i32, u32) {
+    let mut e_o = newexp;
+    let mut m_o = m_i >> 20;
+    if saturating && e_o == 0xF && m_o == 0x7 {
+        m_o = 0x6;
+    }
+    if m_i & 0x80000 != 0 && ((m_i & 0xFFFFF) > 0x80000 || (m_o & 0x1) == 1) {
+        let clamp_sat = saturating && e_o == 0xF && m_o == 0x6;
+        let clamp_nan = !saturating && e_o == 0xF && m_o == 0x7;
+        if !(clamp_sat || clamp_nan) {
+            m_o += 1;
+            if (m_o & 0x7) == 0 {
+                e_o += 1;
+            }
+        }
+    }
+    (e_o, m_o)
+}
+
+/// E4M3 RTNE branch. Extracted from [`fp32_to_fp8_e4m3_biased`].
+fn e4m3_rtne(e_i: i32, m_i: u32, saturating: bool) -> (i32, u32) {
+    let newexp = e_i - 127 + 7;
+    if newexp >= 16 {
+        (0xF, if saturating { 0x6 } else { 0x7 })
+    } else if newexp <= 0 {
+        e4m3_rtne_subnormal(m_i, newexp)
+    } else {
+        e4m3_rtne_normal(newexp, m_i, saturating)
+    }
+}
+
 /// E4M3 front-end with an explicit 20-bit `bias` term for the `Fp8RoundMode::Bias` branch
 /// (spec section 16.1). `Rtne`/`Rto` ignore `bias`.
 pub(crate) fn fp32_to_fp8_e4m3_biased(
@@ -983,106 +1126,16 @@ pub(crate) fn fp32_to_fp8_e4m3_biased(
     let m_i = i & 0x7FFFFF;
 
     let (e_o, m_o): (i32, u32) = if e_i == 0xFF {
-        // Inf or NaN -> NaN-coded; saturating Inf clamps to max_normal.
-        if saturating && m_i == 0 {
-            (0xF, 0x6) // Inf -> clamp to max_normal
-        } else {
-            (0xF, 0x7)
-        }
+        e4m3_special(saturating, m_i)
     } else if e_i == 0x00 {
         // Zero or denorm (DAZ=1) -> same-signed zero.
         (0, 0)
     } else if mode == Fp8RoundMode::Rto {
-        // RTO (round-to-odd), E4M3 only.
-        let newexp = e_i - 127 + 7;
-        if newexp >= 16 {
-            (0xF, if saturating { 0x6 } else { 0x7 })
-        } else if newexp <= 0 {
-            if (21 - newexp) <= 24 {
-                let mant = m_i | 0x800000;
-                let shift = 21 - newexp;
-                let mut m_o = mant >> shift;
-                let sticky = if mant & mask(shift) != 0 { 1 } else { 0 };
-                m_o |= sticky;
-                (0, m_o)
-            } else {
-                // magnitude < 2^-10: J-bit below the subnormal lsb -> odd smallest subnormal.
-                (0, 1)
-            }
-        } else {
-            let e_o = newexp;
-            let mut m_o = m_i >> 20;
-            let sticky = if m_i & 0xFFFFF != 0 { 1 } else { 0 };
-            m_o |= sticky;
-            if saturating && e_o == 0xF && m_o == 0x7 {
-                (e_o, 0x6) // clamp NaN -> max_normal
-            } else {
-                (e_o, m_o)
-            }
-        }
+        e4m3_rto(e_i, m_i, saturating)
     } else if mode == Fp8RoundMode::Bias {
-        // BIAS branch (spec section 16.1 E4M3). With bias == 0 this is add-then-truncate.
-        let mut e_b = e_i;
-        let mut m_b = m_i + (bias & 0xFFFFF);
-        if m_b & 0xFF800000 != 0 {
-            e_b += 1;
-        }
-        m_b &= 0x7FFFFF;
-        let newexp = e_b - 127 + 7;
-        if newexp >= 16 {
-            (0xF, if saturating { 0x6 } else { 0x7 })
-        } else if newexp <= 0 {
-            // Underflow: hard flush to signed zero. Unlike the E5M2 Bias branch, the
-            // section-16.1 E4M3 Bias pseudocode has NO subnormal-truncate block — the
-            // spec is deliberately asymmetric here.
-            (0, 0)
-        } else {
-            // Normal: truncate the biased mantissa. The section-16.1 E4M3 Bias branch has
-            // no saturating NaN-slot clamp (that clamp exists only in the RTNE/RTO
-            // branches); a truncation into `e_o == 0xF, m_o == 0x7` yields the NaN
-            // encoding even when saturating.
-            (newexp, m_b >> 20)
-        }
+        e4m3_bias(e_i, m_i, bias, saturating)
     } else {
-        // RTNE.
-        let newexp = e_i - 127 + 7;
-        if newexp >= 16 {
-            (0xF, if saturating { 0x6 } else { 0x7 })
-        } else if newexp <= 0 {
-            let mut e_o = 0i32;
-            let mut m_o = 0u32;
-            if (21 - newexp) <= 24 {
-                let mant = m_i | 0x800000;
-                let shift = 21 - newexp;
-                m_o = mant >> shift;
-                let low = mant & mask(shift);
-                let half = 1u32 << (shift - 1);
-                if low > half || (low == half && (m_o & 0x1) == 1) {
-                    m_o += 1;
-                    if (m_o & 0x7) == 0 {
-                        e_o += 1;
-                    }
-                }
-            }
-            (e_o, m_o)
-        } else {
-            let mut e_o = newexp;
-            let mut m_o = m_i >> 20;
-            if saturating && e_o == 0xF && m_o == 0x7 {
-                m_o = 0x6;
-            }
-            if m_i & 0x80000 != 0 && ((m_i & 0xFFFFF) > 0x80000 || (m_o & 0x1) == 1) {
-                let clamp_sat = saturating && e_o == 0xF && m_o == 0x6;
-                let clamp_nan = !saturating && e_o == 0xF && m_o == 0x7;
-                if !(clamp_sat || clamp_nan) {
-                    m_o += 1;
-                    if (m_o & 0x7) == 0 {
-                        e_o += 1;
-                    }
-                }
-            }
-            (e_o, m_o)
-        }
+        e4m3_rtne(e_i, m_i, saturating)
     };
 
     ((s_i & 0x1) << 7 | ((e_o as u32) & 0xF) << 3 | (m_o & 0x7)) as u8
