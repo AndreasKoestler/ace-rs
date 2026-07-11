@@ -1901,4 +1901,578 @@ mod tests {
             }
         }
     }
+
+    // =====================================================================================
+    // Independent f64-exact RTNE oracle for the FP->FP8 rounders (findings #1, #5, #11).
+    //
+    // These helpers are DELIBERATELY independent of the production integer bit-twiddling:
+    // they decode the source to an exact f64 magnitude (every FP16 finite value, and every
+    // in-range FP32-normal magnitude, is exact in f64; the FP8 lsb scale is an exact power of
+    // two, so `q` below is computed exactly) and then round to the target FP8 grid. Special
+    // inputs (NaN / Inf / overflow / signed zero / DAZ flush) are encoded from the format
+    // definitions and the documented section-9.2.1 / section-16 policy (see the module
+    // header). Production is SDE-verified ground truth: if the oracle ever disagreed, the
+    // oracle would be wrong, not production.
+    // =====================================================================================
+
+    /// Round a strictly-positive exact real `av` to the FP8 grid of `fmt` under
+    /// round-to-nearest-ties-to-EVEN. Returns `(exp_field, mant_field, overflowed)` where
+    /// `overflowed` means the rounded magnitude exceeds the format max normal (for E5M2 that
+    /// includes rounding into the all-ones exponent binade; for E4M3 it means reaching the
+    /// sole `S.1111.111` NaN slot).
+    fn oracle_round_to_grid(fmt: &Fp8Format, av: f64) -> (u32, u32, bool) {
+        assert!(av > 0.0 && av.is_finite());
+        let mant_bits = fmt.mant_bits as i32;
+        let bias = fmt.bias;
+        let min_normal_exp = 1 - bias;
+        let max_exp_field = (1i64 << fmt.exp_bits) - 1;
+        let max_mant = (1u32 << fmt.mant_bits) - 1;
+
+        // Binade of the leading 1: 2^e <= av < 2^(e+1). log2 can round at binade edges, so
+        // correct with exact power-of-two comparisons.
+        let mut e = av.log2().floor() as i32;
+        while (2f64).powi(e) > av {
+            e -= 1;
+        }
+        while (2f64).powi(e + 1) <= av {
+            e += 1;
+        }
+
+        // Scale of the stored lsb: normal binade uses 2^(e - mant_bits); the subnormal window
+        // pins the lsb at 2^(min_normal_exp - mant_bits).
+        let l = if e >= min_normal_exp {
+            e - mant_bits
+        } else {
+            min_normal_exp - mant_bits
+        };
+        let q = av / (2f64).powi(l); // exact: av and 2^l are exact, q needs <= ~26 bits
+        let fl = q.floor();
+        let frac = q - fl;
+        let nf = if frac < 0.5 {
+            fl
+        } else if frac > 0.5 {
+            fl + 1.0
+        } else if (fl as i64) & 1 == 0 {
+            fl // tie -> even
+        } else {
+            fl + 1.0 // tie -> even (round up to the even neighbour)
+        };
+        let n = nf as i64;
+        if n == 0 {
+            return (0, 0, false); // underflow to zero
+        }
+
+        // Re-derive fields from the rounded integer significand `n` (scale 2^l); the round may
+        // have carried into a new binade.
+        let msb = 63 - (n as u64).leading_zeros() as i32;
+        let e2 = l + msb;
+        if e2 < min_normal_exp {
+            return (0, n as u32, false); // subnormal (n < 2^mant_bits)
+        }
+        let exp_field = (e2 + bias) as i64;
+        let mant_field = (n - (1i64 << msb)) as u32;
+        if exp_field > max_exp_field {
+            return (0, 0, true);
+        }
+        if exp_field == max_exp_field && (fmt.exp_bits == 5 || mant_field == max_mant) {
+            // E5M2: whole all-ones binade is Inf/NaN. E4M3: all-ones mantissa is the NaN slot.
+            return (0, 0, true);
+        }
+        (exp_field as u32, mant_field, false)
+    }
+
+    /// The format overflow (non-saturating) byte: E5M2 `S.11111.00` (Inf-coded), E4M3
+    /// `S.1111.111` (its sole NaN slot). Built from the format definition, not production.
+    fn oracle_overflow(fmt: &Fp8Format, sign: u32) -> u8 {
+        let mef = (1u32 << fmt.exp_bits) - 1;
+        let mant = if fmt.exp_bits == 5 {
+            0
+        } else {
+            (1u32 << fmt.mant_bits) - 1
+        };
+        ((sign << 7) | (mef << fmt.mant_bits) | mant) as u8
+    }
+
+    /// The format max-normal byte: E5M2 `S.11110.11` (=57344), E4M3 `S.1111.110` (=448).
+    fn oracle_max_normal(fmt: &Fp8Format, sign: u32) -> u8 {
+        let mef = (1u32 << fmt.exp_bits) - 1;
+        let mm = (1u32 << fmt.mant_bits) - 1;
+        let (ef, mf) = if fmt.exp_bits == 5 {
+            (mef - 1, mm)
+        } else {
+            (mef, mm - 1)
+        };
+        ((sign << 7) | (ef << fmt.mant_bits) | mf) as u8
+    }
+
+    fn oracle_assemble(fmt: &Fp8Format, sign: u32, ef: u32, mf: u32) -> u8 {
+        ((sign << 7) | (ef << fmt.mant_bits) | mf) as u8
+    }
+
+    /// Independent expected FP8 byte for `fp16_to_bf8`/`fp16_to_hf8` (family-A plain RTNE).
+    /// The FP16 path is DAZ=0/FTZ=0, so subnormal FP16 inputs are honoured (NOT flushed) —
+    /// the DAZ flush lives only in the FP32 front-end.
+    fn oracle_fp16_to_fp8(fmt: &Fp8Format, bits: u16, saturating: bool) -> u8 {
+        let sign = ((bits >> 15) & 1) as u32;
+        let exp = (bits >> 10) & 0x1f;
+        let mant = (bits & 0x3ff) as u32;
+        if exp == 0x1f {
+            if mant == 0 {
+                // +/-Inf.
+                return if saturating {
+                    oracle_max_normal(fmt, sign)
+                } else {
+                    oracle_overflow(fmt, sign)
+                };
+            }
+            // NaN input -> FP8 NaN, both modes (documented section-16.2 payload mapping).
+            let mef = (1u32 << fmt.exp_bits) - 1;
+            let m = if fmt.exp_bits == 5 {
+                ((mant >> 8) & 0b11) | 0b10
+            } else {
+                (1u32 << fmt.mant_bits) - 1
+            };
+            return ((sign << 7) | (mef << fmt.mant_bits) | m) as u8;
+        }
+        // Finite (zero, subnormal, or normal) -> exact f64 magnitude.
+        let av = if exp == 0 {
+            (mant as f64) * (2f64).powi(-24)
+        } else {
+            ((1024 + mant) as f64) * (2f64).powi(exp as i32 - 25)
+        };
+        if av == 0.0 {
+            return (sign << 7) as u8; // signed zero
+        }
+        let (ef, mf, ovf) = oracle_round_to_grid(fmt, av);
+        if ovf {
+            if saturating {
+                oracle_max_normal(fmt, sign)
+            } else {
+                oracle_overflow(fmt, sign)
+            }
+        } else {
+            oracle_assemble(fmt, sign, ef, mf) // (0,0) collapses to signed zero
+        }
+    }
+
+    /// Independent expected FP8 byte for `fp32_to_fp8_e5m2`/`fp32_to_fp8_e4m3` under RTNE.
+    /// FP32 front-end is DAZ=1: subnormal FP32 inputs flush to signed zero.
+    fn oracle_fp32_to_fp8(fmt: &Fp8Format, f: f32, saturating: bool) -> u8 {
+        let bits = f.to_bits();
+        let sign = (bits >> 31) & 1;
+        let e_i = (bits >> 23) & 0xff;
+        let m_i = bits & 0x7fffff;
+        let mef = (1u32 << fmt.exp_bits) - 1;
+        if e_i == 0xff {
+            if m_i == 0 {
+                return if saturating {
+                    oracle_max_normal(fmt, sign)
+                } else {
+                    oracle_overflow(fmt, sign)
+                };
+            }
+            // NaN -> coded NaN (both modes). E5M2 keeps one payload bit from FP32 mant bit 21.
+            let m = if fmt.exp_bits == 5 {
+                0x2 | ((m_i >> 21) & 0x1)
+            } else {
+                (1u32 << fmt.mant_bits) - 1
+            };
+            return ((sign << 7) | (mef << fmt.mant_bits) | m) as u8;
+        }
+        if e_i == 0 {
+            // Zero or FP32 subnormal -> DAZ=1 flush to signed zero.
+            return (sign << 7) as u8;
+        }
+        let av = ((0x800000 + m_i) as f64) * (2f64).powi(e_i as i32 - 150);
+        let (ef, mf, ovf) = oracle_round_to_grid(fmt, av);
+        if ovf {
+            if saturating {
+                oracle_max_normal(fmt, sign)
+            } else {
+                oracle_overflow(fmt, sign)
+            }
+        } else {
+            oracle_assemble(fmt, sign, ef, mf)
+        }
+    }
+
+    /// Signed exact real value of an FP16 bit pattern (Inf -> +/-inf, NaN -> NaN).
+    fn fp16_real(bits: u16) -> f64 {
+        let sign = (bits >> 15) & 1;
+        let exp = (bits >> 10) & 0x1f;
+        let mant = bits & 0x3ff;
+        let s = if sign == 1 { -1.0 } else { 1.0 };
+        if exp == 0x1f {
+            if mant == 0 {
+                s * f64::INFINITY
+            } else {
+                f64::NAN
+            }
+        } else if exp == 0 {
+            s * (mant as f64) * (2f64).powi(-24)
+        } else {
+            s * ((1024 + mant) as f64) * (2f64).powi(exp as i32 - 25)
+        }
+    }
+
+    /// Signed exact real value an FP8 byte decodes to, via the (exact) production decoders.
+    fn fp8_real(exp_bits: u32, byte: u8) -> f64 {
+        if exp_bits == 5 {
+            fp8_e5m2_to_fp32(byte) as f64
+        } else {
+            fp8_e4m3_to_fp32(byte) as f64
+        }
+    }
+
+    // --- FINDING #1: full FP16-domain RTNE for fp16_to_bf8 / fp16_to_hf8 ---
+
+    /// Exhaustive sweep over all 65536 FP16 bit patterns, both target formats, both
+    /// saturation modes: production must equal the independent f64 oracle. 262144 comparisons.
+    #[test]
+    fn fp16_to_fp8_full_domain_matches_f64_oracle() {
+        for b in 0u32..=0xffff {
+            let bits = b as u16;
+            for &sat in &[false, true] {
+                assert_eq!(
+                    fp16_to_bf8(bits, sat),
+                    oracle_fp16_to_fp8(&BF8, bits, sat),
+                    "BF8 bits={bits:#06x} sat={sat}"
+                );
+                assert_eq!(
+                    fp16_to_hf8(bits, sat),
+                    oracle_fp16_to_fp8(&HF8, bits, sat),
+                    "HF8 bits={bits:#06x} sat={sat}"
+                );
+            }
+        }
+    }
+
+    /// Oracle-free properties over the full FP16 domain: (b) sign preservation (incl. signed
+    /// zero and NaN sign) for every input, both formats, both modes.
+    #[test]
+    fn fp16_to_fp8_full_domain_sign_preserved() {
+        let convs: [(fn(u16, bool) -> u8, &str); 2] = [(fp16_to_bf8, "bf8"), (fp16_to_hf8, "hf8")];
+        for (conv, name) in convs {
+            for &sat in &[false, true] {
+                for b in 0u32..=0xffff {
+                    let bits = b as u16;
+                    let out = conv(bits, sat);
+                    assert_eq!(
+                        (out >> 7) & 1,
+                        ((bits >> 15) & 1) as u8,
+                        "{name} sign not preserved for bits={bits:#06x} sat={sat}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (a) Monotonicity: sweeping every non-NaN FP16 input in increasing real-value order, the
+    /// saturating FP8 result's decoded value is non-decreasing. Saturating mode keeps the
+    /// output finite (no Inf/NaN), giving a clean monotone step function.
+    #[test]
+    fn fp16_to_fp8_full_domain_monotonic() {
+        for (fmt, conv) in [
+            (&BF8, fp16_to_bf8 as fn(u16, bool) -> u8),
+            (&HF8, fp16_to_hf8 as fn(u16, bool) -> u8),
+        ] {
+            let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(65536);
+            for b in 0u32..=0xffff {
+                let bits = b as u16;
+                let r = fp16_real(bits);
+                if r.is_nan() {
+                    continue;
+                }
+                let out = conv(bits, true); // saturating -> always finite
+                pairs.push((r, fp8_real(fmt.exp_bits, out)));
+            }
+            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            for w in pairs.windows(2) {
+                assert!(
+                    w[1].1 >= w[0].1,
+                    "monotonicity violated: real {} -> {} but real {} -> {}",
+                    w[0].0,
+                    w[0].1,
+                    w[1].0,
+                    w[1].1
+                );
+            }
+        }
+    }
+
+    /// (c) Every finite FP8 result is a valid, CANONICAL encoding: decoding it to FP32 and
+    /// re-encoding through the FP32->FP8 RTNE front-end is a fixed point. Cross-links the
+    /// finding-#1 output with the (independently SDE-verified) finding-#5 rounder, and
+    /// confirms Inf/NaN only appear where the policy allows.
+    #[test]
+    fn fp16_to_fp8_results_are_canonical_fp8() {
+        for b in 0u32..=0xffff {
+            let bits = b as u16;
+            let in_is_nan = (bits >> 10) & 0x1f == 0x1f && (bits & 0x3ff) != 0;
+            for &sat in &[false, true] {
+                // BF8
+                let out = fp16_to_bf8(bits, sat);
+                let v = fp8_e5m2_to_fp32(out);
+                if v.is_nan() {
+                    assert!(in_is_nan, "BF8 NaN only from NaN input: bits={bits:#06x}");
+                } else if v.is_infinite() {
+                    // Only the non-saturating overflow / Inf-input path yields the Inf code.
+                    assert!(
+                        !sat,
+                        "BF8 Inf code only when non-saturating: bits={bits:#06x}"
+                    );
+                } else {
+                    assert_eq!(
+                        fp32_to_fp8_e5m2(v, Fp8RoundMode::Rtne, false),
+                        out,
+                        "BF8 result {out:#04x} not a canonical fixed point (bits={bits:#06x})"
+                    );
+                }
+                // HF8
+                let out = fp16_to_hf8(bits, sat);
+                let v = fp8_e4m3_to_fp32(out);
+                if v.is_nan() {
+                    // HF8 NaN slot is emitted for NaN input AND for non-saturating overflow.
+                    assert!(
+                        in_is_nan || !sat,
+                        "HF8 NaN only from NaN input or non-sat overflow: bits={bits:#06x}"
+                    );
+                } else {
+                    assert_eq!(
+                        fp32_to_fp8_e4m3(v, Fp8RoundMode::Rtne, false),
+                        out,
+                        "HF8 result {out:#04x} not a canonical fixed point (bits={bits:#06x})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// HF8 (E4M3) RTNE tie-to-even hand case (the report noted HF8 tie-to-even had no hand
+    /// test). HF8 keeps 3 of FP16's 10 mantissa bits, discarding the low 7; exactly half a
+    /// destination lsb is FP16 mantissa bit 6 (0x040) set with the low 6 bits clear.
+    #[test]
+    fn fp16_to_hf8_rtne_ties_to_even() {
+        // Exactly half, kept-lsb EVEN (top 3 bits = 000) -> ties DOWN to mant 000.
+        let even = fp16_bits(0, 15, 0b00_0100_0000); // 0x040
+        assert_eq!(
+            fp16_to_hf8(even, false),
+            hf8(0, 0b0111, 0b000),
+            "tie, even -> down"
+        );
+        // Exactly half, kept-lsb ODD (top 3 bits = 001) -> ties UP to mant 010.
+        let odd = fp16_bits(0, 15, 0b00_1100_0000); // 0x0C0
+        assert_eq!(
+            fp16_to_hf8(odd, false),
+            hf8(0, 0b0111, 0b010),
+            "tie, odd -> up"
+        );
+        // Just above half -> rounds up regardless of parity.
+        let above = fp16_bits(0, 15, 0b00_0100_0001); // 0x041
+        assert_eq!(
+            fp16_to_hf8(above, false),
+            hf8(0, 0b0111, 0b001),
+            "above half -> up"
+        );
+        // Just below half -> rounds down regardless of parity.
+        let below = fp16_bits(0, 15, 0b00_0011_1111); // 0x03F
+        assert_eq!(
+            fp16_to_hf8(below, false),
+            hf8(0, 0b0111, 0b000),
+            "below half -> down"
+        );
+    }
+
+    // --- FINDING #5: FP32 -> FP8 RTNE sweep + Bias-mode hand vectors ---
+
+    /// The structured FP32 mantissa set the RTNE sweep uses: small values, near-max values,
+    /// and the tie boundaries for BOTH targets (E5M2 discards the low 21 bits so its half is
+    /// bit 20 = 0x100000; E4M3 discards the low 20 so its half is bit 19 = 0x80000).
+    fn fp32_sweep_mantissas() -> Vec<u32> {
+        let mut m: Vec<u32> = Vec::new();
+        for v in 0u32..8 {
+            m.push(v);
+        }
+        m.extend_from_slice(&[0x7fffff, 0x7ffffe, 0x7ffff0, 0x400000, 0x200000]);
+        // E5M2 boundary: kept-prefix k (2 bits) shifted to bit 21, +/- around half (0x100000).
+        for k in 0u32..4 {
+            let base = k << 21;
+            for off in [0u32, 1, 0x0fffff, 0x100000, 0x100001, 0x1fffff] {
+                m.push((base | off) & 0x7fffff);
+            }
+        }
+        // E4M3 boundary: kept-prefix k (3 bits) shifted to bit 20, +/- around half (0x80000).
+        for k in 0u32..8 {
+            let base = k << 20;
+            for off in [0u32, 1, 0x7ffff, 0x80000, 0x80001, 0xfffff] {
+                m.push((base | off) & 0x7fffff);
+            }
+        }
+        m.sort_unstable();
+        m.dedup();
+        m
+    }
+
+    /// Broad structured FP32 sweep (all 256 biased exponents x tie-boundary mantissas x both
+    /// signs), both targets, both saturation modes, checked against the independent f64 oracle.
+    /// Covers subnormals (e_i == 0), overflow boundary (e_i == 0xFE/0xFF), +/-0 and NaN.
+    #[test]
+    fn fp32_to_fp8_rtne_sweep_matches_f64_oracle() {
+        let mants = fp32_sweep_mantissas();
+        for e in 0u32..=255 {
+            for &m in &mants {
+                for &sign in &[0u32, 1] {
+                    let f = f32::from_bits((sign << 31) | (e << 23) | m);
+                    for &sat in &[false, true] {
+                        assert_eq!(
+                            fp32_to_fp8_e5m2(f, Fp8RoundMode::Rtne, sat),
+                            oracle_fp32_to_fp8(&BF8, f, sat),
+                            "e5m2 bits={:#010x} sat={sat}",
+                            f.to_bits()
+                        );
+                        assert_eq!(
+                            fp32_to_fp8_e4m3(f, Fp8RoundMode::Rtne, sat),
+                            oracle_fp32_to_fp8(&HF8, f, sat),
+                            "e4m3 bits={:#010x} sat={sat}",
+                            f.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Explicit RTNE tie-to-even and subnormal-RTNE hand vectors for the FP32 front-end
+    /// (finding #5 asks these be pinned by hand, not only by the sweep).
+    #[test]
+    fn fp32_to_fp8_rtne_tie_and_subnormal_hand_vectors() {
+        use Fp8RoundMode::Rtne;
+        // E5M2 keeps 2 mantissa bits (discard 21, half = 0x100000).
+        // Exact half, kept-lsb even -> ties DOWN.
+        let f = f32::from_bits((127 << 23) | 0x100000);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), bf8(0, 0b01111, 0b00));
+        // Exact half, kept-lsb odd -> ties UP to even (0b10).
+        let f = f32::from_bits((127 << 23) | 0x300000);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), bf8(0, 0b01111, 0b10));
+        // Just above half -> up.
+        let f = f32::from_bits((127 << 23) | 0x100001);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), bf8(0, 0b01111, 0b01));
+        // E5M2 subnormal RTNE: 2^-16 -> min subnormal S.00000.01.
+        let f = f32::from_bits(111 << 23);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), bf8(0, 0b00000, 0b01));
+        // 2^-17 is exactly half the min subnormal lsb: ties-to-even DOWN to +0.
+        let f = f32::from_bits(110 << 23);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), 0x00);
+        // Just above that half -> up to the min subnormal.
+        let f = f32::from_bits((110 << 23) | 1);
+        assert_eq!(fp32_to_fp8_e5m2(f, Rtne, false), bf8(0, 0b00000, 0b01));
+
+        // E4M3 keeps 3 mantissa bits (discard 20, half = 0x80000).
+        // Exact half, kept-lsb even -> ties DOWN.
+        let f = f32::from_bits((127 << 23) | 0x80000);
+        assert_eq!(fp32_to_fp8_e4m3(f, Rtne, false), hf8(0, 0b0111, 0b000));
+        // Exact half, kept-lsb odd -> ties UP to even (0b010).
+        let f = f32::from_bits((127 << 23) | 0x180000);
+        assert_eq!(fp32_to_fp8_e4m3(f, Rtne, false), hf8(0, 0b0111, 0b010));
+        // E4M3 subnormal RTNE: 2^-9 -> min subnormal S.0000.001.
+        let f = f32::from_bits(118 << 23);
+        assert_eq!(fp32_to_fp8_e4m3(f, Rtne, false), hf8(0, 0b0000, 0b001));
+    }
+
+    /// Bias-mode ("SR") hand vectors for the FP32 front-end (finding #5): the carry-into-
+    /// exponent path, and the deliberately ASYMMETRIC underflow branches — E5M2 Bias
+    /// subnormal-TRUNCATE (fp8.rs ~878-889) vs E4M3 Bias hard-FLUSH-to-zero (fp8.rs
+    /// ~1048-1052). All use nonzero bias values.
+    #[test]
+    fn fp32_to_fp8_bias_hand_vectors() {
+        use Fp8RoundMode::{Bias, Rtne};
+
+        // --- Carry into the exponent: mantissa all-ones + tiny bias overflows bit 23. ---
+        // 1.9999988 (e_i=127, m=0x7FFFFF) + bias 1 -> exponent bumps, mantissa 0 -> 2.0.
+        let f = f32::from_bits((127 << 23) | 0x7fffff);
+        assert_eq!(
+            fp32_to_fp8_e5m2_biased(f, Bias, false, 1),
+            bf8(0, 0b10000, 0b00),
+            "E5M2 Bias carry into exponent -> 2.0"
+        );
+        assert_eq!(
+            fp32_to_fp8_e4m3_biased(f, Bias, false, 1),
+            hf8(0, 0b1000, 0b000),
+            "E4M3 Bias carry into exponent -> 2.0"
+        );
+
+        // --- Asymmetric underflow. Same magnitude in each format's subnormal window. ---
+        // E5M2: value 2^-15 (newexp == 0) with a nonzero bias TRUNCATES to a NONZERO
+        // subnormal (0x02), it does NOT hard-flush.
+        let f = f32::from_bits(112 << 23); // 2^-15
+        assert_eq!(
+            fp32_to_fp8_e5m2_biased(f, Bias, false, 0x100000),
+            bf8(0, 0b00000, 0b10),
+            "E5M2 Bias subnormal-truncate keeps a nonzero mantissa"
+        );
+        // E4M3: value 2^-9 (== the min E4M3 subnormal, so REPRESENTABLE) with a nonzero bias
+        // is HARD-FLUSHED to signed zero by the Bias branch (no subnormal-truncate block)...
+        let f = f32::from_bits(118 << 23); // 2^-9
+        assert_eq!(
+            fp32_to_fp8_e4m3_biased(f, Bias, false, 0x80000),
+            0x00,
+            "E4M3 Bias hard-flushes a representable subnormal to zero"
+        );
+        // ...whereas plain RTNE on the SAME input yields the min subnormal 0x01. This
+        // contrast is the deliberate spec asymmetry finding #5 flags.
+        assert_eq!(
+            fp32_to_fp8_e4m3(f, Rtne, false),
+            hf8(0, 0b0000, 0b001),
+            "E4M3 RTNE keeps the representable min subnormal (contrast with Bias flush)"
+        );
+
+        // --- Bias == 0 is add-then-truncate, differing from RTNE on an above-half value. ---
+        // e_i=127, m=0x100001 is just above half a BF8 lsb: RTNE rounds up, bias=0 truncates.
+        let f = f32::from_bits((127 << 23) | 0x100001);
+        assert_eq!(
+            fp32_to_fp8_e5m2(f, Rtne, false),
+            bf8(0, 0b01111, 0b01),
+            "RTNE up"
+        );
+        assert_eq!(
+            fp32_to_fp8_e5m2_biased(f, Bias, false, 0),
+            bf8(0, 0b01111, 0b00),
+            "Bias(0) truncates the above-half value down"
+        );
+    }
+
+    // --- FINDING #11: signed zero / negative subnormal sign preservation ---
+
+    /// Negative subnormal and -0.0 inputs produce a correctly-signed (negative) zero, and the
+    /// positive counterparts a positive zero, for both the FP16 and FP32 front-ends.
+    #[test]
+    fn signed_zero_and_negative_subnormal_preserve_sign() {
+        // FP16 -0.0 -> BF8/HF8 -0.
+        assert_eq!(fp16_to_bf8(fp16_bits(1, 0, 0), false), 0x80);
+        assert_eq!(fp16_to_hf8(fp16_bits(1, 0, 0), false), 0x80);
+        // FP16 +0.0 -> +0.
+        assert_eq!(fp16_to_bf8(fp16_bits(0, 0, 0), false), 0x00);
+        assert_eq!(fp16_to_hf8(fp16_bits(0, 0, 0), false), 0x00);
+        // FP16 tiny negative subnormal (mant=1 => -2^-24) underflows both grids -> -0
+        // (sign preserved, DAZ=0 honours the input but it rounds to zero).
+        assert_eq!(fp16_to_bf8(fp16_bits(1, 0, 1), false), 0x80);
+        assert_eq!(fp16_to_hf8(fp16_bits(1, 0, 1), false), 0x80);
+
+        // FP32 -0.0 -> signed zero.
+        assert_eq!(fp32_to_fp8_e5m2(-0.0, Fp8RoundMode::Rtne, false), 0x80);
+        assert_eq!(fp32_to_fp8_e4m3(-0.0, Fp8RoundMode::Rtne, false), 0x80);
+        // FP32 negative subnormal (DAZ=1 flush) -> negative zero, sign preserved.
+        let neg_sub = f32::from_bits((1 << 31) | 1); // -2^-149
+        assert_eq!(fp32_to_fp8_e5m2(neg_sub, Fp8RoundMode::Rtne, false), 0x80);
+        assert_eq!(fp32_to_fp8_e4m3(neg_sub, Fp8RoundMode::Rtne, false), 0x80);
+        // FP32 positive subnormal -> +0.
+        assert_eq!(
+            fp32_to_fp8_e5m2(f32::from_bits(1), Fp8RoundMode::Rtne, false),
+            0x00
+        );
+        assert_eq!(
+            fp32_to_fp8_e4m3(f32::from_bits(1), Fp8RoundMode::Rtne, false),
+            0x00
+        );
+    }
 }
