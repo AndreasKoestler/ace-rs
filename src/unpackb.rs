@@ -560,12 +560,12 @@ mod tests {
                 _ => 0,                    // size 5, 6, 7 -> forced to 0
             };
 
-            for i in 0..KL {
+            for (i, &lane) in got.iter().enumerate() {
                 let j = (start * KL + i) * size;
                 let field = read_field_independent(&input, j, size);
                 let expected = widen_independent(field, size, sign_ex);
                 assert_eq!(
-                    got[i], expected,
+                    lane, expected,
                     "imm8={imm8:#04x} lane {i}: size={size} start={start} sign_ex={sign_ex} \
                      (raw_start={raw_start})"
                 );
@@ -598,19 +598,19 @@ mod tests {
 
             // Independently confirm the value with size, start=0, sign-extend (inline decode).
             let mut saw_sign_set = false;
-            for i in 0..KL {
+            for (i, &lane) in got3.iter().enumerate() {
                 let j = i * size; // start forced to 0
                 let field = read_field_independent(&input, j, size);
                 let expected = widen_independent(field, size, /* sign_ex = */ true);
                 assert_eq!(
-                    got3[i], expected,
+                    lane, expected,
                     "size {size} lane {i}: sign-extend, start forced 0"
                 );
                 if (field >> (size - 1)) & 0x1 != 0 {
                     saw_sign_set = true;
                     // A lane whose field MSB is set must have high bits [7:size] all set.
                     assert_eq!(
-                        got3[i] & (0xffu8 << size),
+                        lane & (0xffu8 << size),
                         0xffu8 << size,
                         "size {size} lane {i}: field MSB set -> bits [7:{size}] all 1"
                     );

@@ -2151,7 +2151,8 @@ mod tests {
     /// zero and NaN sign) for every input, both formats, both modes.
     #[test]
     fn fp16_to_fp8_full_domain_sign_preserved() {
-        let convs: [(fn(u16, bool) -> u8, &str); 2] = [(fp16_to_bf8, "bf8"), (fp16_to_hf8, "hf8")];
+        type Conv = fn(u16, bool) -> u8;
+        let convs: [(Conv, &str); 2] = [(fp16_to_bf8, "bf8"), (fp16_to_hf8, "hf8")];
         for (conv, name) in convs {
             for &sat in &[false, true] {
                 for b in 0u32..=0xffff {
